@@ -1,8 +1,8 @@
 // memex protocol interleaving model — abstract state transitions, NOT Postgres, locks, HTTP or performance.
 // Run: bun docs/protocol-model.ts   (exit 1 on any failed assertion)
 //
-// Every "old/broken variant" is checked SEPARATELY: each must be caught by at least one interleaving,
-// so that deleting a rule from the design makes this model go red.
+// Each listed broken variant is checked SEPARATELY and must be caught by at least one interleaving.
+// This covers only the variants listed here; other deleted rules may still pass (see DESIGN §8 for scope).
 let passed = 0, failed = 0;
 const check = (name: string, cond: boolean) => { cond ? passed++ : failed++; console.log(`${cond ? "PASS" : "FAIL"} ${name}`); };
 const clone = <T>(x: T): T => structuredClone(x);
@@ -108,9 +108,9 @@ function lockedCompare(S: number, deadline: number) {
 // ============================================================================
 type SDB = { blobs: Set<string>; proj: Record<string, Record<string, string>>; shared: Record<string, string>; ver: number; done: Record<string, string> };
 const mkSDB = (): SDB => ({ blobs: new Set(), proj: {}, shared: {}, ver: 1, done: {} });
-type SyncVariant = { dedupeSkipsProjection?: boolean; conflictNoBump?: boolean };
+type SyncVariant = { dedupeSkipsProjection?: boolean; conflictNoBump?: boolean; noRetryShortCircuit?: boolean };
 function syncCommit(db: SDB, collector: string, rec: string, hash: string, commitId: string, v: SyncVariant = {}) {
-  if (db.done[commitId]) return db.done[commitId];          // same commit id retry -> same result
+  if (!v.noRetryShortCircuit && db.done[commitId]) return db.done[commitId];   // same commit id retry -> same result
   const key = `${rec}#${hash}`;
   const existed = db.blobs.has(key);
   db.blobs.add(key);                                         // dedupe = never store the body twice
@@ -132,129 +132,102 @@ const run = (steps: [string, string][], v: SyncVariant = {}) => {
   check("B new: M:B'/N:B -> N:B' resolves conflict although body exists", run(t1).shared.r === "B'");
   check("B new: second collector with same body is registered; M:B' then conflicts", run(t2).shared.r === "CONFLICT");
   check("B new: same collector B -> B' -> B ends at B", run(t3).shared.r === "B");
-  const ok = [run(t1, { dedupeSkipsProjection: true }).shared.r !== "B'", run(t2, { dedupeSkipsProjection: true }).shared.r !== "CONFLICT", run(t3, { dedupeSkipsProjection: true }).shared.r !== "B"];
-  check("B broken variant caught: dedupe skips projection update (all 3 traces)", ok.every(Boolean));
+  const dv = { dedupeSkipsProjection: true };
+  check("B broken variant caught: dedupe skips projection update (each of 3 traces)",
+    run(t1, dv).shared.r !== "B'" && run(t2, dv).shared.r !== "CONFLICT" && run(t3, dv).shared.r !== "B");
   const a = run([["N", "B'"], ["M", "B"]]).shared.r, b = run([["M", "B"], ["N", "B'"]]).shared.r;
   check("B new: conflict state independent of upload order", a === "CONFLICT" && b === "CONFLICT");
   check("B new: agreeing collectors merge", run([["M", "X"], ["N", "X"]]).shared.r === "X");
-  const db = mkSDB(); syncCommit(db, "M", "r", "B", "c1");
-  check("B new: lost receipt retry with same commit id is idempotent", syncCommit(db, "M", "r", "B", "c1") === "B" && Object.keys(db.done).length === 1);
-  // conflict entry must advance the session version so in-flight publishes and frozen blocks notice
+  // retry interleaving: c1:B committed, receipt lost; c2:B' committed; delayed retry of c1 arrives
+  const retry = (v: SyncVariant) => { const db = mkSDB(); syncCommit(db, "M", "r", "B", "c1", v); syncCommit(db, "M", "r", "B'", "c2", v); syncCommit(db, "M", "r", "B", "c1", v); return db.shared.r; };
+  check("B new: delayed retry of an old commit id does not roll back (stays B')", retry({}) === "B'");
+  check("B broken variant caught: retry without commit-id short-circuit rolls back", retry({ noRetryShortCircuit: true }) === "B");
   const before = run([["M", "B"]]); const v0 = before.ver; syncCommit(before, "N", "r", "B'", "x");
   check("B new: entering conflict advances session version", before.ver === v0 + 1);
   const nb = run([["M", "B"]], { conflictNoBump: true }); const v1 = nb.ver; syncCommit(nb, "N", "r", "B'", "x", { conflictNoBump: true });
-  check("B broken variant caught: conflict without version bump leaves frozen block cursor unchanged", nb.ver === v1);
+  check("B broken variant caught: conflict without version bump is invisible to version checks", nb.ver === v1);
 }
-// Frozen injection block K (§6.2): remote replaces the snapshot when any key in K's vector advanced.
+// Frozen injection blocks (§6.2): client holds blocks + an opaque cursor in memory; the cursor carries the session's
+// dependency vector, so even an empty held set learns about invalidation/re-derivation (zero-new-blocks case).
+type Block = { id: string; ok: (d: PDB) => boolean };
+type Cursor = Record<string, number>;
+function frozenRound(db: PDB, held: Block[], cur: Cursor, all: Block[], v: { appendOnly?: boolean } = {}): [Block[], Cursor] {
+  const stale = Object.entries(cur).some(([k, n]) => db.ver[k] !== n);
+  if (!stale || v.appendOnly) return [held, cur];            // nothing changed (or broken: append-only, never replaces)
+  return [all.filter(b => b.ok(db)), Object.fromEntries(Object.keys(cur).map(k => [k, db.ver[k]]))];
+}
 {
-  const db = mkPDB(); const K = { vec: Object.fromEntries(vectorKeys(R1, {}).map(k => [k, db.ver[k]])) };
-  const req = (d: PDB) => Object.entries(K.vec).some(([k, n]) => d.ver[k] !== n) ? "replace" : "no-new-blocks";
-  const d1 = clone(db); changes({})[5][1](d1);
-  check("B frozen: zero new blocks + dependency conflict -> snapshot replace", req(d1) === "replace");
-  const d2 = clone(db); bump(d2, "s:Z");
-  check("B frozen: unrelated session change -> no replace", req(d2) === "no-new-blocks");
+  const db0 = mkPDB();
+  const K: Block = { id: "K", ok: d => exactOk(d, R1) };
+  const cur0: Cursor = Object.fromEntries(vectorKeys(R1, {}).map(k => [k, db0.ver[k]]));
+  const d1 = clone(db0); changes({})[5][1](d1);              // P:r1 enters conflict
+  const [after, cur1] = frozenRound(d1, [K], cur0, [K]);
+  check("B frozen: dependency conflict + zero new blocks -> K actually removed from client", !after.some(b => b.id === "K"));
+  check("B broken variant caught: append-only cursor keeps replaying K", frozenRound(d1, [K], cur0, [K], { appendOnly: true })[0].some(b => b.id === "K"));
+  const d2 = clone(db0); bump(d2, "s:Z");
+  check("B frozen: unrelated session change -> blocks unchanged", frozenRound(d2, [K], cur0, [K])[0][0] === K);
+  // conflict resolved later: old K must not come back (it was derived from the pre-conflict state); re-derived K2 appears
+  const d3 = clone(d1); d3.conflict.delete("P:r1"); bump(d3, "s:P");
+  const [resolved] = frozenRound(d3, after, cur1, [{ id: "K", ok: () => false }, { id: "K2", ok: d => exactOk(d, R1) }]);
+  check("B frozen: after resolution old K is not revived, re-derived K2 appears", !resolved.some(b => b.id === "K") && resolved.some(b => b.id === "K2"));
+}
+// Read eligibility (§4.1, §5.5): unresolved never readable; cross-replica conflict readable only by mem_zoom when canonical known.
+type Rec = { state: "ok" | "conflict" | "unresolved"; canonKnown: boolean; tomb: boolean };
+function readable(r: Rec, use: "zoom" | "auto", v: { zoomAllowsUnresolved?: boolean } = {}) {
+  if (r.tomb) return false;
+  if (r.state === "unresolved") return !!(v.zoomAllowsUnresolved && use === "zoom");   // canonical unknown: never readable
+  if (!r.canonKnown) return false;
+  if (r.state === "ok") return true;
+  return use === "zoom";                                     // conflict: forensic zoom only
+}
+{
+  const unres: Rec = { state: "unresolved", canonKnown: false, tomb: false };  // A->B->C, A forgotten, B lineage missing
+  check("B read: unresolved prefix not readable by mem_zoom", !readable(unres, "zoom"));
+  check("B read: unresolved prefix not readable by auto paths", !readable(unres, "auto"));
+  check("B broken variant caught: zoom exception extended to unresolved", readable(unres, "zoom", { zoomAllowsUnresolved: true }));
+  const conf: Rec = { state: "conflict", canonKnown: true, tomb: false };
+  check("B read: conflict versions shown to mem_zoom, never auto-injected", readable(conf, "zoom") && !readable(conf, "auto"));
+  check("B read: tombstoned conflict not readable even by zoom", !readable({ ...conf, tomb: true }, "zoom"));
 }
 
 // ============================================================================
-// C. Per-collector FIFO leases (§5.1, §5.2) — time, expiry, commit, progress
+// C. Per-collector FIFO leases (§5.1, §5.2) — time, expiry, commit validity, progress
 // ============================================================================
 type Job = { id: string; work: number; isScanChunk?: boolean };
-function simulateLeases(jobsAt: (t: number) => Job[], L: number, ticks: number) {
-  const q: Job[] = []; let cur: { job: Job; start: number } | null = null;
-  const committed: string[] = []; let scanProgress = 0, overrideAttempts = 0;
+type LeaseVariant = { overrideValidLease?: boolean; commitIgnoresLeaseValidity?: boolean; countFailedAsProgress?: boolean };
+function simulateLeases(jobsAt: (t: number) => Job[], L: number, ticks: number, v: LeaseVariant = {}) {
+  const q: Job[] = []; let cur: { job: Job; start: number; lease: number } | null = null; let leaseSeq = 0, current = 0;
+  const committed: string[] = []; let scanProgress = 0;
+  const inflight: { job: Job; lease: number; at: number }[] = [];   // requests whose read finished, arriving at `at`
   for (let t = 0; t < ticks; t++) {
     q.push(...jobsAt(t));
-    if (cur && t - cur.start >= cur.job.work) {             // finished reading -> commit, only if lease still valid
-      if (cur.job.work <= L) { committed.push(cur.job.id); if (cur.job.isScanChunk) scanProgress++; }
-      else q.push(cur.job);                                  // expired: rejected, re-enqueue, no progress
-      cur = null;
+    for (const r of inflight.filter(r => r.at === t)) {         // commit arrival: valid only if its lease is current
+      if (v.commitIgnoresLeaseValidity || r.lease === current) { committed.push(r.job.id); if (r.job.isScanChunk) scanProgress++; if (r.lease === current) { current = 0; cur = null; } }
+      else if (v.countFailedAsProgress && r.job.isScanChunk) scanProgress++;
     }
-    if (cur && t - cur.start >= L) { q.push(cur.job); cur = null; }   // lease expiry
-    if (!cur && q.length) cur = { job: q.shift()!, start: t };       // grant only when no valid lease
-    else if (cur && q.length) overrideAttempts++;            // others wait; a valid lease is never overridden
+    if (cur && t - cur.start >= L) { q.push(cur.job); cur = null; current = 0; }      // lease expiry -> requeue
+    if (cur && t - cur.start === cur.job.work && !inflight.some(r => r.lease === cur!.lease))   // read done -> request sent
+      inflight.push({ job: cur.job, lease: cur.lease, at: t + 1 + (cur.job.id === "slowpost" ? L : 0) }); // slowpost: slow network
+    if (q.length && (!cur || v.overrideValidLease)) { if (cur && v.overrideValidLease) q.push(cur.job); const job = q.shift()!; current = ++leaseSeq; cur = { job, start: t, lease: current }; }
   }
-  return { committed, scanProgress, overrideAttempts };
+  return { committed, scanProgress };
 }
 {
-  // continuous fast appends every tick; one prefix-revision scan chunk enqueued at t=0
-  const r = simulateLeases(t => [{ id: "fast" + t, work: 1 }, ...(t === 0 ? [{ id: "slow", work: 3, isScanChunk: true }] : [])], 5, 100);
+  const fastAndSlow = (t: number) => [{ id: "fast" + t, work: 1 }, ...(t === 0 ? [{ id: "slow", work: 3, isScanChunk: true }] : [])];
+  const r = simulateLeases(fastAndSlow, 5, 100);
   check("C new: queued scan chunk commits despite continuous appends (FIFO)", r.committed.includes("slow") && r.scanProgress === 1);
-  check("C new: valid lease is never overridden (others queue)", r.overrideAttempts > 0);
+  check("C broken variant caught: granting over a valid lease starves the scan chunk", !simulateLeases(fastAndSlow, 5, 100, { overrideValidLease: true }).committed.includes("slow"));
+  // a chunk whose request arrives after its lease expired (slow network) must not commit
+  const late = (t: number) => (t === 0 ? [{ id: "slowpost", work: 2, isScanChunk: true }] : [{ id: "fast" + t, work: 1 }]);
+  const lr = simulateLeases(late, 5, 20);
+  check("C new: request arriving after lease expiry is rejected, no progress", !lr.committed.includes("slowpost") && lr.scanProgress === 0);
+  check("C broken variant caught: commit ignoring lease validity accepts stale read", simulateLeases(late, 5, 20, { commitIgnoresLeaseValidity: true }).committed.includes("slowpost"));
+  check("C broken variant caught: counting failed commits as scan progress", simulateLeases(late, 5, 20, { countFailedAsProgress: true }).scanProgress > 0);
   const tooBig = simulateLeases(t => (t === 0 ? [{ id: "huge", work: 9, isScanChunk: true }] : []), 5, 200);
   check("C new: chunk larger than lease never counts as progress (so chunks must be bounded)", tooBig.scanProgress === 0 && !tooBig.committed.includes("huge"));
-  // broken: optimistic CAS without queue — fast path commits every tick, slow reads 3 ticks then CAS on base
-  let base = 0, slowDone = false;
+  let base = 0, slowDone = false;                            // optimistic CAS without queue
   for (let t = 0; t < 100 && !slowDone; t += 3) { const b0 = base; base += 3; if (base === b0) slowDone = true; }
   check("C broken variant caught: CAS without queue starves the prefix revision", !slowDone);
-}
-
-// ============================================================================
-// D. Codex Legacy, option B (§4.1): single collector, staged chunks, server-side alignment off-lease
-// ============================================================================
-type Slot = { id: number; h: string; unresolved?: boolean };
-// Align new ordered hashes against old slots. Unique-hash LCS anchors; gaps: equal length -> revisions (keep ids);
-// otherwise new ids for inserted lines. Hashes duplicated on either side -> those lines unresolved.
-function align(old: Slot[], next: string[], counter: { n: number }): Slot[] {
-  const cnt = (xs: string[]) => xs.reduce((m, x) => m.set(x, (m.get(x) ?? 0) + 1), new Map<string, number>());
-  const co = cnt(old.map(s => s.h)), cn = cnt(next);
-  const uniq = (h: string) => co.get(h) === 1 && cn.get(h) === 1;
-  // LCS over unique hashes
-  const A = old.filter(s => uniq(s.h)), B = next.map((h, i) => ({ h, i })).filter(x => uniq(x.h));
-  const dp = Array.from({ length: A.length + 1 }, () => Array(B.length + 1).fill(0));
-  for (let i = A.length - 1; i >= 0; i--) for (let j = B.length - 1; j >= 0; j--)
-    dp[i][j] = A[i].h === B[j].h ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const anchors: [number, number][] = []; // [oldIndex, newIndex]
-  for (let i = 0, j = 0; i < A.length && j < B.length;) {
-    if (A[i].h === B[j].h) { anchors.push([old.indexOf(A[i]), B[j].i]); i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) i++; else j++;
-  }
-  anchors.push([old.length, next.length]);
-  const out: Slot[] = []; let po = 0, pn = 0;
-  for (const [ao, an] of anchors) {
-    const og = old.slice(po, ao), ng = next.slice(pn, an);
-    ng.forEach((h, k) => {
-      const ambiguous = (co.get(h) ?? 0) > 1 || (cn.get(h) ?? 0) > 1;
-      if (og.length === ng.length) out.push({ id: og[k].id, h, unresolved: ambiguous || undefined }); // revision or same
-      else out.push({ id: ++counter.n, h, unresolved: ambiguous || undefined });
-    });
-    if (ao < old.length) out.push({ id: old[ao].id, h: next[an] });
-    po = ao + 1; pn = an + 1;
-  }
-  return out;
-}
-{
-  const c = { n: 0 };
-  const s1 = align([], ["A", "B", "C"], c);
-  const s2 = align(s1, ["A", "X", "B", "C"], c);
-  check("D legacy: insert keeps existing slots (A B C -> A X B C = 1 4 2 3)", s2.map(s => s.id).join(" ") === "1 4 2 3");
-  const s3 = align(s2, ["A", "X", "B'", "C"], c);
-  check("D legacy: same-position change is a revision of slot 2", s3[2].id === 2 && s3[2].h === "B'");
-  const d1 = align([], ["A", "Q", "A"], { n: 0 });
-  check("D legacy: duplicated lines are unresolved, not silently matched", d1.filter(s => s.unresolved).length === 2);
-}
-// Staging + server alignment: client uploads bounded chunks under leases, then seals (staged generation g).
-// Server aligns off-lease and publishes with CAS on (staged generation, projection version).
-{
-  let stagedGen = 1, projVer = 1; let proj = "old";
-  const alignJob = (gen: number, pv: number, result: string) => {
-    if (gen !== stagedGen || pv !== projVer) return false; proj = result; projVer++; return true;
-  };
-  const g = stagedGen, p = projVer;          // server starts aligning generation 1
-  stagedGen++;                               // meanwhile client seals a newer snapshot
-  check("D legacy: stale alignment (newer seal arrived) is rejected", !alignJob(g, p, "from-gen1") && proj === "old");
-  check("D legacy: re-run on current generation publishes", alignJob(stagedGen, projVer, "from-gen2") && proj === "from-gen2");
-}
-// Second collector for a Legacy session -> whole session cross-replica conflict (option B), order independent.
-{
-  const legacy = (order: string[]) => {
-    const owners = new Set<string>(); let state = "ok", ver = 1;
-    for (const c of order) { owners.add(c); if (owners.size > 1 && state !== "replica_conflict") { state = "replica_conflict"; ver++; } }
-    return { state, ver };
-  };
-  const x = legacy(["M", "M", "N"]), y = legacy(["N", "M", "M"]);
-  check("D legacy: second collector isolates the whole session, both orders", x.state === "replica_conflict" && y.state === "replica_conflict");
-  check("D legacy: isolation advances session version (publishes/frozen blocks notice)", x.ver === 2 && y.ver === 2);
-  check("D legacy: single collector stays available", legacy(["M", "M"]).state === "ok");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
