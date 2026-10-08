@@ -149,16 +149,22 @@ const run = (steps: [string, string][], v: SyncVariant = {}) => {
 }
 // Frozen injection blocks (§6.2): client holds blocks + an opaque cursor in memory; the cursor carries the session's
 // dependency vector, so even an empty held set learns about invalidation/re-derivation (zero-new-blocks case).
-type Block = { id: string; ok: (d: PDB) => boolean };
+// A block is valid only while every key of the vector it was GENERATED under is unchanged and its inputs pass the
+// exact check; once any key advanced, the block is permanently invalid (re-derivation creates a new block id).
+type Block = { id: string; genVec: Record<string, number>; inputs: Art };
+type FrozenVariant = { appendOnly?: boolean; ignoreGenVec?: boolean };
+const blockValid = (b: Block, db: PDB, v: FrozenVariant) =>
+  (v.ignoreGenVec || Object.entries(b.genVec).every(([k, n]) => db.ver[k] === n)) && exactOk(db, b.inputs);
 type Cursor = Record<string, number>;
-function frozenRound(db: PDB, held: Block[], cur: Cursor, all: Block[], v: { appendOnly?: boolean } = {}): [Block[], Cursor] {
+function frozenRound(db: PDB, held: Block[], cur: Cursor, all: Block[], v: FrozenVariant = {}): [Block[], Cursor] {
   const stale = Object.entries(cur).some(([k, n]) => db.ver[k] !== n);
   if (!stale || v.appendOnly) return [held, cur];            // nothing changed (or broken: append-only, never replaces)
-  return [all.filter(b => b.ok(db)), Object.fromEntries(Object.keys(cur).map(k => [k, db.ver[k]]))];
+  return [all.filter(b => blockValid(b, db, v)), Object.fromEntries(Object.keys(cur).map(k => [k, db.ver[k]]))];
 }
 {
   const db0 = mkPDB();
-  const K: Block = { id: "K", ok: d => exactOk(d, R1) };
+  const genVec = (d: PDB) => Object.fromEntries(vectorKeys(R1, {}).map(k => [k, d.ver[k]]));
+  const K: Block = { id: "K", genVec: genVec(db0), inputs: R1 };
   const cur0: Cursor = Object.fromEntries(vectorKeys(R1, {}).map(k => [k, db0.ver[k]]));
   const d1 = clone(db0); changes({})[5][1](d1);              // P:r1 enters conflict
   const [after, cur1] = frozenRound(d1, [K], cur0, [K]);
@@ -168,7 +174,10 @@ function frozenRound(db: PDB, held: Block[], cur: Cursor, all: Block[], v: { app
   check("B frozen: unrelated session change -> blocks unchanged", frozenRound(d2, [K], cur0, [K])[0][0] === K);
   // conflict resolved later: old K must not come back (it was derived from the pre-conflict state); re-derived K2 appears
   const d3 = clone(d1); d3.conflict.delete("P:r1"); bump(d3, "s:P");
-  const [resolved] = frozenRound(d3, after, cur1, [{ id: "K", ok: () => false }, { id: "K2", ok: d => exactOk(d, R1) }]);
+  const K2: Block = { id: "K2", genVec: genVec(d3), inputs: R1 };   // re-derived after resolution
+  const [resolved] = frozenRound(d3, after, cur1, [K, K2]);         // the SAME original K is offered again
+  check("B broken variant caught: validity ignoring generation vector revives old K",
+    frozenRound(d3, after, cur1, [K, K2], { ignoreGenVec: true })[0].some(b => b.id === "K"));
   check("B frozen: after resolution old K is not revived, re-derived K2 appears", !resolved.some(b => b.id === "K") && resolved.some(b => b.id === "K2"));
 }
 // Read eligibility (§4.1, §5.5): unresolved never readable; cross-replica conflict readable only by mem_zoom when canonical known.
@@ -201,8 +210,9 @@ function simulateLeases(jobsAt: (t: number) => Job[], L: number, ticks: number, 
   const inflight: { job: Job; lease: number; at: number }[] = [];   // requests whose read finished, arriving at `at`
   for (let t = 0; t < ticks; t++) {
     q.push(...jobsAt(t));
-    for (const r of inflight.filter(r => r.at === t)) {         // commit arrival: valid only if its lease is current
-      if (v.commitIgnoresLeaseValidity || r.lease === current) { committed.push(r.job.id); if (r.job.isScanChunk) scanProgress++; if (r.lease === current) { current = 0; cur = null; } }
+    for (const r of inflight.filter(r => r.at === t)) {         // commit arrival: valid only if lease is current AND unexpired
+      const valid = r.lease === current && cur !== null && t < cur.start + L;
+      if (v.commitIgnoresLeaseValidity || valid) { committed.push(r.job.id); if (r.job.isScanChunk) scanProgress++; if (valid) { current = 0; cur = null; } }
       else if (v.countFailedAsProgress && r.job.isScanChunk) scanProgress++;
     }
     if (cur && t - cur.start >= L) { q.push(cur.job); cur = null; current = 0; }      // lease expiry -> requeue
@@ -223,6 +233,11 @@ function simulateLeases(jobsAt: (t: number) => Job[], L: number, ticks: number, 
   check("C new: request arriving after lease expiry is rejected, no progress", !lr.committed.includes("slowpost") && lr.scanProgress === 0);
   check("C broken variant caught: commit ignoring lease validity accepts stale read", simulateLeases(late, 5, 20, { commitIgnoresLeaseValidity: true }).committed.includes("slowpost"));
   check("C broken variant caught: counting failed commits as scan progress", simulateLeases(late, 5, 20, { countFailedAsProgress: true }).scanProgress > 0);
+  // deadline boundary: request sent at start+work, arrives one tick later; L = 5
+  const at = (work: number) => simulateLeases(t => (t === 0 ? [{ id: "edge", work, isScanChunk: true }] : []), 5, 4 + work);
+  check("C new: arrival before lease deadline commits", at(3).committed.includes("edge"));
+  check("C new: arrival exactly at lease deadline is rejected", !at(4).committed.includes("edge") && at(4).scanProgress === 0);
+  check("C new: arrival after lease deadline is rejected", !at(5).committed.includes("edge"));
   const tooBig = simulateLeases(t => (t === 0 ? [{ id: "huge", work: 9, isScanChunk: true }] : []), 5, 200);
   check("C new: chunk larger than lease never counts as progress (so chunks must be bounded)", tooBig.scanProgress === 0 && !tooBig.committed.includes("huge"));
   let base = 0, slowDone = false;                            // optimistic CAS without queue
