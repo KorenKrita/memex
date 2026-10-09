@@ -35,7 +35,20 @@ export interface FileResult {
   path: string;
   harness?: "pi" | "codex";
   status: "indexed" | "skipped";
-  reason?: "legacy" | "child-thread" | "unknown-format" | "unsupported-version" | "invalid-tree" | "compressed" | "empty" | "no-ordinal" | "unreadable";
+  reason?:
+    | "legacy"
+    | "child-thread"
+    | "unknown-format"
+    | "unsupported-version"
+    | "invalid-tree"
+    | "no-session-id"
+    | "duplicate-copy"
+    | "conflicting-copies"
+    | "compressed"
+    | "empty"
+    | "no-ordinal"
+    | "unreadable";
+  copyOf?: string; // duplicate-copy: the path counted for this session
   error?: string;
   forkStatus?: "none" | "resolved" | "parent-not-given" | "unresolved";
   records: number; // L0 lines with a record identity (Pi entries / Codex ordinals)
@@ -207,24 +220,40 @@ function unitsOf(path: Rec[], unpaired: Set<string>): Rec[][] {
   return out;
 }
 
-// One per resolved fork family (a file and its resolved Pi forks), shared, never copied. Three jobs, kept
-// apart (DESIGN §4.3, §4.4):
-//  - source partition: a trie over the views' canonical record keys finds, for a new view, the earliest
-//    earlier view sharing its longest prefix; only that view's span list decides what is reused and where
-//    P is cut, so another fork's spans never change this one's cut;
-//  - span identity: a span is its ordered canonical record keys; an identical span (e.g. the same P cut by
-//    two sibling forks) is one object;
-//  - forest nodes: identical (left, right) pairs are one node.
+// Partition state, in two scopes (DESIGN §4.3, §4.4):
+//  - per file (FileViews): a trie over its views' canonical record keys and each view's span list. A new
+//    view's source is the view sharing its longest prefix among this file's earlier views (first one on
+//    a tie) and, for a resolved fork, its parent file's views (only the parent's: their partition already
+//    holds what the parent took from its own ancestors). Only the source's span list decides what is
+//    reused and where P is cut, so no other file's spans change this cut. On a tie this file's view is
+//    taken; both cut the shared prefix the same way.
+//  - per resolved fork family (Family), shared: span identity (ordered canonical record keys → one span,
+//    e.g. the same P cut by two sibling forks) and forest nodes (identical (left, right) → one node).
 // Canonical record keys carry the session the record is native to, so byte-identical records new in two
 // sessions stay two records, and an inherited record keeps its source through every descendant.
 type ViewSpan = { start: number; end: number; id?: string }; // id undefined: nothing to summarize
-type Registry = {
+type FileViews = {
   trie: Map<string, { node: number; view: number }>; // `${parentNode}|${recordKey}` → trie node
   viewSpans: ViewSpan[][]; // per view, in partition order, record offsets on that view's path
+};
+type Family = {
   spanId: Map<string, string>; // ordered record keys → span id
   nodeId: Map<string, string>; // `${left},${right}` → node id
 };
-const newRegistry = (): Registry => ({ trie: new Map(), viewSpans: [], spanId: new Map(), nodeId: new Map() });
+const newFamily = (): Family => ({ spanId: new Map(), nodeId: new Map() });
+// Longest prefix of `path` in a file's trie, and the first view holding it.
+function sharedPrefix(fv: FileViews, path: Rec[]): { shared: number; src: number; node: number } {
+  let node = 0;
+  let shared = 0;
+  let src = -1;
+  for (; shared < path.length; shared++) {
+    const t = fv.trie.get(`${node}|${path[shared].key}`);
+    if (!t) break;
+    node = t.node;
+    src = t.view;
+  }
+  return { shared, src, node };
+}
 const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all have fewer leaves builds no nodes
 
 // Partition every view into spans the way DESIGN §4.3 does it online, given the views in creation order:
@@ -232,7 +261,8 @@ const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all 
 // unit boundaries; where it forks inside a source span it gets a prefix span P (cut back to whole units, so
 // a call never leaves its result) followed by its own spans. Spans never cross a user message.
 // Assumption: spans are taken as finally cut; whether a span was still open at fork time is not in the logs.
-function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry()): Registry {
+function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), parentViews?: FileViews): FileViews {
+  const own: FileViews = { trie: new Map(), viewSpans: [] };
   const unpaired = new Set<string>();
   const pending = new Map<string, string>(); // this file's new nodes, published only if it is not short
   let longest = 0;
@@ -243,9 +273,9 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
     const size = recs.reduce((a, r) => a + digestSize(r), 0);
     if (size === 0) return { start, end }; // e.g. a lone memory result
     const key = recs.map((r) => r.key).join("\u0000");
-    let id = reg.spanId.get(key);
+    let id = fam.spanId.get(key);
     if (id === undefined) {
-      reg.spanId.set(key, (id = `${res.path}#s${n++}`));
+      fam.spanId.set(key, (id = `${res.path}#s${n++}`));
       res.spans++;
       res.summaryInputBytes += size;
       if (prefix) res.prefixSpans++;
@@ -255,20 +285,16 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
   };
   for (const path of views) {
     res.views++;
-    const vi = reg.viewSpans.length;
-    // Shared prefix with earlier views, and the earliest view that has it.
-    let node = 0;
-    let shared = 0;
-    let src = -1;
-    for (; shared < path.length; shared++) {
-      const t = reg.trie.get(`${node}|${path[shared].key}`);
-      if (!t) break;
-      node = t.node;
-      src = t.view;
-    }
-    for (let i = shared; i < path.length; i++) {
-      const id = reg.trie.size + 1;
-      reg.trie.set(`${node}|${path[i].key}`, { node: id, view: vi });
+    const vi = own.viewSpans.length;
+    const mineHit = sharedPrefix(own, path);
+    const parentHit = parentViews ? sharedPrefix(parentViews, path) : { shared: 0, src: -1, node: 0 };
+    const fromParent = parentHit.shared > mineHit.shared;
+    const shared = fromParent ? parentHit.shared : mineHit.shared;
+    const srcSpans = fromParent ? parentViews!.viewSpans[parentHit.src] : mineHit.src >= 0 ? own.viewSpans[mineHit.src] : [];
+    let node = mineHit.node;
+    for (let i = mineHit.shared; i < path.length; i++) {
+      const id = own.trie.size + 1;
+      own.trie.set(`${node}|${path[i].key}`, { node: id, view: vi });
       node = id;
     }
     const us = unitsOf(path, unpaired);
@@ -280,7 +306,7 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
     const mine: ViewSpan[] = [];
     let pos = 0;
     let limit = shared; // where a prefix span must end at the latest
-    for (const sp of src >= 0 ? reg.viewSpans[src] : []) {
+    for (const sp of srcSpans) {
       if (sp.end <= shared && unitAt.has(sp.end)) {
         mine.push(sp); // whole on the shared prefix and ending on one of this view's unit boundaries
         pos = sp.end;
@@ -309,7 +335,7 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
       mine.push(register(us.slice(ui, ui + len), starts[ui], false));
       ui += len;
     }
-    reg.viewSpans.push(mine);
+    own.viewSpans.push(mine);
     // Forest over this view's span list: binary carries; identical subtrees are one node (DESIGN §4.4).
     const order = mine.flatMap((s) => (s.id ? [s.id] : []));
     longest = Math.max(longest, order.length);
@@ -317,7 +343,7 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
       const up: string[] = [];
       for (let i = 0; i + 1 < level.length; i += 2) {
         const key = `${level[i]},${level[i + 1]}`;
-        let id = reg.nodeId.get(key) ?? pending.get(key);
+        let id = fam.nodeId.get(key) ?? pending.get(key);
         if (id === undefined) pending.set(key, (id = `${res.path}#n${pending.size}`));
         up.push(id);
       }
@@ -326,10 +352,10 @@ function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry(
   }
   // Short sessions list span summaries directly (DESIGN §4.4): their nodes are neither counted nor
   // published, so a longer fork builds (and counts) them itself.
-  if (longest >= SHORT_SESSION) for (const [k, v] of pending) reg.nodeId.set(k, v);
+  if (longest >= SHORT_SESSION) for (const [k, v] of pending) fam.nodeId.set(k, v);
   res.forestInternalNodes = longest >= SHORT_SESSION ? pending.size : 0;
   res.unpairedCalls = unpaired.size;
-  return reg;
+  return own;
 }
 
 // Unique records: evidence, digest and lexical bytes, exclusions. Independent of how views share them.
@@ -356,12 +382,13 @@ function account(recs: Rec[], res: FileResult) {
 }
 
 const inSpan = (r: Rec) => DIGEST_KINDS.has(r.kind); // memory results stay: they close their call
-type Parsed = { recs: Rec[]; views: Rec[][]; seed?: Registry };
+type Parsed = { recs: Rec[]; views: Rec[][]; from?: ParentInfo };
 
 // ---------- reading ----------
 
-// `want` is the dev:ino seen by collect(); a file swapped after discovery is refused.
-function readLines(path: string, res: FileResult, want?: string): Record<string, any>[] {
+// `want` is the dev:ino seen by collect(); a file swapped after discovery is refused. `wantHash`, if given,
+// is the content hash seen by dryRun's copy pre-pass: a file rewritten in between is refused too.
+function readText(path: string, want?: string, wantHash?: string): string {
   // O_NONBLOCK: a FIFO swapped in would otherwise block open() before the checks below can refuse it.
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let text: string;
@@ -372,6 +399,12 @@ function readLines(path: string, res: FileResult, want?: string): Record<string,
   } finally {
     closeSync(fd);
   }
+  if (wantHash !== undefined && createHash("sha256").update(text).digest("hex") !== wantHash) throw new Error("file changed since discovery");
+  return text;
+}
+
+function readLines(path: string, res: FileResult, want?: string, wantHash?: string): Record<string, any>[] {
+  const text = readText(path, want, wantHash);
   const lines = text.split("\n");
   const out: Record<string, any>[] = [];
   lines.forEach((line, i) => {
@@ -484,9 +517,9 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
   }
 }
 
-// A resolved fork parent: its entries by match key (id + content) → canonical record key, and its family's
-// registry.
-type ParentInfo = { keys: Map<string, string>; registry: Registry };
+// A resolved fork parent: its entries by match key (id + content) → canonical record key, its family's
+// shared span / node identity, and its own views' partition (the source for the child's views).
+type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews };
 type ParentLookup = (p: string) => ParentInfo | "invalid" | undefined; // undefined: parent not among the inputs
 
 // A root, as in Pi's getTree(): parentId null, pointing at itself, or at an entry not in the file (an
@@ -534,6 +567,9 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   const onTail = new Set<string>();
   for (let e: Record<string, any> | undefined = entries[entries.length - 1]; e; e = piIsRoot(e, byId) ? undefined : byId.get(e.parentId)) onTail.add(e.id);
   res.offTail = entries.length - onTail.size;
+  // The native session identity is the header id (DESIGN §4.1); a path is not an identity.
+  if (typeof header.id !== "string" || !header.id) return skip(res, "no-session-id");
+  const session: string = header.id;
 
   res.forkStatus = "none";
   let from: ParentInfo | undefined;
@@ -544,9 +580,8 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   }
   // Matching uses id + content; identity adds the session the record is native to (DESIGN §4.1), so a
   // record new here is not mistaken for a byte-identical record new in a sibling, and an inherited one
-  // keeps its source. The session is the header id (the file path if there is none).
-  const session = typeof header.id === "string" && header.id ? header.id : res.path;
-  const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e).slice(0, 16)}`;
+  // keeps its source.
+  const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e)}`;
   const keys = new Map<string, string>();
   const navOf = new Map<string, Rec[]>(); // records for navigation (inherited ones included)
   const own: Rec[] = []; // records new in this file: the only ones counted as evidence
@@ -599,7 +634,7 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
     if (kids.length === 0) views.push(path.slice());
     for (let i = kids.length - 1; i >= 0; i--) stack.push({ e: kids[i], depth: depth + 1 });
   }
-  return { recs: own, views, seed: from?.registry, keys };
+  return { recs: own, views, from, keys };
 }
 
 // ---------- Codex (rollout, Paginated only) ----------
@@ -766,6 +801,7 @@ function skip(res: FileResult, reason: FileResult["reason"]): Parsed {
 export interface AnalyzeOptions {
   parent?: ParentLookup; // Pi fork parents among the approved inputs (dryRun supplies it)
   identity?: string; // dev:ino from collect(); the file must still be that inode
+  contentHash?: string; // sha256 seen by dryRun's copy pre-pass; the file must still have it
 }
 
 export function analyzeFile(path: string, opts: AnalyzeOptions = {}): FileResult {
@@ -777,7 +813,7 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
   if (PI_SUBAGENT.test(path)) return skip(res, "child-thread"), (res.harness = "pi"), { res };
   if (path.endsWith(".zst")) return skip(res, "compressed"), { res };
   try {
-    const lines = readLines(path, res, opts.identity);
+    const lines = readLines(path, res, opts.identity, opts.contentHash);
     if (lines.length === 0) return skip(res, "empty"), { res };
     let parsed: Parsed & { keys?: Map<string, string> };
     if (lines[0].type === "session") parsed = piFile(lines, res, opts.parent ?? (() => undefined));
@@ -785,11 +821,12 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
     else return skip(res, "unknown-format"), { res };
     if (res.status !== "indexed") return { res };
     account(parsed.recs, res);
-    const registry = partition(parsed.views, res, parsed.seed);
+    const family = parsed.from?.family ?? newFamily();
+    const fileViews = partition(parsed.views, res, family, parsed.from?.views);
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
-    return { res, parent: usable ? { keys: parsed.keys!, registry } : undefined };
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews } : undefined };
   } catch (e) {
     const fresh = emptyResult(path);
     Object.assign(res, fresh, { status: "skipped", reason: "unreadable", error: String((e as Error).message ?? e).slice(0, 200) });
@@ -843,6 +880,32 @@ export function collect(inputs: string[]): { files: string[]; identity: Map<stri
 export function dryRun(inputs: string[]) {
   const { files, identity, symlinks, errors } = collect(inputs);
   const approved = new Set(files);
+  // Pi copies (DESIGN §4.1): files with the same header id are one native session. Identical copies are
+  // analysed once (the first path) and the others reported as `duplicate-copy`; copies that differ are a
+  // projection merge this tool does not do, so the whole group is `conflicting-copies` and forks of it stay
+  // unresolved. The pre-pass reads with the same checks as analysis and keeps only (id, content hash); the
+  // analysis must then see the same content. Codex files are not grouped: a thread id may legitimately span
+  // several rollouts.
+  const copyHash = new Map<string, string>(); // path → sha256 of the content seen here
+  const groups = new Map<string, string[]>(); // header id → paths
+  for (const f of files) {
+    if (PI_SUBAGENT.test(f) || f.endsWith(".zst")) continue;
+    try {
+      const text = readText(f, identity.get(f));
+      const head = JSON.parse(text.slice(0, text.indexOf("\n") < 0 ? text.length : text.indexOf("\n")));
+      if (head?.type !== "session" || typeof head.id !== "string" || !head.id) continue;
+      copyHash.set(f, createHash("sha256").update(text).digest("hex"));
+      (groups.get(head.id) ?? groups.set(head.id, []).get(head.id)!).push(f);
+    } catch {
+      // unreadable or not JSON: the analysis reports it
+    }
+  }
+  const canonicalPath = new Map<string, string>(); // path → the path analysed for its session
+  const conflicting = new Set<string>();
+  for (const paths of groups.values()) {
+    if (new Set(paths.map((p) => copyHash.get(p))).size > 1) for (const p of paths) conflicting.add(p);
+    else for (const p of paths) canonicalPath.set(p, paths[0]);
+  }
   // Pi forks name their parent file. Only parents among the approved inputs are read: each file is analysed
   // once, a parent before its children (on demand), so a child starts from the parent's spans. A fork chain
   // that loops back counts as an invalid parent.
@@ -851,16 +914,30 @@ export function dryRun(inputs: string[]) {
   const run = (f: string): { res: FileResult; parent?: ParentInfo } => {
     let r = done.get(f);
     if (!r) {
-      busy.add(f);
-      r = analyze(f, { parent, identity: identity.get(f) });
-      busy.delete(f);
+      const res = emptyResult(f);
+      const canon = canonicalPath.get(f);
+      if (conflicting.has(f)) {
+        res.harness = "pi";
+        skip(res, "conflicting-copies");
+        r = { res };
+      } else if (canon !== undefined && canon !== f) {
+        res.harness = "pi";
+        skip(res, "duplicate-copy");
+        res.copyOf = canon;
+        r = { res, parent: run(canon).parent };
+      } else {
+        busy.add(f);
+        r = analyze(f, { parent, identity: identity.get(f), contentHash: copyHash.get(f) });
+        busy.delete(f);
+      }
       done.set(f, r);
     }
     return r;
   };
   const parent: ParentLookup = (p) => {
     if (!approved.has(p) || PI_SUBAGENT.test(p)) return undefined;
-    if (busy.has(p)) return "invalid";
+    const q = canonicalPath.get(p) ?? p;
+    if (busy.has(q)) return "invalid";
     return run(p).parent ?? "invalid";
   };
   const results = files.map((f) => run(f).res);

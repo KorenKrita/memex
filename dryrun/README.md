@@ -12,7 +12,7 @@ opens no network connection and calls no model. There are no default directories
 
 Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
 only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
-cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log` and `mutate-dryrun6-144322.log`.
+cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log`, `mutate-dryrun6-144322.log` and `mutate-dryrun7-151942.log` (there `parentGeq`, a tie taking the parent's view, survives: no test tells them apart; believed equivalent (both sources should cut an equally long shared prefix the same way), not proven).
 Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
@@ -28,7 +28,10 @@ Rules without a listed mutation there are tested but not mutation-checked.
   entry whose `parentId` names no entry in the file is a root, as in Pi's own `getTree()`, and is counted
   in `orphanRoots`. **All branches are counted** (retrieval covers every branch,
   DESIGN §4.3). Each root-to-tip path is a view; views are partitioned depth first, children in file
-  (= creation) order. A later view's **source** is the first earlier view sharing its longest prefix (a resolved fork's views continue its parent's): it reuses the
+  (= creation) order. A later view's **source** is the view sharing its longest prefix among this file's
+  earlier views (first one on a tie) and, for a resolved fork, its **direct parent's** views only (a tie
+  takes this file's: both cut the shared prefix the same way); an older ancestor holding the same records
+  is never the source, since the parent's partition already holds what it took from it. It reuses the
   source's spans lying whole on that prefix and ending on one of its own unit boundaries; where it forks
   inside a source span S it gets a prefix span P (cut back to whole units) and then its own spans, and S
   stays for its view. Spans other views made never change this cut. A fork on a span boundary shares
@@ -48,9 +51,18 @@ Rules without a listed mutation there are tested but not mutation-checked.
   it first. Only a file whose own ancestry is resolved (or that is no fork) can be a parent: parent not
   given → every entry `unresolved`; parent invalid, itself unresolved, or a fork chain looping back →
   `unresolved` too.
+- Pi session identity is the header `id` (DESIGN §4.1); a Pi file without one is `no-session-id` and is
+  never a parent (a path is not an identity). Files with the same header id are copies of one session:
+  identical copies are analysed once (first path) and the others are `duplicate-copy` with `copyOf`; a fork
+  naming either copy resolves to the same one. Copies that differ need a projection merge this tool does
+  not do, so the whole group is `conflicting-copies` and forks of it stay `unresolved`, whatever the file
+  names. A pre-pass reads each Pi file once (same open checks) and keeps only its id and content hash; the
+  analysis must see the same hash, a file rewritten in between is `unreadable`. Codex files are not
+  grouped by id: one thread id may legitimately span several rollout files.
   Cost: linear in entries for a linear session (tested for a 4× size ratio; a cheap per-entry copy is
   not caught); a branching session materializes every view, so work is the sum of view lengths plus
-  sorting views and partitioning (a 4000-view synthetic file is tested to finish in a subprocess deadline).
+  partitioning (a 4000-view synthetic file is tested to finish in a subprocess deadline). Memory is not
+  bounded or tested: each file's views and its family's partition are held while it is analysed.
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
   `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
   uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is

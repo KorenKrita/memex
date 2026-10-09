@@ -19,7 +19,8 @@ function file(name: string, rows: unknown[] | string): string {
 const B = (s: string) => Buffer.byteLength(s);
 
 // ---------- Pi fixtures ----------
-const piHeader = (extra: object = {}) => ({ type: "session", version: 3, id: "s1", timestamp: "2026-10-01T00:00:00Z", cwd: "/w", ...extra });
+let headerN = 0; // every header gets its own session id unless a test names one (same id = copies of one session)
+const piHeader = (extra: object = {}) => ({ type: "session", version: 3, id: `s${++headerN}`, timestamp: "2026-10-01T00:00:00Z", cwd: "/w", ...extra });
 const piMsg = (id: string, parentId: string | null, message: object) => ({ type: "message", id, parentId, timestamp: "2026-10-01T00:00:00Z", message });
 const user = (text: unknown) => ({ role: "user", content: text, timestamp: 1 });
 const asst = (content: unknown[]) => ({ role: "assistant", content, api: "x", provider: "x", model: "x", timestamp: 1 });
@@ -223,7 +224,7 @@ describe("Pi", () => {
     const parent = file("pi/fork/parent.jsonl", parentRows);
     const reordered = Object.fromEntries(Object.entries(parentRows[1] as object).reverse());
     const edited = { ...(parentRows[2] as object), message: say("same id, different content") };
-    const childRows = [piHeader({ id: "s2", parentSession: parent }), reordered, edited, piMsg("u2", "a1", user("new in child"))];
+    const childRows = [piHeader({ id: "child", parentSession: parent }), reordered, edited, piMsg("u2", "a1", user("new in child"))];
     const child = file("pi/fork/child.jsonl", childRows);
     const solo = dryRun([child]).perFile[0];
     expect(solo).toMatchObject({ forkStatus: "parent-not-given", unresolved: 3, evidence: 0, spans: 0 });
@@ -497,7 +498,7 @@ describe("third review", () => {
 
   test("a resolved Pi fork keeps the inherited prefix for navigation, not as new evidence", () => {
     const parent = file("pi/xfork/parent.jsonl", [piHeader(), piMsg("u", null, user("question")), piMsg("a", "u", say("old reply"))]);
-    const child = file("pi/xfork/child.jsonl", [piHeader({ id: "s2", parentSession: parent }), piMsg("u", null, user("question")), piMsg("b", "u", say("new reply"))]);
+    const child = file("pi/xfork/child.jsonl", [piHeader({ id: "child", parentSession: parent }), piMsg("u", null, user("question")), piMsg("b", "u", say("new reply"))]);
     const r = dryRun([join(dir, "pi/xfork")]);
     // parent S = [u a]; child P = [u], [b]
     expect(r.total).toMatchObject({ spans: 3, prefixSpans: 1 });
@@ -508,7 +509,7 @@ describe("third review", () => {
 
   test("a fork whose parent file is invalid is not resolved against it", () => {
     const parent = file("pi/badparent/parent.jsonl", [piHeader(), piMsg("u", null, user("q")), piMsg("b", "u", user("x")), piMsg("u", "b", user("dup"))]);
-    const child = file("pi/badparent/child.jsonl", [piHeader({ id: "s2", parentSession: parent }), piMsg("u", null, user("q")), piMsg("b", "u", say("new"))]);
+    const child = file("pi/badparent/child.jsonl", [piHeader({ id: "child", parentSession: parent }), piMsg("u", null, user("q")), piMsg("b", "u", say("new"))]);
     const r = isolated(`const r = dryRun([${JSON.stringify(join(dir, "pi/badparent"))}]); const c = r.perFile.find((f) => f.path === ${JSON.stringify(child)}); console.log(JSON.stringify([r.skipped, c.forkStatus, c.evidence]));`);
     expect(r.signal).toBeNull();
     expect(JSON.parse(r.out)).toEqual([{ "invalid-tree": [parent] }, "unresolved", 0]);
@@ -570,7 +571,7 @@ describe("fourth review", () => {
 
   test("nodes a short parent never built are built (and counted) by its longer fork", () => {
     const P = file("pi/shortpar/P.jsonl", [piHeader(), piMsg("u0", null, user("q0")), piMsg("u1", "u0", user("q1"))]);
-    const rows: unknown[] = [piHeader({ id: "s2", parentSession: P }), piMsg("u0", null, user("q0")), piMsg("u1", "u0", user("q1"))];
+    const rows: unknown[] = [piHeader({ id: "c2", parentSession: P }), piMsg("u0", null, user("q0")), piMsg("u1", "u0", user("q1"))];
     for (let i = 2; i < 6; i++) rows.push(piMsg(`u${i}`, `u${i - 1}`, user(`q${i}`)));
     const C = file("pi/shortpar/C.jsonl", rows);
     const r = dryRun([join(dir, "pi/shortpar")]);
@@ -580,8 +581,8 @@ describe("fourth review", () => {
 
   test("sibling forks share one prefix span", () => {
     const P = file("pi/sib/P.jsonl", [piHeader(), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
-    file("pi/sib/C1.jsonl", [piHeader({ id: "s1", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
-    file("pi/sib/C2.jsonl", [piHeader({ id: "s2", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", say("c"))]);
+    file("pi/sib/C1.jsonl", [piHeader({ id: "c1", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    file("pi/sib/C2.jsonl", [piHeader({ id: "c2", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", say("c"))]);
     const r = dryRun([join(dir, "pi/sib")]).total;
     // S = [u a], P = [u], [b], [c]
     expect(r).toMatchObject({ spans: 4, prefixSpans: 1 });
@@ -652,6 +653,121 @@ describe("fourth review", () => {
     // 4x the entries: linear work grows ~4x, quadratic path copying ~16x
     expect(timed(40000) / timed(10000)).toBeLessThan(8);
   }, 60000);
+
+  // Sixth review: a fork's views take their partition from the parent it names, not from an older
+  // ancestor holding the same records.
+  test("a grandchild continues its parent's partition, even where the parent cut back to a whole unit", () => {
+    const P = file("pi/lineage/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
+    const C = file("pi/lineage/C.jsonl", [piHeader({ id: "sC", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r1", "c", result("t", "B"))]);
+    const G = file("pi/lineage/G.jsonl", [
+      piHeader({ id: "sG", parentSession: C }),
+      piMsg("u", null, user("u")),
+      piMsg("c", "u", call("t")),
+      piMsg("g", "c", user("g")),
+      piMsg("h", "g", user("h")),
+    ]);
+    const r = dryRun([join(dir, "pi/lineage")]);
+    // P: [u c r0]. C forks inside it after c (inside the unit) → P cut back to [u], then [c r1].
+    // G continues C: reuse [u], cut [c] out of C's [c r1], then [g], [h]: 4 leaves → 3 nodes.
+    expect(r.perFile.find((f) => f.path === G)).toMatchObject({ spans: 3, summaryInputBytes: D("tool_call", "bash {}") + D("user", "g") + D("user", "h"), forestInternalNodes: 3 });
+    expect(r.total.summaryInputBytes).toBe(
+      D("user", "u") + D("tool_call", "bash {}") + D("tool_result", "A") + // P
+        D("user", "u") + D("tool_call", "bash {}") + D("tool_result", "B") + // C
+        D("tool_call", "bash {}") + D("user", "g") + D("user", "h"), // G
+    );
+    expect(r.perFile.find((f) => f.path === C)).toMatchObject({ prefixSpans: 1 });
+  });
+
+  test("a fork's second view through the same cut reuses its first view's spans", () => {
+    // P: [u c r0]. C has two views: [u c r1] (forks inside P's unit: [u], [c r1]) and [u c r2], which
+    // shares [u c] with P's view and with C's first view. Either source gives the same cut there (a source
+    // sharing the same prefix length partitions it the same way), so: [u] reused, then [c r2].
+    const P = file("pi/tie/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
+    const C = file("pi/tie/C.jsonl", [
+      piHeader({ id: "sC", parentSession: P }),
+      piMsg("u", null, user("u")),
+      piMsg("c", "u", call("t")),
+      piMsg("r1", "c", result("t", "B")),
+      piMsg("r2", "c", result("t", "C")),
+    ]);
+    const c = dryRun([join(dir, "pi/tie")]).perFile.find((f) => f.path === C)!;
+    expect(c).toMatchObject({ views: 2, spans: 3, prefixSpans: 1 });
+  });
+
+  // Sixth review: copies of one native session (same header id) are one session.
+  test("identical copies of a session are counted once; the others are reported as copies", () => {
+    const rows = [piHeader({ id: "same" }), piMsg("u", null, user("u"))];
+    const a = file("pi/copies/a.jsonl", rows);
+    const b = file("pi/copies/b.jsonl", rows);
+    const r = dryRun([join(dir, "pi/copies")]);
+    expect(r.files).toBe(2);
+    expect(r.total).toMatchObject({ evidence: 1, spans: 1, digestBytes: D("user", "u"), summaryInputBytes: D("user", "u") });
+    expect(r.perFile.find((f) => f.path === b)).toMatchObject({ status: "skipped", reason: "duplicate-copy", copyOf: a });
+  });
+
+  test("identical copies of a fork are counted once", () => {
+    const P = file("pi/forkcopies/P.jsonl", [piHeader({ id: "P" }), piMsg("u", null, user("u"))]);
+    const rows = [piHeader({ id: "copy", parentSession: P }), piMsg("u", null, user("u")), piMsg("z", "u", user("same"))];
+    file("pi/forkcopies/A.jsonl", rows);
+    file("pi/forkcopies/B.jsonl", rows);
+    const r = dryRun([join(dir, "pi/forkcopies")]).total;
+    expect(r).toMatchObject({ evidence: 2, digestBytes: D("user", "u") + D("user", "same"), summaryInputBytes: D("user", "u") + D("user", "same") });
+  });
+
+  test("a fork naming either copy of its parent resolves the same way", () => {
+    const rows = [piHeader({ id: "par" }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))];
+    const p1 = file("pi/copyparent/p1.jsonl", rows);
+    const p2 = file("pi/copyparent/p2.jsonl", rows);
+    const kid = (name: string, parentSession: string) =>
+      file(`pi/copyparent/${name}.jsonl`, [piHeader({ id: name, parentSession }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const k1 = kid("k1", p1);
+    const k2 = kid("k2", p2);
+    const r = dryRun([join(dir, "pi/copyparent")]);
+    for (const k of [k1, k2]) expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "resolved", inherited: 1, evidence: 1 });
+    // S = [u a], P = [u], [b] from k1, [b] from k2 (two native records)
+    expect(r.total).toMatchObject({ spans: 4, prefixSpans: 1 });
+  });
+
+  test("copies that differ are all quarantined, and so are forks of them, whatever the file names", () => {
+    const run = (d: string, first: string, second: string) => {
+      const x = file(`${d}/${first}.jsonl`, [piHeader({ id: "dup" }), piMsg("u", null, user("u"))]);
+      file(`${d}/${second}.jsonl`, [piHeader({ id: "dup" }), piMsg("u", null, user("u")), piMsg("a", "u", say("longer"))]);
+      const k = file(`${d}/kid.jsonl`, [piHeader({ id: "kid", parentSession: x }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+      const r = dryRun([join(dir, d)]);
+      return { conflicting: r.skipped["conflicting-copies"]?.length, kid: r.perFile.find((f) => f.path === k)!.forkStatus, evidence: r.total.evidence };
+    };
+    const want = { conflicting: 2, kid: "unresolved" as const, evidence: 0 };
+    expect(run("pi/conflict-ab", "a", "b")).toEqual(want);
+    expect(run("pi/conflict-ba", "b", "a")).toEqual(want);
+  });
+
+  test("byte-identical content under different session ids is two sessions", () => {
+    file("pi/twoids/a.jsonl", [piHeader({ id: "one" }), piMsg("u", null, user("u"))]);
+    file("pi/twoids/b.jsonl", [piHeader({ id: "two" }), piMsg("u", null, user("u"))]);
+    expect(dryRun([join(dir, "pi/twoids")]).total).toMatchObject({ evidence: 2, spans: 2 });
+  });
+
+  test("a Pi file without a session id is reported and is never a usable parent", () => {
+    const p = file("pi/noid/p.jsonl", [{ type: "session", version: 3, timestamp: "t", cwd: "/w" }, piMsg("u", null, user("u"))]);
+    const k = file("pi/noid/k.jsonl", [piHeader({ id: "k", parentSession: p }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const r = dryRun([join(dir, "pi/noid")]);
+    expect(r.perFile.find((f) => f.path === p)).toMatchObject({ status: "skipped", reason: "no-session-id" });
+    expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "unresolved", evidence: 0 });
+  });
+
+  test("a file rewritten between the copy pre-pass and analysis is refused", () => {
+    const p = file("pi/rewrite/a.jsonl", [piHeader({ id: "rw" }), piMsg("u", null, user("u"))]);
+    const spy = spyOn(fs, "readFileSync");
+    let n = 0;
+    // first read (copy pre-pass) sees one content, the second (analysis) another: a rewrite in between
+    spy.mockImplementation((() => {
+      n++;
+      return n === 1 ? jsonl([piHeader({ id: "rw" }), piMsg("u", null, user("u"))]) : jsonl([piHeader({ id: "rw" }), piMsg("u", null, user("changed"))]);
+    }) as any);
+    const r = dryRun([p]);
+    spy.mockRestore();
+    expect(r.perFile[0]).toMatchObject({ status: "skipped", reason: "unreadable" });
+  });
 
   test("a branch-heavy session finishes within its deadline (views are materialized: sum of view lengths)", () => {
     // a chain of 4000 user entries with one extra leaf on each: 4000 views, ~8M records copied in total
