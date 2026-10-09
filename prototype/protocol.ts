@@ -189,8 +189,13 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
   await c`begin isolation level read committed`;
   let commitAttempted = false;
   try {
-    await c.unsafe(`set local transaction_timeout = 0`);             // drop any inherited active timer (not rescheduled by a new value)
-    await c.unsafe(`set local transaction_timeout = ${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}`);
+    // A new value does not reschedule an already-active (inherited) timer: clear it, then re-arm with
+    // min(our deadline, inherited remaining) so a stricter inherited deadline is never relaxed.
+    const [{ inh }] = await c`select current_setting('transaction_timeout') as inh`;
+    await c`select set_config('transaction_timeout', '0', true)`;
+    await c`select set_config('transaction_timeout', least(${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}::bigint,
+              case when ${inh}::interval = interval '0' then null
+                   else greatest(1, floor(extract(epoch from (${inh}::interval - (clock_timestamp() - now()))) * 1000)::bigint) end)::text, true)`;
     let now: Record<string, number>;
     if (opts.lockAndReadOneStatement) {                              // broken: snapshot taken before the lock wait
       now = await readVectorWithLock(c, keys);
@@ -332,12 +337,17 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     // before the next lease is granted, even if COMMIT itself (not covered by transaction_timeout, PG17
     // CommitTransaction disables it) finishes after expires_at.
     // LIVENESS: transaction_timeout bounds the pre-COMMIT rest of the transaction by the remaining lifetime, so an
-    // in-flight commit cannot hold the queue far past expiry. syncCommit owns this connection's timeout: an
-    // inherited active timer is disabled first (re-setting a value does not reschedule an active timer).
+    // in-flight commit cannot hold the queue far past expiry. Re-setting a value does not reschedule an active
+    // (inherited) timer, so it is cleared first and re-armed with min(lease remaining, inherited remaining); an
+    // inherited stricter deadline (measured from transaction start, now()) is never relaxed.
+    const [{ inh }] = await tx`select current_setting('transaction_timeout') as inh`;
     if (!opts.noLeaseDeadline) await tx`select set_config('transaction_timeout', '0', true)`;
     const [v] = await tx`select left_ms, case when left_ms > 0 and ${!opts.noLeaseDeadline}
-                           then set_config('transaction_timeout', least(left_ms, 2147483647)::text, true) end as armed
-                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms
+                           then set_config('transaction_timeout', least(left_ms, inh_left, 2147483647)::text, true) end as armed
+                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms,
+                                      case when ${inh}::interval = interval '0' then null
+                                           else greatest(1, floor(extract(epoch from (${inh}::interval
+                                                - (clock_timestamp() - now()))) * 1000)::bigint) end as inh_left
                                from lease where id = ${c.leaseId} and granted_at is not null) s`;
     if (!v || Number(v.left_ms) <= 0) return { ok: false, reason: "lease" } as const;
     const merged: { rec: string; next: { state: string; hash: string | null }; old: any }[] = [];

@@ -40,12 +40,12 @@ file on exit, full log). Deleting or weakening one rule in `protocol.ts` turned 
 fresh read after the lock, each vector component (view / query / destination), remap bumping the occurrence's
 session, writer and publisher barrier locks, the locked-section deadline, merge serialization, lease expiry on the
 server clock, commit-id short-circuit, conflict bumping the version, generation-vector validity, FIFO grant, no
-grant over a valid lease, conflict in the exact check; later rounds (15/15 in the last run): generation-vector
+grant over a valid lease, conflict in the exact check; later rounds (17/17 in the last run): generation-vector
 check inside `publish`, `transaction_timeout` instead of `statement_timeout`, granting the queue head on any
 poll, re-checking lease expiry after the barrier wait, the commit-id lock, records restricted to the lease's
 source, reporting a lease only while unexpired and not done, `uncertain` after COMMIT, the `commitAttempted`
 flag, exclusive (not shared) merge lock, the lease-lifetime timer, resetting an inherited timer (publish and
-sync), the 64-bit remaining-lifetime cast, and the successor's grant having to touch the expired lease row.
+sync), never relaxing a stricter inherited timeout (publish and sync), the 64-bit remaining-lifetime cast, and the successor's grant having to touch the expired lease row.
 
 ## Prototype choices (not performance conclusions)
 
@@ -55,9 +55,10 @@ sync), the 64-bit remaining-lifetime cast, and the successor's grant having to t
   transaction up to COMMIT, including client pauses between statements; on expiry the backend is terminated,
   which releases the lock and discards the publication. It does **not** cover the COMMIT phase itself (PG17
   `CommitTransaction()` disables it before the durable commit), so a publication whose COMMIT started in time
-  can finish slightly late. `statement_timeout` is not enough: many short statements can hold the lock
-  indefinitely. `publish()` reserves its own pool connection, and first sets the timeout to 0 because setting a
-  new value does not reschedule an already-active (inherited) timer.
+  can finish after the deadline, with no proven upper bound (WAL/disk stalls); writers wait that long. `statement_timeout` is not enough: many short statements can hold the lock
+  indefinitely. `publish()` reserves its own pool connection, and re-arms the timeout
+  (setting a new value does not reschedule an already-active inherited timer) with min(own deadline, inherited
+  remaining), so a stricter inherited deadline is never relaxed.
 - When the deadline fires during a statement, Bun receives SQLSTATE `25P04` → `timeout` (confirmed). When it fires
   while the session is idle in transaction (client pause), Bun reports only `ERR_POSTGRES_CONNECTION_CLOSED`,
   indistinguishable from any other disconnect. `publish()` therefore classifies a closed connection by position:
@@ -71,9 +72,9 @@ sync), the 64-bit remaining-lifetime cast, and the successor's grant having to t
   is the cut-off (DESIGN §5.1 "only commit while the lease is valid"). Safety does not depend on a timer: the
   successor's grant must update the expired lease row to reap it, so it waits for this transaction to end; a
   commit accepted at the check always lands before the next lease exists, even if its COMMIT finishes after
-  `expires_at`. Interpretation, not yet written into DESIGN: "valid" means valid at the server-side acceptance
+  `expires_at`. This is the DESIGN §5.1 semantics: "valid" means valid at the server-side acceptance
   check, not at COMMIT completion. For liveness, the same statement arms `transaction_timeout` with the remaining
-  lifetime (after clearing any inherited timer), so a stalled pre-COMMIT transaction cannot hold the queue far
+  lifetime (min with any inherited timer), so a stalled pre-COMMIT transaction cannot hold the queue far
   past expiry. Not a hard millisecond bound; the COMMIT phase is not covered (see above).
 - "Published" means a row in `publication`, written inside the locked section. HTTP/socket hand-off and
   cancellation at that boundary are **not** verified here.

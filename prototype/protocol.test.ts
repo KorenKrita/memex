@@ -184,6 +184,16 @@ describe("publish barrier (§5.5)", () => {
     expect(await P.publicationCount(db, "R1")).toBe(1);
   });
 
+  test("an inherited stricter transaction_timeout is not relaxed by the publish deadline", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "300" } } as any);
+    try {
+      const r = await P.publish(pool, "R1", { inLock: async (tx) => { await tx`select pg_sleep(2)`; } }, { lockDeadlineMs: 10_000 });
+      expect(r).toBe("timeout");                   // the inherited 300ms still applies, not our 10s
+      expect(await P.publicationCount(db, "R1")).toBe(0);
+    } finally { await pool.close(); }
+  });
+
   test("the locked-section deadline holds even if the connection inherits a longer transaction_timeout", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
     const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "5000" } } as any);
@@ -341,6 +351,16 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
     const [{ n }] = await db`select (select count(*) from body) + (select count(*) from projection) as n`;
     expect(Number(n)).toBe(0);                   // rows written before the hook were rolled back too
     expect(await P.scanProgress(db, "P", "M")).toBe(0);
+  });
+  test("an inherited stricter transaction_timeout is not relaxed by the lease lifetime", async () => {
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "300" } } as any);
+    try {
+      const l = await P.acquireLease(pool, "P", "M", 10_000);
+      const commit = P.syncCommit(pool, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
+        { afterMergeRead: (tx) => waitForOwnTermination(tx) });   // well inside the 10s lease
+      expect(await commit.then(() => "resolved", (e: any) => e?.code)).toMatch(/^ERR_POSTGRES_(CONNECTION_CLOSED|EXPECTED_REQUEST)$/);
+      expect(await P.scanProgress(db, "P", "M")).toBe(0);
+    } finally { await pool.close(); }
   });
   test("liveness holds with an inherited longer transaction_timeout on the connection", async () => {
     const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "5000" } } as any);
