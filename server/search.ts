@@ -667,17 +667,27 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
       if (!sp || (await q`select 1 from tomb where key = any(${q.array((sp.canons as string[]).map((c) => "canon:" + c), "text")}) limit 1`).length)
         throw new HttpError(404, "not found or not readable");
-      // The view: the search result's view_key tip when given, else the same rule as search labels. A tip
-      // that names no view holding this span is reported (view_basis unknown, no neighbours), not replaced.
-      const views = await q`select ord, tip, spans, span_ids from view where source = ${sp.source} and span_ids @> array[${sid}]::text[] order by ord`;
-      let v: any, vb: ViewBasis, reason: string | null = null;
-      if (typeof body.view_tip === "string") {
-        v = views.find((x: any) => x.tip === body.view_tip);
-        vb = "unknown";
-        if (!v) reason = "view-not-found";
-        else vb = typeof body.view_basis === "string" && ["observed", "inferred-tail"].includes(body.view_basis) ? body.view_basis : "observed";
+      // The view: the search result's `view_key` as given (its source may be a fork child whose view holds this
+      // span), or `leaf` for the querying session's own view, else the target rule of search labels. A key that
+      // names no view holding this span is reported (view_basis unknown, no neighbours), never replaced; a key
+      // from an older version of its source is still followed when its tip exists (a tip fixes the path) and is
+      // marked stale with the current version.
+      const vkIn = body.view_key && typeof body.view_key === "object" ? body.view_key
+        : typeof body.leaf === "string" ? { source: r.source, tip: body.leaf, basis: "observed" } : null;
+      let vsrc: string = sp.source, v: any, vb: ViewBasis, reason: string | null = null, stale: object | null = null;
+      if (vkIn) {
+        if (typeof vkIn.source !== "string" || typeof vkIn.tip !== "string" && vkIn.tip !== null) throw new HttpError(400, "view_key");
+        if (!b.valid.has(vkIn.source)) throw new HttpError(404, "not found or not readable");
+        vsrc = vkIn.source;
+        const views = await q`select ord, tip, spans from view where source = ${vsrc} and span_ids @> array[${sid}]::text[]`;
+        v = vkIn.tip === null ? undefined : views.find((x: any) => x.tip === vkIn.tip);
+        vb = v && ["observed", "inferred-tail"].includes(vkIn.basis) ? vkIn.basis : "unknown";
+        if (!v) reason = vkIn.tip === null ? "view-unknown" : "view-not-found";
+        const now = b.valid.get(vsrc)!.deps["s:" + vsrc];
+        if (v && Number.isInteger(vkIn.version) && vkIn.version !== now) stale = { version: vkIn.version, version_now: now };
       } else {
         const t = await targetView(q, sp.source);
+        const views = await q`select ord, tip, spans from view where source = ${sp.source} and span_ids @> array[${sid}]::text[]`;
         v = t.v && views.find((x: any) => x.tip === t.v!.tip);
         vb = t.basis;
         reason = t.reason ?? null;
@@ -691,9 +701,10 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       const more = pg.more;
       const summary = (await q`select text from span_summary ss join span s on s.id = ss.span where ss.span = ${sid} and ss.input_fp = s.input_fp`)[0]?.text ?? null;
       return {
-        deps: depsOf(b, [sp.source, ...[...t.values()].map((x) => x.source)]),
+        deps: depsOf(b, [sp.source, vsrc, ...[...t.values()].map((x) => x.source)]),
         body: {
-          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, view_basis: vb, ...(reason ? { reason } : {}), summary, records, more, next_offset: pg.next,
+          id: "span:" + sid, source: sp.source, view_key: { source: vsrc, tip: v?.tip ?? null, basis: vb, version: b.valid.get(vsrc)!.deps["s:" + vsrc] ?? null },
+          view_basis: vb, ...(reason ? { reason } : {}), ...(stale ? { stale } : {}), summary, records, more, next_offset: pg.next,
           before: i > 0 ? "span:" + order[i - 1] : null, after: i >= 0 && i < order.length - 1 ? "span:" + order[i + 1] : null,
         },
       };

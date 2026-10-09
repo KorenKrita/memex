@@ -961,24 +961,70 @@ test("a unit's label merges its representations; an on-path excerpt does not upg
   expect(r2.results.find((x: any) => x.key === "unit:" + S).path.label).toBe("on-path");
 });
 
-test("zoom follows the search result's view key; a view key it cannot find is reported, not replaced", async () => {
-  const { S, P, B1, U1 } = await branched();
+test("zoom takes the search result's view_key as returned; a key it cannot find is reported, not replaced", async () => {
+  const { src, S, P, B1, U1 } = await branched();
   const on = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on");
   const vk = on.path.view_key;
-  // Along b2: P → b1 → (v1 b2).
-  let z = (await zoom(db, T0({ id: "span:" + P, view_tip: vk.tip, view_basis: vk.basis }))).body as any;
-  expect(z).toMatchObject({ view_tip: "b2", view_basis: "inferred-tail", before: null, after: "span:" + B1 });
+  // Along b2: P → b1 → (v1 b2), with the key passed through unchanged.
+  let z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_key: { source: src, tip: "b2", basis: "inferred-tail" }, view_basis: "inferred-tail", before: null, after: "span:" + B1 });
+  expect(z.stale).toBeUndefined();
   // S is not on b2: no neighbours, the reason given (it is not quietly zoomed along a2).
-  z = (await zoom(db, T0({ id: "span:" + S, view_tip: vk.tip }))).body as any;
-  expect(z).toMatchObject({ view_tip: null, view_basis: "unknown", reason: "view-not-found", before: null, after: null });
+  z = (await zoom(db, T0({ id: "span:" + S, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_key: { tip: null }, view_basis: "unknown", reason: "view-not-found", before: null, after: null });
   expect(z.records.length).toBe(3);
-  // Without a view key: the target session's own view rule; S off the tail view → unknown as well.
+  // A leaf reported later does not move a zoom that names its key: still along b2.
+  await db`insert into collector_view values (${src}, 'c9', 'a2', now())`;
+  z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_key: { tip: "b2" }, after: "span:" + B1 });
+  // Without a key: the target session's own rule, now the observed leaf a2: S → (u1 a2).
   z = (await zoom(db, T0({ id: "span:" + S }))).body as any;
-  expect(z).toMatchObject({ view_basis: "unknown", reason: "span-off-view", after: null });
-  // An observed leaf on a2: S → (u1 a2).
-  await db`insert into collector_view values (${sourceIdOf("pi", "br")}, 'c9', 'a2', now())`;
-  z = (await zoom(db, T0({ id: "span:" + S }))).body as any;
-  expect(z).toMatchObject({ view_tip: "a2", view_basis: "observed", after: "span:" + U1 });
+  expect(z).toMatchObject({ view_key: { tip: "a2" }, view_basis: "observed", after: "span:" + U1 });
+  // An unknown key (basis unknown, tip null) stays unknown.
+  z = (await zoom(db, T0({ id: "span:" + P, view_key: { ...vk, tip: null, basis: "unknown" } }))).body as any;
+  expect(z).toMatchObject({ view_basis: "unknown", reason: "view-unknown", after: null });
+  // The querying session's own leaf (mem_zoom's leaf_id): its view.
+  z = (await zoom(db, T0({ id: "span:" + P, source: src, leaf: "b2" }))).body as any;
+  expect(z).toMatchObject({ view_key: { source: src, tip: "b2" }, after: "span:" + B1 });
+});
+
+test("zoom view_key: an older version is followed and marked stale; an unreadable or bad key is refused", async () => {
+  const { src, P, B1 } = await branched();
+  const vk = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
+  const l1 = [header("br"), msg("user", "u0", null, "alpha choose db"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis brtoken-off"),
+    msg("user", "u1", "a1", "next q"), msg("assistant", "a2", "u1", "ok"), msg("assistant", "b1", "a0", "only postgres brtoken-on"), msg("user", "v1", "b1", "go on"),
+    msg("assistant", "b2", "v1", "fine")];
+  // The other branch grows: a new version, b2 is still a tip and fixes the same path → followed, marked stale.
+  await put("br", [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure")]);
+  await drain(db);
+  let z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_key: { tip: "b2" }, after: "span:" + B1, stale: { version: vk.version } });
+  expect(z.stale.version_now).toBeGreaterThan(vk.version);
+  // This branch grows past b2: b2 is no longer a tip → reported, not replaced by the new tip.
+  await put("br", [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure"), msg("user", "v2", "b2", "more"), msg("assistant", "b3", "v2", "sure")]);
+  await drain(db);
+  z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_basis: "unknown", reason: "view-not-found", after: null });
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: { ...vk, source: sourceIdOf("pi", "nobody") } }))).rejects.toThrow("not found");
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: { tip: "b2" } }))).rejects.toThrow("view_key");
+  void src;
+});
+
+test("zoom along a fork child's view: a span stored under the parent navigates in the child's order", async () => {
+  const Pp = sourceIdOf("pi", "fz");
+  const pl = [header("fz"), msg("user", "u0", null, "alpha fz-shared"), msg("assistant", "a0", "u0", "x"), msg("user", "u1", "a0", "parent next"), msg("assistant", "a1", "u1", "y")];
+  await put("fz", pl);
+  await drain(db);
+  const C = await put("fc", [header("fc", { parentSession: "/x/fz.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "child next"), msg("assistant", "k2", "k1", "z")], "personal", Pp, "k2");
+  await drain(db);
+  const [shared] = await db`select id from span where source = ${Pp} and keys[1] like 'fz/u0:%'`;
+  const [childNext] = await db`select id from span where source = ${C} and keys[1] like 'fc/k1:%'`;
+  const [parentNext] = await db`select id from span where source = ${Pp} and keys[1] like 'fz/u1:%'`;
+  const cv = (await db`select tip from view where source = ${C}`)[0];
+  let z = (await zoom(db, T0({ id: "span:" + shared.id, view_key: { source: C, tip: cv.tip, basis: "observed" } }))).body as any;
+  expect(z).toMatchObject({ source: Pp, view_key: { source: C, tip: "k2" }, after: "span:" + childNext.id });
+  z = (await zoom(db, T0({ id: "span:" + shared.id }))).body as any;
+  expect(z).toMatchObject({ view_key: { source: Pp }, after: "span:" + parentNext.id });
 });
 
 test("label merge: unanimous stays, disagreement is mixed, an unlocated or branched representation wins", () => {
