@@ -1,241 +1,160 @@
-// pg_trgm vs ParadeDB pg_search on real span text (DESIGN §6.3 [待核实], §11 item 4).
+// pg_trgm vs ParadeDB pg_search on a lexical-index sample (DESIGN §6.3 [待核实], §11 item 4).
 //
-// Known-item lexical retrieval: queries are cut deterministically from the corpus (a span = the target);
-// the relevant set of a query is every span containing it (case-insensitive substring; for two-term
-// queries, both). This measures what the raw-text channel is for (paths, identifiers, error strings, rare
-// Chinese words); it says nothing about paraphrased questions (the embedding channel's job).
+// Corpus: eval/sample-lexical.ts output (raw record text in ≤ 2 KB chunks, as lexical_chunks would hold it).
+// Queries: a fixed, hand-checked file [{ cls, terms, intended? }]. Relevance:
+//   - literal classes (zh, path, ident, error, ident-part, terms): chunks containing every term
+//     (case-insensitive substring), complete by construction over this corpus;
+//   - typo: chunks containing the `intended` spelling;
+//   - neg: no chunk is relevant; any result counts as a false hit.
+// Reported per class and method: hit@10 (any relevant in top 10), P@10 = relevant in top 10 / min(|rel|, 10),
+// MRR, latency p50/p95. Any query error aborts the run (exit 1): a failed query is not an empty result.
+// Tables live in schema fts_v2, created fresh; nothing else in the database is touched.
 //
-//   docker run -d --name memex-fts-test -e POSTGRES_PASSWORD=memex -e POSTGRES_DB=memex \
-//     -p 127.0.0.1:55433:5432 --tmpfs /var/lib/postgresql paradedb/paradedb:latest
-//   bun eval/fts-compare.ts /tmp/memex-eval/corpus.jsonl /tmp/memex-eval/fts-result.json
+//   bun eval/fts-compare.ts /tmp/memex-eval/lexical.jsonl /tmp/memex-eval/fts-queries.json /tmp/memex-eval/fts-v2.json
 import { SQL } from "bun";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
-const [corpusPath, outPath] = process.argv.slice(2);
-if (!corpusPath || !outPath) throw new Error("usage: fts-compare.ts <corpus.jsonl> <out.json>");
+const [corpusPath, queryPath, outPath] = process.argv.slice(2);
+if (!corpusPath || !queryPath || !outPath) throw new Error("usage: fts-compare.ts <lexical.jsonl> <queries.json> <out.json>");
 const sql = new SQL(process.env.MEMEX_FTS_URL ?? "postgres://postgres:memex@127.0.0.1:55433/memex");
 const K = 10;
-const PER_CLASS = 40;
 
-// ---------- corpus ----------
-const docs: string[] = readFileSync(corpusPath, "utf8")
-  .trim()
-  .split("\n")
-  .map((l) => JSON.parse(l).text as string)
-  .map((t) => t.replaceAll("\u0000", ""));
+const corpusText = readFileSync(corpusPath, "utf8");
+const lines = corpusText.trim().split("\n").map((l) => JSON.parse(l));
+const header = lines[0].header ? lines.shift() : undefined;
+const docs: string[] = lines.map((l) => l.text);
 const lower = docs.map((d) => d.toLowerCase());
-const has = (i: number, q: string) => lower[i].includes(q.toLowerCase());
-const df = (q: string) => lower.reduce((a, _, i) => a + (has(i, q) ? 1 : 0), 0);
-
-// ---------- queries ----------
-type Q = { cls: string; q: string; terms: string[]; relevant: number[]; target?: number; note?: string };
-const h = (s: string) => createHash("sha256").update(s).digest("hex");
-const order = docs.map((_, i) => i).sort((a, b) => (h(`q${a}`) < h(`q${b}`) ? -1 : 1)); // deterministic target order
-const seen = new Set<string>();
-const queries: Q[] = [];
-const relevantOf = (terms: string[]) => docs.map((_, i) => i).filter((i) => terms.every((t) => has(i, t)));
-function addFrom(cls: string, pick: (text: string) => string[], opts: { maxDf?: number; minDf?: number } = {}) {
-  let n = 0;
-  for (const i of order) {
-    if (n >= PER_CLASS) break;
-    for (const cand of pick(docs[i])) {
-      const key = cls + "\u0000" + cand.toLowerCase();
-      if (seen.has(key)) continue;
-      const d = df(cand);
-      if (d < (opts.minDf ?? 1) || d > (opts.maxDf ?? 5)) continue;
-      seen.add(key);
-      queries.push({ cls, q: cand, terms: [cand], relevant: relevantOf([cand]), target: i });
-      n++;
-      break;
-    }
-  }
-}
-const uniq = (xs: string[]) => [...new Set(xs)];
-// Chinese: runs of 2–6 Han characters inside longer Han text (a word or phrase as one would type it)
-addFrom("zh", (t) => uniq([...t.matchAll(/[\p{Script=Han}]{4,}/gu)].flatMap((m) => [m[0].slice(0, 4), m[0].slice(1, 3), m[0].slice(0, 6)]).filter((s) => s.length >= 2)));
-// identifiers: camelCase / snake_case / kebab-case tokens
-addFrom("ident", (t) => uniq([...t.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][a-z0-9]+|_[a-z0-9]+|-[a-z0-9]+)+\b/g)].map((m) => m[0]).filter((s) => s.length >= 8)));
-// paths: two or more segments with a slash and a file-like tail
-addFrom("path", (t) => uniq([...t.matchAll(/(?:~|\.{0,2})?\/?(?:[\w.-]+\/)+[\w.-]+\.[a-z]{1,5}\b/g)].map((m) => m[0]).filter((s) => s.length >= 10)));
-// error strings: 3–5 words around error/failed/exception
-addFrom("error", (t) =>
-  uniq([...t.matchAll(/(?:[\w'`.:-]+ ){0,2}(?:error|Error|failed|Failed|exception|Exception|denied|not found)(?: [\w'`.:-]+){1,2}/g)].map((m) => m[0].trim()).filter((s) => s.length >= 12)),
-);
-// identifier fragment: an inner camelCase / snake_case part (≥ 6 chars) of a longer identifier
-addFrom(
-  "ident-part",
-  (t) =>
-    uniq(
-      [...t.matchAll(/\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+){2,}\b/g)].flatMap((m) => m[0].split(/(?=[A-Z])/).slice(1).filter((p) => p.length >= 6)),
-    ),
-  { maxDf: 8 },
-);
-// two terms from one span, not adjacent: a Chinese word and an identifier
-{
-  let n = 0;
-  for (const i of order) {
-    if (n >= PER_CLASS) break;
-    const zh = [...docs[i].matchAll(/[\p{Script=Han}]{2,4}/gu)].map((m) => m[0]).filter((s) => df(s) <= 200 && df(s) >= 2);
-    const id = [...docs[i].matchAll(/\b[A-Za-z][A-Za-z0-9_]{5,}\b/g)].map((m) => m[0]).filter((s) => df(s) <= 200 && df(s) >= 2);
-    if (!zh.length || !id.length) continue;
-    const terms = [zh[0], id[Math.floor(id.length / 2)]];
-    const rel = relevantOf(terms);
-    if (rel.length > 5 || seen.has("mixed" + terms.join("|"))) continue;
-    seen.add("mixed" + terms.join("|"));
-    queries.push({ cls: "mixed", q: terms.join(" "), terms, relevant: rel, target: i });
-    n++;
-  }
-}
-// typo: one inner letter of a rare identifier dropped; relevant = spans containing the original
-{
-  let n = 0;
-  for (const q of queries.filter((x) => x.cls === "ident")) {
-    if (n >= PER_CLASS) break;
-    const s = q.q;
-    const at = Math.floor(s.length / 2);
-    const typo = s.slice(0, at) + s.slice(at + 1);
-    if (df(typo) > 0) continue;
-    queries.push({ cls: "typo", q: typo, terms: [typo], relevant: q.relevant, target: q.target, note: `from ${s}` });
-    n++;
-  }
-}
-// negatives: absent strings that look real (identifier with a swapped segment, absent Chinese phrase)
-{
-  const ids = queries.filter((x) => x.cls === "ident").map((x) => x.q);
-  const zhs = queries.filter((x) => x.cls === "zh").map((x) => x.q);
-  let n = 0;
-  for (let k = 0; k < ids.length && n < PER_CLASS / 2; k++) {
-    const a = ids[k].split(/(?=[A-Z_-])/);
-    const b = ids[(k + 7) % ids.length].split(/(?=[A-Z_-])/);
-    if (a.length < 2 || b.length < 2) continue;
-    const neg = a[0] + b[b.length - 1];
-    if (df(neg) > 0) continue;
-    queries.push({ cls: "negative", q: neg, terms: [neg], relevant: [] });
-    n++;
-  }
-  for (let k = 0; k + 1 < zhs.length && n < PER_CLASS; k += 2) {
-    const neg = zhs[k].slice(0, 2) + zhs[k + 1].slice(-2);
-    if (neg.length < 4 || df(neg) > 0) continue;
-    queries.push({ cls: "negative", q: neg, terms: [neg], relevant: [] });
-    n++;
-  }
-}
+const queryText = readFileSync(queryPath, "utf8");
+type Q = { cls: string; terms: string[]; intended?: string; relevant: Set<number> };
+const queries: Q[] = JSON.parse(queryText).map((q: any) => {
+  const want = (q.cls === "typo" ? [q.intended] : q.terms).map((t: string) => t.toLowerCase());
+  const relevant = q.cls === "neg" ? new Set<number>() : new Set(lower.flatMap((d, i) => (want.every((t: string) => d.includes(t)) ? [i] : [])));
+  if (q.cls !== "neg" && relevant.size === 0) throw new Error(`query has no relevant chunk: ${JSON.stringify(q)}`);
+  if (q.cls === "neg" && lower.some((d) => q.terms.every((t: string) => d.includes(t.toLowerCase())))) throw new Error(`negative query is present: ${q.terms}`);
+  return { ...q, relevant };
+});
 
 // ---------- database ----------
-await sql`drop table if exists spans`;
-await sql`create table spans (id int primary key, body text not null)`;
-for (let i = 0; i < docs.length; i += 200) {
-  const rows = docs.slice(i, i + 200).map((body, j) => ({ id: i + j, body }));
-  await sql`insert into spans ${sql(rows)}`;
-}
-await sql`create extension if not exists pg_trgm`;
-await sql`create extension if not exists pg_search`;
+const [ver] = await sql`select version() v, (select extversion from pg_extension where extname = 'pg_search') pg_search, (select extversion from pg_extension where extname = 'pg_trgm') pg_trgm`;
+await sql`drop schema if exists fts_v2 cascade`;
+await sql`create schema fts_v2`;
+await sql`create table fts_v2.chunks (id int primary key, body text not null)`;
+for (let i = 0; i < docs.length; i += 500) await sql`insert into fts_v2.chunks ${sql(docs.slice(i, i + 500).map((body, j) => ({ id: i + j, body })))}`;
 const t0 = performance.now();
-await sql`create index spans_trgm on spans using gin (body gin_trgm_ops)`;
+await sql`create index chunks_trgm on fts_v2.chunks using gin (body gin_trgm_ops)`;
 const trgmBuild = performance.now() - t0;
 const t1 = performance.now();
-await sql.unsafe(`create index spans_bm25 on spans using paradedb (
+await sql.unsafe(`create index chunks_bm25 on fts_v2.chunks using bm25 (
   id,
   (body::pdb.jieba),
-  (body::pdb.chinese_compatible('alias=cc')),
   (body::pdb.source_code('alias=code')),
   (body::pdb.ngram(2,3,'alias=ng'))
 ) with (key_field = 'id')`);
 const bm25Build = performance.now() - t1;
-await sql`analyze spans`;
-const [sizes] = await sql`select pg_relation_size('spans_trgm') trgm, pg_relation_size('spans_bm25') bm25, pg_total_relation_size('spans') - pg_indexes_size('spans') heap`;
+await sql`analyze fts_v2.chunks`;
+const [sizes] = await sql`select pg_relation_size('fts_v2.chunks_trgm') trgm, pg_relation_size('fts_v2.chunks_bm25') bm25, pg_relation_size('fts_v2.chunks') heap, pg_total_relation_size('fts_v2.chunks') total`;
 
 // ---------- methods ----------
-// Each returns the top-K span ids for a query. Multi-term queries: every term must match (AND).
-type Method = { name: string; run: (q: Q) => Promise<number[]> };
-const ilikeAll = (q: Q) => q.terms.map((_, k) => `body ilike '%' || $${k + 1} || '%'`).join(" and ");
+// Each returns the top-K chunk ids. Several terms: every term must match (AND).
 const esc = (s: string) => s.replace(/[\\%_]/g, (c) => "\\" + c);
-const bm25 = (field: string, op: string) => async (q: Q) => {
-  const where = q.terms.map((_, k) => `${field} ${op} $${k + 1}`).join(" and ");
-  const rows = await sql.unsafe(`select id from spans where ${where} order by pdb.score(id) desc, id limit ${K}`, q.terms);
-  return rows.map((r: any) => r.id);
-};
+type Method = { name: string; sql: (q: Q) => [string, string[]] };
 const methods: Method[] = [
   {
-    // exact substring, ranked by trigram word similarity (the index serves ILIKE for patterns of ≥ 3 chars)
+    // exact substring (the trigram index serves ILIKE), ranked by word similarity
     name: "trgm-ilike",
-    run: async (q) => {
-      const rank = q.terms.map((_, k) => `word_similarity($${k + 1}, body)`).join(" + ");
-      const rows = await sql.unsafe(`select id from spans where ${ilikeAll(q)} order by ${rank} desc, id limit ${K}`, q.terms.map(esc));
-      return rows.map((r: any) => r.id);
+    sql: (q) => {
+      const n = q.terms.length; // $1..$n escaped patterns, $n+1..$2n raw terms for ranking
+      const where = q.terms.map((_, k) => `body ilike '%' || $${k + 1} || '%'`).join(" and ");
+      const rank = q.terms.map((_, k) => `word_similarity($${n + k + 1}, body)`).join(" + ");
+      return [`select id from fts_v2.chunks where ${where} order by ${rank} desc, id limit ${K}`, [...q.terms.map(esc), ...q.terms]];
     },
   },
   {
-    // fuzzy fallback: word similarity above the default threshold (0.6), every term
+    // fuzzy: word similarity ≥ pg_trgm.word_similarity_threshold (0.6) for every term
     name: "trgm-fuzzy",
-    run: async (q) => {
-      const where = q.terms.map((_, k) => `$${k + 1} <% body`).join(" and ");
-      const rank = q.terms.map((_, k) => `word_similarity($${k + 1}, body)`).join(" + ");
-      const rows = await sql.unsafe(`select id from spans where ${where} order by ${rank} desc, id limit ${K}`, q.terms);
-      return rows.map((r: any) => r.id);
-    },
+    sql: (q) => [`select id from fts_v2.chunks where ${q.terms.map((_, k) => `$${k + 1} <% body`).join(" and ")} order by ${q.terms.map((_, k) => `word_similarity($${k + 1}, body)`).join(" + ")} desc, id limit ${K}`, q.terms],
   },
-  { name: "jieba-or", run: bm25("body", "|||") },
-  { name: "jieba-and", run: bm25("body", "&&&") },
-  { name: "cc-and", run: bm25("body::pdb.alias('cc')", "&&&") },
-  { name: "code-and", run: bm25("body::pdb.alias('code')", "&&&") },
-  { name: "ngram-and", run: bm25("body::pdb.alias('ng')", "&&&") },
+  ...(
+    [
+      ["jieba-and", "body", "&&&"],
+      ["code-and", "body::pdb.alias('code')", "&&&"],
+      ["ngram-and", "body::pdb.alias('ng')", "&&&"],
+      ["jieba-phrase", "body", "###"],
+      // ngram ### is rejected by pg_search 0.26 ("does not support this query type")
+    ] as const
+  ).map(([name, field, op]) => ({
+    name,
+    sql: (q: Q): [string, string[]] => [`select id from fts_v2.chunks where ${q.terms.map((_, k) => `${field} ${op} $${k + 1}`).join(" and ")} order by pdb.score(id) desc, id limit ${K}`, q.terms],
+  })),
 ];
 
 // ---------- run ----------
-const per: Record<string, Record<string, { hit: number; recall: number; mrr: number; fp: number; n: number; ms: number[]; errors: number }>> = {};
-const samples: Record<string, { cls: string; q: string; relevant: number; got: Record<string, number[]> }[]> = {};
-for (const m of methods) for (const q of queries.slice(0, 5)) await m.run(q).catch(() => {}); // warm up
-for (const q of queries) {
-  const rel = new Set(q.relevant);
-  const got: Record<string, number[]> = {};
-  for (const m of methods) {
-    const c = ((per[m.name] ??= {})[q.cls] ??= { hit: 0, recall: 0, mrr: 0, fp: 0, n: 0, ms: [], errors: 0 });
-    c.n++;
-    const t = performance.now();
-    let ids: number[] = [];
-    try {
-      ids = await m.run(q);
-    } catch {
-      c.errors++;
-    }
-    c.ms.push(performance.now() - t);
-    got[m.name] = ids;
-    if (rel.size === 0) {
-      c.fp += ids.length > 0 ? 1 : 0; // any result for an absent string is a false hit
-      continue;
-    }
-    const first = ids.findIndex((id) => rel.has(id));
-    c.hit += first >= 0 ? 1 : 0;
-    c.mrr += first >= 0 ? 1 / (first + 1) : 0;
-    c.recall += ids.filter((id) => rel.has(id)).length / Math.min(rel.size, K);
+const run = async (m: Method, q: Q): Promise<number[]> => {
+  const [text, params] = m.sql(q);
+  try {
+    return (await sql.unsafe(text, params)).map((r: any) => r.id as number);
+  } catch (e) {
+    console.error(JSON.stringify({ method: m.name, query: q.terms, sql: text, error: String((e as Error).message ?? e) }));
+    process.exit(1);
   }
-  (samples[q.cls] ??= []).length < 3 && samples[q.cls].push({ cls: q.cls, q: q.q, relevant: q.relevant.length, got });
+};
+for (const m of methods) for (const q of queries.slice(0, 3)) await run(m, q); // warm-up, errors abort too
+type Cell = { n: number; hit: number; p: number; mrr: number; falseHit: number; ms: number[] };
+const per: Record<string, Record<string, Cell>> = {};
+const perQuery: any[] = [];
+for (const q of queries) {
+  const row: any = { cls: q.cls, terms: q.terms, intended: q.intended, relevant: q.relevant.size, methods: {} };
+  for (const m of methods) {
+    const c = ((per[q.cls] ??= {})[m.name] ??= { n: 0, hit: 0, p: 0, mrr: 0, falseHit: 0, ms: [] });
+    const t = performance.now();
+    const ids = await run(m, q);
+    c.ms.push(performance.now() - t);
+    c.n++;
+    const rel = ids.filter((id) => q.relevant.has(id)).length;
+    const first = ids.findIndex((id) => q.relevant.has(id));
+    if (q.cls === "neg") c.falseHit += ids.length ? 1 : 0;
+    else {
+      c.hit += first >= 0 ? 1 : 0;
+      c.p += rel / Math.min(q.relevant.size, K);
+      c.mrr += first >= 0 ? 1 / (first + 1) : 0;
+    }
+    row.methods[m.name] = { returned: ids.length, relevantInTop: rel, firstRank: first >= 0 ? first + 1 : null };
+  }
+  perQuery.push(row);
 }
 const pct = (xs: number[], p: number) => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))];
 const table: Record<string, Record<string, string>> = {};
-for (const [m, byCls] of Object.entries(per))
-  for (const [cls, c] of Object.entries(byCls)) {
-    const pos = c.n;
+for (const [cls, byM] of Object.entries(per))
+  for (const [m, c] of Object.entries(byM))
     (table[cls] ??= {})[m] =
-      cls === "negative"
-        ? `falseHit ${c.fp}/${pos} p50 ${pct(c.ms, 0.5).toFixed(1)}ms${c.errors ? ` err ${c.errors}` : ""}`
-        : `hit@${K} ${((100 * c.hit) / pos).toFixed(0)}% recall ${((100 * c.recall) / pos).toFixed(0)}% mrr ${(c.mrr / pos).toFixed(2)} p50 ${pct(c.ms, 0.5).toFixed(1)}ms p95 ${pct(c.ms, 0.95).toFixed(1)}ms${c.errors ? ` err ${c.errors}` : ""}`;
+      (cls === "neg" ? `falseHit ${c.falseHit}/${c.n}` : `hit@${K} ${c.hit}/${c.n} P@${K} ${((100 * c.p) / c.n).toFixed(0)}% MRR ${(c.mrr / c.n).toFixed(2)}`) +
+      ` p50 ${pct(c.ms, 0.5).toFixed(1)}ms p95 ${pct(c.ms, 0.95).toFixed(1)}ms`;
+
+// ---------- plans for the slow path ----------
+const plans: Record<string, string[]> = {};
+for (const q of [queries.find((x) => x.cls === "typo")!, queries.find((x) => x.cls === "ident")!]) {
+  for (const name of ["trgm-fuzzy", "trgm-ilike"]) {
+    const [text, params] = methods.find((m) => m.name === name)!.sql(q);
+    plans[`${name} ${q.cls} ${q.terms.join(" ")}`] = (await sql.unsafe(`explain (analyze, buffers) ${text}`, params)).map((r: any) => r["QUERY PLAN"]);
   }
-const counts = Object.fromEntries(Object.entries(Object.groupBy(queries, (q) => q.cls)).map(([k, v]) => [k, v!.length]));
+}
+
+const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const result = {
-  corpus: { spans: docs.length, bytes: docs.reduce((a, d) => a + Buffer.byteLength(d), 0) },
+  env: { ...ver, image: process.env.MEMEX_FTS_IMAGE },
+  corpus: { header, chunks: docs.length, bytes: docs.reduce((a, d) => a + Buffer.byteLength(d), 0), fileSha256: sha(corpusText) },
+  queries: { file: queryPath, sha256: sha(queryText), count: queries.length },
   build: { trgmMs: Math.round(trgmBuild), bm25Ms: Math.round(bm25Build), ...Object.fromEntries(Object.entries(sizes).map(([k, v]) => [k + "Bytes", Number(v)])) },
-  queries: counts,
   table,
-  queriesUsed: queries.map(({ cls, q, relevant, note }) => ({ cls, q, relevant: relevant.length, note })),
-  samples,
+  perQuery,
+  plans,
 };
 writeFileSync(outPath, JSON.stringify(result, null, 2), { mode: 0o600 });
-console.log(JSON.stringify({ corpus: result.corpus, build: result.build, queries: counts }, null, 1));
+console.log(JSON.stringify({ env: result.env, corpus: { chunks: result.corpus.chunks, bytes: result.corpus.bytes }, build: result.build }, null, 1));
 for (const [cls, row] of Object.entries(table)) {
   console.log(`\n[${cls}]`);
-  for (const [m, v] of Object.entries(row)) console.log(`  ${m.padEnd(11)} ${v}`);
+  for (const [m, v] of Object.entries(row)) console.log(`  ${m.padEnd(13)} ${v}`);
 }
+for (const [k, v] of Object.entries(plans)) console.log(`\n${k}\n  ` + v.join("\n  "));
 await sql.close();

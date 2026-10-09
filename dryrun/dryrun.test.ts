@@ -1007,4 +1007,41 @@ describe("span hook", () => {
     const own = child.flatMap((g) => g.span.records).find((x: any) => x.id === "b");
     expect(own.key.startsWith("cc/")).toBe(true);
   });
+
+  test("lexical hook: raw text of every lexical record (thinking, context, whole tool output), no memory, sums to lexicalBytes", () => {
+    const out = `${"H".repeat(1500)}\nMIDDLE-ONLY-TOKEN\n${"T".repeat(1500)}`;
+    file("hook/lex/s.jsonl", [
+      piHeader(),
+      piMsg("s", null, { role: "system", sections: { memex: "SNAPSHOT", base: "BASE RULES" }, timestamp: 1 }),
+      piMsg("u", "s", user("q")),
+      piMsg("t", "u", asst([{ type: "thinking", thinking: "THOUGHT" }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }])),
+      piMsg("r", "t", result("c1", out)),
+      piMsg("m", "r", call("c2", "mcp__memex__mem_zoom")),
+      piMsg("mr", "m", result("c2", "MEMORY RESULT", "mcp__memex__mem_zoom")),
+      piMsg("a", "mr", say("done")),
+    ]);
+    const lex: { file: string; rec: any }[] = [];
+    const r = dryRun([join(dir, "hook/lex")], undefined, (file, rec) => lex.push({ file, rec }));
+    const texts = lex.map((x) => x.rec.text);
+    expect(texts).toContain("BASE RULES");
+    expect(texts).toContain("THOUGHT");
+    expect(texts).toContain(out); // not clipped: the middle survives
+    expect(texts.join("\n")).not.toContain("MEMORY RESULT");
+    expect(texts.join("\n")).not.toContain("SNAPSHOT");
+    expect(lex.reduce((a, x) => a + B(x.rec.text), 0)).toBe(r.total.lexicalBytes);
+    expect(new Set(lex.map((x) => x.rec.key)).size).toBe(lex.length);
+  });
+
+  test("lexical hook: copies once, a resolved fork adds only its own records", () => {
+    const rows = [piHeader({ id: "lc" }), piMsg("u", null, user("copied"))];
+    file("hook/lexcopy/a.jsonl", rows);
+    file("hook/lexcopy/b.jsonl", rows);
+    const P = file("hook/lexcopy/P.jsonl", [piHeader({ id: "lp" }), piMsg("u", null, user("parent q")), piMsg("a", "u", say("parent a"))]);
+    file("hook/lexcopy/C.jsonl", [piHeader({ id: "lch", parentSession: P }), piMsg("u", null, user("parent q")), piMsg("b", "u", say("child b"))]);
+    const lex: string[] = [];
+    const r = dryRun([join(dir, "hook/lexcopy")], undefined, (_f, rec) => lex.push(rec.text));
+    expect(r.forks.resolved).toBe(1);
+    expect(lex.sort()).toEqual(["child b", "copied", "parent a", "parent q"]);
+    expect(lex.reduce((a, t) => a + B(t), 0)).toBe(r.total.lexicalBytes);
+  });
 });

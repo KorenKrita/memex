@@ -379,7 +379,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
 }
 
 // Unique records: evidence, digest and lexical bytes, exclusions. Independent of how views share them.
-function account(recs: Rec[], res: FileResult) {
+function account(recs: Rec[], res: FileResult, onLexical?: LexicalSink) {
   const evidence = new Set<string>();
   const excludedSeen = new Set<string>();
   for (const r of recs) {
@@ -397,6 +397,7 @@ function account(recs: Rec[], res: FileResult) {
     const n = bytes(r.text);
     res.lexicalBytes += n;
     res.lexicalChunks += Math.ceil(n / LEXICAL_CHUNK);
+    if (onLexical && n) onLexical({ id: r.id, key: r.key, kind: r.kind, text: r.text });
   }
   res.evidence = evidence.size;
 }
@@ -825,12 +826,15 @@ function skip(res: FileResult, reason: FileResult["reason"]): Parsed {
 // A newly counted span and its summary-input records (digest text), for local sampling tools (eval/).
 export type SpanRecord = { id: string; key: string; kind: string; digest: string };
 export type SpanSink = (span: { id: string; prefix: boolean; records: SpanRecord[]; context: SpanRecord[] }) => void;
+// One record of the lexical index (raw text, not clipped; memory results never reach it), once per unique record.
+export type LexicalSink = (rec: { id: string; key: string; kind: string; text: string }) => void;
 
 export interface AnalyzeOptions {
   parent?: ParentLookup; // Pi fork parents among the approved inputs (dryRun supplies it)
   identity?: string; // dev:ino from collect(); the file must still be that inode
   contentHash?: string; // sha256 seen by dryRun's copy pre-pass; the file must still have it
   onSpan?: SpanSink; // called once per span this file adds
+  onLexical?: LexicalSink; // called once per record this file adds to the lexical index
 }
 
 export function analyzeFile(path: string, opts: AnalyzeOptions = {}): FileResult {
@@ -849,7 +853,7 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
     else if (lines[0].type === "session_meta") parsed = codexFile(path, lines, res);
     else return skip(res, "unknown-format"), { res };
     if (res.status !== "indexed") return { res };
-    account(parsed.recs, res);
+    account(parsed.recs, res, opts.onLexical);
     const family = parsed.from?.family ?? newFamily();
     const fileViews = partition(parsed.views, res, family, parsed.from?.views, opts.onSpan);
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
@@ -906,8 +910,13 @@ export function collect(inputs: string[]): { files: string[]; identity: Map<stri
   return { files: [...files].sort(), identity, symlinks: [...symlinks].sort(), errors };
 }
 
-// `onSpan(file, span)`: each counted span with its file, for local sampling (eval/); counting is unchanged.
-export function dryRun(inputs: string[], onSpan?: (file: string, span: Parameters<SpanSink>[0]) => void) {
+// `onSpan(file, span)`: each counted span with its file, for local sampling (eval/); `onLexical(file, rec)`:
+// each record of the lexical index with its file. Counting is unchanged.
+export function dryRun(
+  inputs: string[],
+  onSpan?: (file: string, span: Parameters<SpanSink>[0]) => void,
+  onLexical?: (file: string, rec: Parameters<LexicalSink>[0]) => void,
+) {
   const { files, identity, symlinks, errors } = collect(inputs);
   const approved = new Set(files);
   // Pi copies (DESIGN §4.1): files with the same header id are one native session. Identical copies are
@@ -965,7 +974,7 @@ export function dryRun(inputs: string[], onSpan?: (file: string, span: Parameter
         r = { res, parent: run(canon).parent };
       } else {
         busy.add(f);
-        r = analyze(f, { parent, identity: identity.get(f), contentHash: copyHash.get(f), onSpan: onSpan && ((s) => onSpan(f, s)) });
+        r = analyze(f, { parent, identity: identity.get(f), contentHash: copyHash.get(f), onSpan: onSpan && ((s) => onSpan(f, s)), onLexical: onLexical && ((x) => onLexical(f, x)) });
         busy.delete(f);
       }
       done.set(f, r);

@@ -8,7 +8,8 @@ user's OpenViking server is configured with; `ov.conf` is piped in over ssh and 
 |---|---|
 | `sample-spans.ts` | Deterministic span sample through `dryRun()` (copies, fork parents, snapshot checks), per-record digests and the §4.3 `<context>` |
 | `span-trial.py` | §9 step 2: span summaries per §4.3 + embeddings; `--self-test` checks rendering and validation offline |
-| `fts-compare.ts` | `pg_trgm` vs ParadeDB `pg_search` (exploratory, see below) |
+| `sample-lexical.ts` | Lexical-index sample through `dryRun()`'s lexical hook: whole files, raw record text in ≤ 2 KB chunks |
+| `fts-compare.ts` | `pg_trgm` vs ParadeDB `pg_search` on that sample with a fixed query file |
 | `probes/pi-persist-probe.ts` | §11 item 2: Pi lifecycle events vs what is in the session file |
 | `probes/codex-hook-probe.sh`, `probes/codex-appserver-probe.ts` | §11 item 1: Codex hooks per entry point, rollout state at each hook |
 
@@ -49,12 +50,38 @@ local Pi and Codex logs; mean input 9,837 B, mean `<context>` 638 B.
 - Codex cold-file compression: the binary has it, but feature `local_thread_store_compression` is off
   ("under development") in this build; source (b12ac84) compresses rollouts older than 7 days when on.
 
-## FTS comparison (exploratory only)
+## FTS comparison (`/tmp/memex-eval/fts-v2.json`)
 
-`fts-compare.ts` ran a substring known-item micro-benchmark on 3,000 sampled digest spans: relevant = spans
-containing the query string, so `trgm-ilike` scores 100% by construction. It is **not** a basis for choosing:
-it used digest text instead of ~2 KB `lexical_chunks` of raw text, auto-generated queries, and no
-hand-checked relevance. Observations worth re-testing: pg_search `ngram(2,3)` matched Chinese and paths
-almost as well as substring search at ~1 ms; `jieba` missed many Chinese substrings; `source_code` found
-identifier fragments; only trigram similarity (`<%`) handled typos, at ~2 s per query (cause not yet
-analysed).
+Setup: PostgreSQL 18.6, `pg_search` 0.26.0, `pg_trgm` 1.6 (image
+`paradedb/paradedb@sha256:52fc9c95…a217ac`, tmpfs, laptop). Corpus: every lexical record of 150 whole files
+(seed `memex-fts-1`) = 44,327 chunks, 54 MB, including tool output, thinking and context text. Queries: 80,
+fixed in a file (sha256 `c4b1afe2…`), picked by hand from strings that occur in the corpus — Chinese
+words (19), paths (10), identifiers (14), error strings (8), identifier fragments (7), two-term AND (8),
+typos of corpus identifiers (8), absent look-alikes (6). Relevance is substring containment (typos: of the
+intended spelling), which is complete over this corpus but favours `trgm-ilike` by definition. P@10 =
+relevant in top 10 / min(relevant, 10).
+
+| class | trgm-ilike | trgm-fuzzy `<%` | jieba `&&&` | source_code `&&&` | ngram(2,3) `&&&` | jieba phrase `###` |
+|---|---|---|---|---|---|---|
+| zh (19) hit / P@10 | 19 / 100% | 18 / 79% | 17 / 69% | 13 / 44% | 19 / 100% | 19 / 99% |
+| path (10) | 10 / 100% | 10 / 98% | 10 / 90% | 10 / 87% | 10 / 97% | 10 / 100% |
+| ident (14) | 14 / 100% | 14 / 91% | 11 / 71% | 10 / 53% | 14 / 95% | 14 / 97% |
+| error (8) | 8 / 100% | 8 / 91% | 8 / 90% | 7 / 69% | 8 / 91% | 8 / 100% |
+| ident-part (7) | 7 / 100% | 7 / 86% | 3 / 37% | 5 / 39% | 7 / 94% | 3 / 43% |
+| terms AND (8) | 8 / 100% | 7 / 71% | 8 / 95% | 6 / 61% | 8 / 100% | 8 / 100% |
+| typo (8) | 0 | **8 / 100%** | 0 | 0 | 0 | 0 |
+| neg (6) false hits | 0 | 1 | 1 | 0 | 0 | 0 |
+| latency p50 (all) | 1–18 ms | 150–1,070 ms | 2–3 ms | 1–3 ms | 6–12 ms | 2–4 ms |
+
+- Build on 54 MB: trigram GIN 3.1 s, 69 MB; bm25 (three tokenizers) 3.5 s, 231 MB; heap 33 MB.
+- `trgm-ilike` p95 reaches 530 ms on two-character Chinese words: a pattern under three characters has no
+  trigram, so the planner scans the table (44k rows, 360 ms for `罗盘`). Three or more characters use the
+  index (`蛤蟆街`: 0.4 ms).
+- `<%` is slow because the index condition is loose: for `receipt_rejected` the index returns 3,147 rows and
+  the `word_similarity` recheck over whole 2 KB chunks keeps 608 (713 ms). It is the only method that found
+  typos, and it gave one false hit on an absent look-alike identifier.
+- `ngram(2,3)` matched Chinese, paths, identifier fragments and AND queries close to substring search at
+  6–12 ms; it rejects phrase queries (`###`) in 0.26. `jieba` phrase search is exact for whole words but
+  misses identifier fragments; `jieba` AND gave one false hit on an absent Chinese look-alike.
+- Limits: one laptop, one 54 MB sample (the whole local lexical text is 782 MB), queries chosen by one
+  person from the corpus itself, no ranking judgement beyond "contains the string", no concurrent load.
