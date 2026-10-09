@@ -821,3 +821,34 @@ test("an embed refused only because the projection is momentarily stale: the vec
   await drain(db);
   expect((await db`select count(*)::int n from span_summary where embedding is not null`)[0].n).toBe(4);
 });
+
+test("a merge publish holding the barrier is bounded as a whole: forget gets through, nothing is published", async () => {
+  const s = await put("ph", linear("ph", 4));
+  await coldThenStructure();
+  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  const { hooks } = await import("./derive.ts");
+  process.env.MEMEX_PUBLISH_HOLD_MS = "400";
+  let inside!: () => void;
+  const isInside = new Promise<void>((r) => (inside = r));
+  hooks.inPublish = async (tx: any) => {
+    hooks.inPublish = async () => {};
+    inside();
+    await tx`select pg_sleep(0.25)`; // each below the deadline, together above it
+    await tx`select pg_sleep(0.25)`;
+    await tx`select pg_sleep(0.25)`;
+  };
+  let run: Promise<unknown> | undefined;
+  try {
+    run = runMerge(db, (await claimJobFor("merge", pair.id))!).catch((e) => e);
+    await isInside;
+    const t0 = performance.now();
+    await forgetSource(db, s);
+    expect(performance.now() - t0).toBeLessThan(400 + 300);
+  } finally {
+    hooks.inPublish = async () => {};
+    delete process.env.MEMEX_PUBLISH_HOLD_MS;
+    await run;
+  }
+  expect((await db`select count(*)::int n from forest_node where text is not null`)[0].n).toBe(0);
+  expect((await db`select 1 ok`)[0].ok).toBe(1);
+});

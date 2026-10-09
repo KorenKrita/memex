@@ -145,7 +145,8 @@ export async function unchanged(tx: Tx, deps: Record<string, number>) {
 }
 
 /** Test seam: runs between the exact check and the guarded send (where a concurrent change can land). */
-export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {} };
+export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {}, inPublish: async (_tx: Tx) => {} };
+const PUBLISH_HOLD_MS = () => Number(process.env.MEMEX_PUBLISH_HOLD_MS ?? 5_000);
 
 export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isolation level repeatable read read only", f) as Promise<T>;
 
@@ -295,7 +296,11 @@ export async function skip(db: Db, job: Job, reason: string, scopes: string[] = 
 /** Publish under the shared barrier if `deps` still hold; otherwise finish and queue the job again later. */
 export async function publish(db: Db, job: Job, deps: Record<string, number>, write: (tx: Tx) => Promise<unknown>) {
   return db.begin(async (tx: Tx) => {
+    // The whole held interval is bounded (PostgreSQL 17 transaction_timeout ends the session past it, which
+    // rolls back and releases the barrier), so a stuck write never holds forget or a revoke back.
+    await tx`select set_config('transaction_timeout', ${PUBLISH_HOLD_MS() + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
+    await hooks.inPublish(tx);
     const fresh = await unchanged(tx, deps);
     const fin = await finishJob(tx, job);
     if (fin !== "done") return fin;
