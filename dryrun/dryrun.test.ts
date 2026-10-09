@@ -1,11 +1,12 @@
 // Synthetic fixtures only: every log here is written by the test into a temp dir.
 import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyzeFile, codexForkBoundary, codexIsChild, collect, dryRun, type Rec, SPAN_MAX, spansOf, units } from "./dryrun";
-const tz = (n: number) => 31 - Math.clz32(n & -n);
+import { analyzeFile, codexForkBoundary, codexIsChild, collect, dryRun } from "./dryrun";
+const SPAN_MAX = 12288; // DESIGN §4.3 upper target; mirrored here, not imported
+const D = (kind: string, text: string) => B(`${kind}: ${text}`) + 1; // one record's digest bytes
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "memex-dryrun-")));
 const jsonl = (rows: unknown[]) => rows.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("\n") + "\n";
@@ -81,9 +82,10 @@ describe("Pi", () => {
     expect(r.branchPoints).toBe(1);
     expect(r.evidence).toBe(5);
     expect(r.lexicalBytes).toBe(B("first") + B("old reply") + B("new reply") + B("second") + B("done"));
-    // u1 alone, [a1], [b1], [u2 b2]: the shared user message is in one span only
-    expect(r.spans).toBe(4);
-    expect(r.exchanges).toBe(2);
+    // views in creation order: S = [u1 a1]; the second view forks inside S → P = [u1], then [b1], [u2 b2]
+    expect(r).toMatchObject({ views: 2, spans: 4, prefixSpans: 1, exchanges: 2 });
+    expect(r.summaryInputBytes).toBe(2 * D("user", "first") + D("assistant", "old reply") + D("assistant", "new reply") + D("user", "second") + D("assistant", "done"));
+    expect(r.digestBytes).toBe(r.summaryInputBytes - D("user", "first")); // unique records only
   });
 
   test("a fork inside an exchange does not merge the two branches into one span", () => {
@@ -96,8 +98,11 @@ describe("Pi", () => {
       piMsg("b2", "r", say("branch B")),
     ]);
     const r = analyzeFile(p);
-    expect(r.spans).toBe(3); // [u1 c r], [a2], [b2]
-    expect(r.digestBytes).toBe(B("user: go\n") + B('tool_call: bash {}\n') + B("tool_result: out\n") + B("assistant: branch A\n") + B("assistant: branch B\n"));
+    // DESIGN §4.3 example: S = [u1 c r a2] closed, fork at r → P = [u1 c r] + [b2]; S is kept for its view
+    expect(r).toMatchObject({ views: 2, spans: 3, prefixSpans: 1 });
+    const prefix = D("user", "go") + D("tool_call", "bash {}") + D("tool_result", "out");
+    expect(r.digestBytes).toBe(prefix + D("assistant", "branch A") + D("assistant", "branch B"));
+    expect(r.summaryInputBytes).toBe(prefix + D("assistant", "branch A") + prefix + D("assistant", "branch B"));
   });
 
   test("forest nodes are counted per branch with shared prefixes once", () => {
@@ -106,8 +111,9 @@ describe("Pi", () => {
     for (let i = 0; i < 3; i++) rows.push(piMsg(`s${i}`, i ? `s${i - 1}` : null, user(`shared ${i}`)));
     for (const b of ["a", "b"]) for (let i = 0; i < 2; i++) rows.push(piMsg(`${b}${i}`, i ? `${b}${i - 1}` : "s2", user(`${b} ${i}`)));
     const r = analyzeFile(file("pi/forest-branch.jsonl", rows));
-    expect(r.spans).toBe(7);
-    expect(r.forestInternalNodes).toBe(tz(1) + tz(2) + tz(3) + 2 * (tz(4) + tz(5))); // 0+1+0+2*(2+0) = 5
+    expect(r).toMatchObject({ spans: 7, prefixSpans: 0 }); // forks on span boundaries share spans directly
+    // view a: (s0 s1) (s2 a0) ((s0 s1)(s2 a0)); view b reuses (s0 s1), adds (s2 b0) and its parent
+    expect(r.forestInternalNodes).toBe(5);
   });
 
   test("a branch point between a call and its result keeps the call in both branches' spans", () => {
@@ -121,12 +127,23 @@ describe("Pi", () => {
       piMsg("ry", "y", result("t", "out B")),
     ]);
     const r = analyzeFile(p);
-    expect(r.spans).toBe(3); // [u], [c x rx], [c y ry]: the call is in both, counted once as evidence
-    expect(r.evidence).toBe(6);
+    // S = [u c x rx]; fork after c is inside the unit [c x rx] → P cut back to the whole unit [u], then [c y ry]
+    expect(r).toMatchObject({ spans: 3, prefixSpans: 1, unpairedCalls: 0, evidence: 6 });
     expect(r.digestBytes).toBe(B("user: go\n") + B("tool_call: bash {}\n") + B("assistant: note A\n") + B("assistant: note B\n") + B("tool_result: out A\n") + B("tool_result: out B\n"));
   });
 
-  test("an open call carried across a branch point sits in each branch's span, not the parent's", () => {
+  test("views are partitioned in creation order: the first branch keeps its span, a later one gets P", () => {
+    const p = file("pi/order.jsonl", [
+      piHeader(),
+      piMsg("u1", null, user("u".repeat(6000))),
+      piMsg("a1", "u1", say("a".repeat(6000))), // first: S = [u1 a1] fits under SPAN_MAX
+      piMsg("b1", "u1", say("b".repeat(7000))), // later: forks inside S → P = [u1], then [b1]
+    ]);
+    // reversed order would give [u1], [b1] first, then reuse [u1] whole: no prefix span
+    expect(analyzeFile(p)).toMatchObject({ views: 2, spans: 3, prefixSpans: 1 });
+  });
+
+  test("an open call at a branch point stays whole in each branch's span", () => {
     const big = { s: "a".repeat(11000) }; // call ~11KB + result digest ~2KB (head/tail cut) > SPAN_MAX
     const p = file("pi/carry.jsonl", [
       piHeader(),
@@ -138,9 +155,8 @@ describe("Pi", () => {
       piMsg("ry", "y", result("t", "r".repeat(7000))),
     ]);
     const r = analyzeFile(p);
-    // [u] alone; each branch [c x rx] is one indivisible unit over SPAN_MAX
-    expect(r.spans).toBe(3);
-    expect(r.oversizedSpans).toBe(2);
+    // [u] alone (shared, a span boundary); each branch [c x rx] is one indivisible unit over SPAN_MAX
+    expect(r).toMatchObject({ spans: 3, oversizedSpans: 2, prefixSpans: 0 });
   });
 
   test("a child holding only labels or state does not make a branch", () => {
@@ -322,35 +338,41 @@ describe("Codex", () => {
 });
 
 // ---------- units, spans and sizes ----------
-const rec = (kind: Rec["kind"], callId?: string, size = 1): Rec => ({ id: `${kind}${callId ?? ""}`, kind, callId, text: "x".repeat(size) });
-const shape = (us: Rec[][]) => us.map((u) => u.map((r) => r.id).join("+"));
+const pi = (name: string, msgs: object[]) => file(`pi/${name}.jsonl`, [piHeader(), ...msgs.map((m, i) => piMsg(`e${i}`, i ? `e${i - 1}` : null, m))]);
+const big = (n: number) => ({ s: "x".repeat(n) });
 
 describe("units and spans", () => {
   test("a call and its result stay together across commentary, parallel calls and out-of-order results", () => {
-    expect(shape(units([rec("user"), rec("tool_call", "A"), rec("assistant"), rec("tool_result", "A"), rec("assistant")]))).toEqual([
-      "user",
-      "tool_callA+assistant+tool_resultA",
-      "assistant",
-    ]);
-    expect(shape(units([rec("tool_call", "A"), rec("tool_call", "B"), rec("tool_result", "B"), rec("tool_result", "A"), rec("user")]))).toEqual([
-      "tool_callA+tool_callB+tool_resultB+tool_resultA",
-      "user",
-    ]);
-    // a result that never arrives keeps the unit open to the end of the segment
-    expect(shape(units([rec("tool_call", "A"), rec("assistant"), rec("assistant")]))).toEqual(["tool_callA+assistant+assistant"]);
+    // [callA say rA] is ~14KB: kept whole as one oversized span instead of being split at the commentary
+    const a = analyzeFile(pi("unit-commentary", [user("q"), call("A", "bash", big(6000)), say("y".repeat(6000)), result("A", "z".repeat(2000))]));
+    expect(a).toMatchObject({ spans: 2, oversizedSpans: 1, unpairedCalls: 0 });
+    const b = analyzeFile(pi("unit-parallel", [user("q"), call("A", "bash", big(5000)), call("B", "bash", big(5000)), result("B", "z".repeat(2000)), result("A", "z".repeat(2000))]));
+    expect(b).toMatchObject({ spans: 2, oversizedSpans: 1, unpairedCalls: 0 });
+  });
+
+  test("a call with no result ends at the next user message and is reported", () => {
+    const r = analyzeFile(pi("unpaired", [user("U1"), call("A"), user("U2"), say("reply")]));
+    // [U1 callA], [U2 reply]: U2's exchange is not swallowed by the open call
+    expect(r).toMatchObject({ spans: 2, unpairedCalls: 1, exchanges: 2, oversizedSpans: 0 });
+    const big2 = analyzeFile(pi("unpaired-big", [user("U1"), call("A", "bash", big(7000)), user("u".repeat(7000)), say("reply")]));
+    expect(big2).toMatchObject({ spans: 2, unpairedCalls: 1, oversizedSpans: 0 });
   });
 
   test("SPAN_MAX wins over SPAN_MIN: short user + 10KB reply become two spans", () => {
-    const s = spansOf([rec("user", undefined, 3000), rec("assistant", undefined, 10000)]);
-    expect(s.map((x) => x.oversized)).toEqual([false, false]);
-    expect(s.length).toBe(2);
+    expect(analyzeFile(pi("max-min", [user("u".repeat(3000)), say("a".repeat(10000))]))).toMatchObject({ spans: 2, oversizedSpans: 0 });
   });
 
   test("only a single indivisible unit may exceed SPAN_MAX", () => {
-    const s = spansOf([rec("user"), rec("tool_call", "A", 9000), rec("assistant", undefined, 9000), rec("tool_result", "A", 10)]);
-    expect(s.length).toBe(2);
-    expect(s[1].oversized).toBe(true);
-    expect(s[1].recs.map((r) => r.kind)).toEqual(["tool_call", "assistant", "tool_result"]);
+    const r = analyzeFile(pi("oversized", [user("q"), call("A", "bash", big(9000)), say("a".repeat(9000)), result("A", "ok")]));
+    expect(r).toMatchObject({ spans: 2, oversizedSpans: 1 });
+  });
+
+  test("a memory result never opens a span or pushes one over SPAN_MAX", () => {
+    const mem = result("m", "RECALLED", "mem_search"); // no call: an orphan memory result
+    expect(analyzeFile(pi("mem-only", [mem]))).toMatchObject({ spans: 0, evidence: 0 });
+    const full = "u".repeat(SPAN_MAX - D("user", ""));
+    expect(D("user", full)).toBe(SPAN_MAX);
+    expect(analyzeFile(pi("mem-at-max", [user(full), mem]))).toMatchObject({ spans: 1, oversizedSpans: 0, summaryInputBytes: SPAN_MAX });
   });
 
   test("UTF-8 bytes, not characters", () => {
@@ -371,8 +393,7 @@ describe("units and spans", () => {
     const rows: unknown[] = [piHeader()];
     for (let i = 0; i < 13; i++) rows.push(piMsg(`u${i}`, i ? `u${i - 1}` : null, user(`q${i}`)));
     const r = analyzeFile(file("pi/forest.jsonl", rows));
-    expect(r.spans).toBe(13);
-    expect(r.forestInternalNodes).toBe(10);
+    expect(r).toMatchObject({ views: 1, spans: 13, forestInternalNodes: 10 });
   });
 });
 
@@ -434,13 +455,18 @@ describe("input boundary", () => {
     const outside = realpathSync(mkdtempSync(join(tmpdir(), "memex-outside-")));
     writeFileSync(join(outside, "s.jsonl"), jsonl([piHeader(), piMsg("u", null, user("outside"))]));
     const p = file("swap/a.jsonl", [piHeader(), piMsg("u", null, user("inside"))]);
-    const { files } = collect([join(dir, "swap")]);
-    fs.unlinkSync(p);
+    const { files, identity } = collect([join(dir, "swap")]);
+    const opts = { identity: identity.get(files[0]) };
+    expect(analyzeFile(files[0], opts).status).toBe("indexed");
+    const kept = join(dir, "kept");
+    mkdirSync(kept, { recursive: true });
+    renameSync(p, join(kept, "a-1.jsonl")); // moved aside, not deleted
     symlinkSync(join(outside, "s.jsonl"), p);
-    expect(analyzeFile(files[0])).toMatchObject({ status: "skipped", reason: "unreadable" });
-    fs.unlinkSync(p);
+    expect(analyzeFile(files[0], opts)).toMatchObject({ status: "skipped", reason: "unreadable" });
+    renameSync(p, join(kept, "a-link"));
     writeFileSync(p, jsonl([piHeader(), piMsg("u", null, user("replaced"))]));
-    expect(analyzeFile(files[0])).toMatchObject({ status: "skipped", reason: "unreadable" }); // new inode
+    expect(analyzeFile(files[0], opts)).toMatchObject({ status: "skipped", reason: "unreadable" }); // new inode
+    expect(analyzeFile(files[0], { identity: "0:0" })).toMatchObject({ status: "skipped", reason: "unreadable" });
   });
 
   test("dry run never writes into its inputs", () => {
@@ -449,8 +475,4 @@ describe("input boundary", () => {
     dryRun([join(dir, "ro")]);
     expect(readFileSync(p).equals(before)).toBe(true);
   });
-});
-
-test("span size limits", () => {
-  expect(SPAN_MAX).toBe(12288);
 });

@@ -6,25 +6,26 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, read
 import { basename, join, resolve } from "node:path";
 
 // [待标定] values from DESIGN §4.3
-export const SPAN_MIN = 4096; // target only: a span may close short to stay under SPAN_MAX
-export const SPAN_MAX = 12288;
-export const TOOL_HEAD = 1024;
-export const TOOL_TAIL = 1024;
-export const TOOL_ERROR_LINES = 20;
-export const LEXICAL_CHUNK = 2048;
+const SPAN_MIN = 4096; // target only: a span may close short to stay under SPAN_MAX
+const SPAN_MAX = 12288;
+const TOOL_HEAD = 1024;
+const TOOL_TAIL = 1024;
+const TOOL_ERROR_LINES = 20;
+const LEXICAL_CHUNK = 2048;
 
 const enc = new TextEncoder();
 const bytes = (s: string) => enc.encode(s).length;
 
 // Kinds that become span text. `context` (harness / extension context) and `thinking` are kept in L0
 // and the lexical index but are not summary input; neither opens an exchange.
-export type Kind = "user" | "assistant" | "tool_call" | "tool_result" | "agent" | "context" | "thinking";
-export interface Rec {
+type Kind = "user" | "assistant" | "tool_call" | "tool_result" | "agent" | "context" | "thinking";
+interface Rec {
   id: string;
   kind: Kind;
   text: string;
   callId?: string;
   memory?: boolean; // memory tool result: keeps call/result pairing, contributes no text or evidence
+  key: string; // record identity: native record id + position inside it
 }
 const DIGEST_KINDS = new Set<Kind>(["user", "assistant", "tool_call", "tool_result", "agent"]);
 
@@ -40,7 +41,10 @@ export interface FileResult {
   records: number; // L0 lines with a record identity (Pi entries / Codex ordinals)
   evidence: number; // records contributing summary input
   offTail: number; // Pi entries not on the inferred-tail path (still counted: retrieval covers all branches)
-  branchPoints: number; // Pi entries with more than one child
+  branchPoints: number; // Pi entries with more than one text-bearing child
+  views: number; // branch tips (Pi) / 1 (Codex): each is one navigation view
+  prefixSpans: number; // DESIGN §4.3 prefix segments P, created where a later branch forks inside a span
+  unpairedCalls: number; // tool calls with no result before the next user message or the end
   inherited: number; // fork prefix: canonical lives in the parent
   unresolved: number; // fork prefix with unknown boundary: archived, quarantined
   tornLines: number; // last line cut mid-write
@@ -52,7 +56,8 @@ export interface FileResult {
   exchanges: number;
   spans: number;
   oversizedSpans: number; // spans over SPAN_MAX made of one indivisible unit
-  digestBytes: number;
+  digestBytes: number; // unique records' digest text
+  summaryInputBytes: number; // sum over all spans (P re-reads its prefix): L1 summary input, without context
   lexicalBytes: number;
   lexicalChunks: number;
   forestInternalNodes: number;
@@ -66,6 +71,9 @@ function emptyResult(path: string): FileResult {
     evidence: 0,
     offTail: 0,
     branchPoints: 0,
+    views: 0,
+    prefixSpans: 0,
+    unpairedCalls: 0,
     inherited: 0,
     unresolved: 0,
     tornLines: 0,
@@ -78,6 +86,7 @@ function emptyResult(path: string): FileResult {
     spans: 0,
     oversizedSpans: 0,
     digestBytes: 0,
+    summaryInputBytes: 0,
     lexicalBytes: 0,
     lexicalChunks: 0,
     forestInternalNodes: 0,
@@ -143,9 +152,9 @@ function canon(v: unknown): string {
       .join(",")}}`;
   return JSON.stringify(v);
 }
-export const contentHash = (v: unknown) => createHash("sha256").update(canon(v)).digest("hex");
+const contentHash = (v: unknown) => createHash("sha256").update(canon(v)).digest("hex");
 
-export function digestOf(r: Rec): string {
+function digestOf(r: Rec): string {
   if (r.kind !== "tool_result") return `${r.kind}: ${r.text}`;
   const n = bytes(r.text);
   if (n <= TOOL_HEAD + TOOL_TAIL) return `${r.kind}: ${r.text}`;
@@ -163,114 +172,156 @@ export function digestOf(r: Rec): string {
 }
 const digestSize = (r: Rec) => (DIGEST_KINDS.has(r.kind) && !r.memory ? bytes(digestOf(r)) + 1 : 0);
 
-// ---------- units and spans ----------
+// ---------- units, spans, views ----------
 
 // A unit is never split: one record, or a tool call together with everything up to the last result of
-// the calls still open (parallel calls, out-of-order results, commentary in between). A call whose result
-// never arrives keeps its unit open to the end of the segment.
-export function units(seg: Rec[]): Rec[][] {
-  return unitsOpen(seg).units;
-}
-
-export function unitsOpen(seg: Rec[]): { units: Rec[][]; open: boolean } {
+// the calls it opened (parallel calls, out-of-order results, commentary in between). A real user message
+// ends any open unit: a call still waiting there is unpaired and stays in its own exchange.
+function unitsOf(path: Rec[], unpaired: Set<string>): Rec[][] {
   const out: Rec[][] = [];
   let cur: Rec[] | undefined;
-  const open = new Set<string>();
-  for (const r of seg) {
+  const open = new Map<string, string>(); // callId → record key
+  const closeOpen = () => {
+    for (const k of open.values()) unpaired.add(k);
+    open.clear();
+    cur = undefined;
+  };
+  for (const r of path) {
+    if (r.kind === "user" && cur) closeOpen();
     if (cur) {
       cur.push(r);
-      if (r.kind === "tool_call" && r.callId) open.add(r.callId);
+      if (r.kind === "tool_call" && r.callId) open.set(r.callId, r.key);
       if (r.kind === "tool_result" && r.callId) open.delete(r.callId);
       if (open.size === 0) cur = undefined;
       continue;
     }
     if (r.kind === "tool_call" && r.callId) {
       cur = [r];
-      open.add(r.callId);
+      open.set(r.callId, r.key);
       out.push(cur);
     } else out.push([r]);
   }
-  return { units: out, open: cur !== undefined };
+  closeOpen();
+  return out;
 }
 
-export type Span = { recs: Rec[]; size: number; oversized: boolean };
-export function spansOf(seg: Rec[]): Span[] {
-  return spansOfUnits(units(seg));
-}
-function spansOfUnits(us: Rec[][]): Span[] {
-  const spans: Span[] = [];
-  let cur: Span | undefined;
-  for (const u of us) {
-    const n = u.reduce((s, r) => s + digestSize(r), 0);
-    if (n === 0 && !cur) continue; // context-only units never open a span on their own
-    if (cur && cur.size + n > SPAN_MAX) cur = undefined;
-    if (!cur) spans.push((cur = { recs: [], size: 0, oversized: false }));
-    cur.recs.push(...u);
-    cur.size += n;
-    if (cur.size > SPAN_MAX) cur.oversized = true; // only possible for a lone oversized unit
+type Span = { id: number; keys: string[]; size: number };
+
+// Partition every view into spans, the way DESIGN §4.3 does it online: views are taken in creation order
+// (first child first at every branch point); a later view reuses every earlier span lying whole on its
+// path, and where it forks inside an earlier span it gets a prefix span P (cut back to a whole unit, so a
+// call never leaves its result) followed by its own spans. Spans never cross a user message.
+function partition(views: Rec[][], res: FileResult) {
+  const spanAt = new Map<string, Span[]>(); // first record key → spans starting there
+  const unpaired = new Set<string>();
+  const nodeId = new Map<string, number>(); // forest node (left,right) → id, shared across views
+  let nextId = 0;
+  const register = (us: Rec[][], prefix: boolean): Span | undefined => {
+    const recs = us.flat();
+    const size = recs.reduce((a, r) => a + digestSize(r), 0);
+    if (size === 0) return undefined; // e.g. a lone memory result: nothing to summarize
+    const sp: Span = { id: nextId++, keys: recs.map((r) => r.key), size };
+    (spanAt.get(sp.keys[0]) ?? spanAt.set(sp.keys[0], []).get(sp.keys[0])!).push(sp);
+    res.spans++;
+    res.summaryInputBytes += size;
+    if (prefix) res.prefixSpans++;
+    if (size > SPAN_MAX) res.oversizedSpans++; // only a lone indivisible unit gets here
+    return sp;
+  };
+  for (const path of views) {
+    res.views++;
+    const us = unitsOf(path, unpaired);
+    const starts: number[] = []; // record offset of each unit
+    let off = 0;
+    for (const u of us) starts.push(off), (off += u.length);
+    const order: number[] = []; // this view's span list
+    let ui = 0;
+    while (ui < us.length) {
+      let full: Span | undefined;
+      let partial = 0;
+      for (const sp of spanAt.get(us[ui][0].key) ?? []) {
+        let m = 0;
+        while (m < sp.keys.length && starts[ui] + m < path.length && path[starts[ui] + m].key === sp.keys[m]) m++;
+        if (m === sp.keys.length) full = !full || sp.keys.length > full.keys.length ? sp : full;
+        else partial = Math.max(partial, m);
+      }
+      if (full) {
+        order.push(full.id);
+        const end = starts[ui] + full.keys.length;
+        while (ui < us.length && starts[ui] < end) ui++;
+        continue;
+      }
+      let k = 0;
+      while (ui + k < us.length && starts[ui + k] + us[ui + k].length <= starts[ui] + partial) k++;
+      if (k > 0) {
+        const p = register(us.slice(ui, ui + k), true);
+        if (p) order.push(p.id);
+        ui += k;
+        continue;
+      }
+      // Fresh span: whole units, up to SPAN_MAX, never across a user message.
+      let n = 1;
+      let size = us[ui].reduce((a, r) => a + digestSize(r), 0);
+      while (ui + n < us.length && us[ui + n][0].kind !== "user") {
+        const add = us[ui + n].reduce((a, r) => a + digestSize(r), 0);
+        if (size + add > SPAN_MAX) break;
+        size += add;
+        n++;
+      }
+      const sp = register(us.slice(ui, ui + n), false);
+      if (sp) order.push(sp.id);
+      ui += n;
+    }
+    // Forest over this view's span list: binary carries; identical subtrees are one node (DESIGN §4.4).
+    for (let level = order; level.length > 1; ) {
+      const up: number[] = [];
+      for (let i = 0; i + 1 < level.length; i += 2) {
+        const key = `${level[i]},${level[i + 1]}`;
+        let id = nodeId.get(key);
+        if (id === undefined) nodeId.set(key, (id = nextId++));
+        up.push(id);
+      }
+      level = up;
+    }
   }
-  return spans.filter((s) => s.size > 0);
+  res.forestInternalNodes = nodeId.size;
+  res.unpairedCalls = unpaired.size;
 }
 
-// A segment is a chain of records along the conversation tree that never crosses a branch point or an
-// exchange start. `parent` is the index of the segment it continues (-1 for a root). A tool unit still
-// open at a segment's end is carried into every child segment, so a call is never cut from its result;
-// its records are counted once, its span once per branch (like DESIGN §4.3's prefix segment P).
-export type Segment = { recs: Rec[]; parent: number };
-
-const tz = (n: number) => 31 - Math.clz32(n & -n);
-
-function account(segments: Segment[], res: FileResult) {
+// Unique records: evidence, digest and lexical bytes, exclusions. Independent of how views share them.
+function account(recs: Rec[], res: FileResult) {
   const evidence = new Set<string>();
   const excludedSeen = new Set<string>();
-  const depthEnd: number[] = []; // span depth at the end of each segment (spans from the root on this branch)
-  const carry: Rec[][] = []; // open unit carried out of each segment
-  segments.forEach((seg, i) => {
-    const inherit = seg.parent >= 0 ? carry[seg.parent] : [];
-    const { units: us, open } = unitsOpen([...inherit, ...seg.recs]);
-    const hasKids = segments.some((s) => s.parent === i);
-    const closed = open && hasKids ? us.slice(0, -1) : us;
-    carry[i] = open && hasKids ? us[us.length - 1] : [];
-    let depth = seg.parent >= 0 ? depthEnd[seg.parent] : 0;
-    for (const s of spansOfUnits(closed)) {
-      res.spans++;
-      if (s.oversized) res.oversizedSpans++;
-      // Binary carries along this branch: the span at depth d completes tz(d) merges. Depth is unique
-      // per span in a tree, so shared prefixes are counted once (DESIGN §4.4).
-      res.forestInternalNodes += tz(++depth);
+  for (const r of recs) {
+    if (r.kind === "user") res.exchanges++;
+    if (r.memory) continue;
+    const d = digestSize(r);
+    res.digestBytes += d;
+    if (d) evidence.add(r.key.slice(0, r.key.lastIndexOf("#")));
+    else {
+      const reason = r.kind === "thinking" ? "thinking" : "context";
+      const key = `${r.key.slice(0, r.key.lastIndexOf("#"))}:${reason}`;
+      tally(res.digestExcluded, reason, bytes(r.text), excludedSeen.has(key) ? 0 : 1);
+      excludedSeen.add(key);
     }
-    depthEnd[i] = depth;
-    for (const r of seg.recs) {
-      if (r.kind === "user") res.exchanges++;
-      if (r.memory) continue;
-      const d = digestSize(r);
-      res.digestBytes += d;
-      if (d) evidence.add(r.id);
-      else {
-        const reason = r.kind === "thinking" ? "thinking" : "context";
-        const key = `${r.id}:${reason}`;
-        tally(res.digestExcluded, reason, bytes(r.text), excludedSeen.has(key) ? 0 : 1);
-        excludedSeen.add(key);
-      }
-      const n = bytes(r.text);
-      res.lexicalBytes += n;
-      res.lexicalChunks += Math.ceil(n / LEXICAL_CHUNK);
-    }
-  });
+    const n = bytes(r.text);
+    res.lexicalBytes += n;
+    res.lexicalChunks += Math.ceil(n / LEXICAL_CHUNK);
+  }
   res.evidence = evidence.size;
 }
 
+const inSpan = (r: Rec) => DIGEST_KINDS.has(r.kind); // memory results stay: they close their call
+type Parsed = { recs: Rec[]; views: Rec[][] };
+
 // ---------- reading ----------
 
-// Identity (dev:ino) recorded by collect(); a file swapped after discovery is refused.
-const seenIdentity = new Map<string, string>();
-
-function readLines(path: string, res: FileResult): Record<string, any>[] {
+// `want` is the dev:ino seen by collect(); a file swapped after discovery is refused.
+function readLines(path: string, res: FileResult, want?: string): Record<string, any>[] {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   let text: string;
   try {
     const st = fstatSync(fd);
-    const want = seenIdentity.get(path);
     if (!st.isFile() || (want !== undefined && want !== `${st.dev}:${st.ino}`)) throw new Error("file changed since discovery");
     text = readFileSync(fd, "utf8");
   } finally {
@@ -298,15 +349,16 @@ function readLines(path: string, res: FileResult): Record<string, any>[] {
 
 // ---------- Pi (session v3) ----------
 
-export const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
+const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 
 function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
-  return perRecord(res, (ex) => piRecordsInner(entry, res, ex));
+  return perRecord(res, (ex) => piRecordsInner(entry, res, ex)).map((r, j) => ({ ...r, key: `${entry.id}#${j}` }));
 }
 
-function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally): Rec[] {
+type Draft = Omit<Rec, "key">;
+function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally): Draft[] {
   const id = String(entry.id);
-  const custom = (customType: string, content: unknown): Rec[] => {
+  const custom = (customType: string, content: unknown): Draft[] => {
     const text = textOf(content);
     if (String(customType).startsWith("memex-")) return tally(ex, "memex-injected", bytes(text)), [];
     if (OTHER_MEMORY_CUSTOM.test(String(customType))) return tally(ex, "other-memory-injected", bytes(text)), [];
@@ -334,7 +386,7 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
       return kept ? [{ id, kind: "user", text: kept }] : [];
     }
     case "assistant": {
-      const out: Rec[] = [];
+      const out: Draft[] = [];
       const texts: string[] = [];
       for (const p of Array.isArray(m.content) ? m.content : []) {
         if (p?.type === "text") texts.push(String(p.text ?? ""));
@@ -387,7 +439,7 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
   }
 }
 
-function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: string) => Set<string> | undefined): Segment[] {
+function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: string) => Set<string> | undefined): Parsed {
   res.harness = "pi";
   const [header, ...rest] = lines;
   if (header.version !== 3) return skip(res, "unsupported-version");
@@ -425,43 +477,39 @@ function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: s
       recsOf.set(e.id, []);
     } else recsOf.set(e.id, piRecords(e, res));
   }
-  // A child subtree without any text (labels, state, usage) does not make a branch.
+  // Only span text makes a branch: a child subtree of labels, state or extension context does not.
   const hasText = new Map<string, boolean>();
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
-    hasText.set(e.id, recsOf.get(e.id)!.length > 0 || (children.get(e.id) ?? []).some((k) => hasText.get(k.id)));
+    hasText.set(e.id, recsOf.get(e.id)!.some(inSpan) || (children.get(e.id) ?? []).some((k) => hasText.get(k.id)));
   }
   const textKids = (id: string) => (children.get(id) ?? []).filter((k) => hasText.get(k.id));
-  const opensExchange = (e: Record<string, any>) => recsOf.get(e.id)!.some((r) => r.kind === "user");
-  const segments: Segment[] = [];
-  const segOf = new Map<string, number>(); // entry id → segment holding it
-  const visit = (start: Record<string, any>, parent: number) => {
-    const idx = segments.push({ recs: [], parent }) - 1;
-    for (let e: Record<string, any> | undefined = start; e; ) {
-      segOf.set(e.id, idx);
-      segments[idx].recs.push(...recsOf.get(e.id)!);
-      const kids = textKids(e.id);
-      if (kids.length > 1) res.branchPoints++;
-      if (kids.length === 1 && !opensExchange(kids[0])) {
-        e = kids[0];
-        continue;
-      }
-      for (const k of kids) stack.push([k, idx]);
-      e = undefined;
-    }
-  };
-  const stack: [Record<string, any>, number][] = [];
-  for (const e of entries) if (!byId.has(e.parentId) || e.parentId === e.id) stack.push([e, -1]);
-  while (stack.length) {
-    const [e, parent] = stack.pop()!;
-    if (!segOf.has(e.id)) visit(e, parent);
+  for (const e of entries) if (textKids(e.id).length > 1) res.branchPoints++;
+  // Views: root → tip paths, in creation order (first child first). Iterative DFS sharing one path array.
+  const views: Rec[][] = [];
+  const path: Rec[] = [];
+  const stack: { e: Record<string, any>; depth: number }[] = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if ((!byId.has(e.parentId) || e.parentId === e.id) && hasText.get(e.id)) stack.push({ e, depth: 0 });
   }
-  return segments;
+  const lens: number[] = [];
+  while (stack.length) {
+    const { e, depth } = stack.pop()!;
+    lens.length = depth;
+    path.length = depth ? lens[depth - 1] : 0;
+    path.push(...recsOf.get(e.id)!.filter(inSpan));
+    lens.push(path.length);
+    const kids = textKids(e.id);
+    if (kids.length === 0) views.push(path.slice());
+    for (let k = kids.length - 1; k >= 0; k--) stack.push({ e: kids[k], depth: depth + 1 });
+  }
+  return { recs: entries.flatMap((e) => recsOf.get(e.id)!), views };
 }
 
-function piEntryKeys(path: string): Set<string> | undefined {
+function piEntryKeys(path: string, want?: string): Set<string> | undefined {
   const res = emptyResult(path);
-  const lines = readLines(path, res);
+  const lines = readLines(path, res, want);
   if (lines[0]?.type !== "session") return undefined;
   return new Set(lines.slice(1).filter((e) => typeof e.id === "string").map((e) => `${e.id}:${contentHash(e)}`));
 }
@@ -505,10 +553,10 @@ function codexFragments(p: Record<string, any>, ex: Tally): { user: string[]; co
 }
 
 function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<string, string>): Rec[] {
-  return perRecord(res, (ex) => codexRecordsInner(line, res, calls, ex));
+  return perRecord(res, (ex) => codexRecordsInner(line, res, calls, ex)).map((r, j) => ({ ...r, key: `${line.ordinal}#${j}` }));
 }
 
-function codexRecordsInner(line: Record<string, any>, res: FileResult, calls: Map<string, string>, ex: Tally): Rec[] {
+function codexRecordsInner(line: Record<string, any>, res: FileResult, calls: Map<string, string>, ex: Tally): Draft[] {
   const id = String(line.ordinal);
   if (line.type === "inter_agent_communication") {
     const text = stripMemory(textOf(line.payload), ex);
@@ -524,7 +572,7 @@ function codexRecordsInner(line: Record<string, any>, res: FileResult, calls: Ma
         return text ? [{ id, kind: "assistant", text }] : [];
       }
       const { user, context } = codexFragments(p, ex);
-      const out: Rec[] = [];
+      const out: Draft[] = [];
       const u = stripMemory(user.join("\n"), ex);
       if (u) out.push({ id, kind: "user", text: u });
       const c = stripMemory(context.join("\n"), ex);
@@ -585,7 +633,7 @@ export function codexForkBoundary(meta: Record<string, any>, path: string): numb
   return undefined;
 }
 
-function codexFile(path: string, lines: Record<string, any>[], res: FileResult): Segment[] {
+function codexFile(path: string, lines: Record<string, any>[], res: FileResult): Parsed {
   res.harness = "codex";
   const meta = lines[0].payload ?? {};
   if (meta.history_mode !== "paginated") return skip(res, "legacy");
@@ -600,7 +648,7 @@ function codexFile(path: string, lines: Record<string, any>[], res: FileResult):
     const p = l.type === "response_item" ? l.payload : undefined;
     if (p && /_call$/.test(String(p.type)) && p.call_id) calls.set(String(p.call_id), String(p.name ?? p.type));
   }
-  const segments: Segment[] = [{ recs: [], parent: -1 }];
+  const recs: Rec[] = [];
   for (const l of lines) {
     if (meta.forked_from_id) {
       // Unknown boundary: every record could be inherited, so the whole file stays quarantined.
@@ -614,33 +662,40 @@ function codexFile(path: string, lines: Record<string, any>[], res: FileResult):
       }
     }
     const rs = codexRecords(l, res, calls);
-    const last = segments[segments.length - 1];
-    if (rs.some((r) => r.kind === "user") && last.recs.length) segments.push({ recs: [], parent: segments.length - 1 });
-    segments[segments.length - 1].recs.push(...rs);
+    recs.push(...rs);
   }
-  return segments;
+  return { recs, views: [recs.filter(inSpan)] }; // rollback replay is out of scope: one linear view
 }
 
 // ---------- driver ----------
 
-function skip(res: FileResult, reason: FileResult["reason"]): Segment[] {
+function skip(res: FileResult, reason: FileResult["reason"]): Parsed {
   res.status = "skipped";
   res.reason = reason;
-  return [];
+  return { recs: [], views: [] };
 }
 
-export function analyzeFile(path: string, parentKeys: (p: string) => Set<string> | undefined = () => undefined): FileResult {
+export interface AnalyzeOptions {
+  parentKeys?: (p: string) => Set<string> | undefined; // Pi fork parents among the approved inputs
+  identity?: string; // dev:ino from collect(); the file must still be that inode
+}
+
+export function analyzeFile(path: string, opts: AnalyzeOptions = {}): FileResult {
+  const parentKeys = opts.parentKeys ?? (() => undefined);
   const res = emptyResult(path);
   if (PI_SUBAGENT.test(path)) return skip(res, "child-thread"), (res.harness = "pi"), res;
   if (path.endsWith(".zst")) return skip(res, "compressed"), res;
   try {
-    const lines = readLines(path, res);
+    const lines = readLines(path, res, opts.identity);
     if (lines.length === 0) return skip(res, "empty"), res;
-    let segments: Segment[];
-    if (lines[0].type === "session") segments = piFile(lines, res, parentKeys);
-    else if (lines[0].type === "session_meta") segments = codexFile(path, lines, res);
+    let parsed: Parsed;
+    if (lines[0].type === "session") parsed = piFile(lines, res, parentKeys);
+    else if (lines[0].type === "session_meta") parsed = codexFile(path, lines, res);
     else return skip(res, "unknown-format"), res;
-    if (res.status === "indexed") account(segments, res);
+    if (res.status === "indexed") {
+      account(parsed.recs, res);
+      partition(parsed.views, res);
+    }
   } catch (e) {
     const fresh = emptyResult(path);
     Object.assign(res, fresh, { status: "skipped", reason: "unreadable", error: String((e as Error).message ?? e).slice(0, 200) });
@@ -653,8 +708,9 @@ export function analyzeFile(path: string, parentKeys: (p: string) => Set<string>
 // when it is listed, and every file is opened with O_NOFOLLOW and checked against the identity seen here.
 // Residual: a directory swapped for a link between that check and readdir; closing it needs openat-style
 // traversal, which Node does not offer.
-export function collect(inputs: string[]): { files: string[]; symlinks: string[]; errors: { path: string; error: string }[] } {
+export function collect(inputs: string[]): { files: string[]; identity: Map<string, string>; symlinks: string[]; errors: { path: string; error: string }[] } {
   const files = new Set<string>();
+  const identity = new Map<string, string>();
   const symlinks = new Set<string>();
   const errors: { path: string; error: string }[] = [];
   const walk = (p: string) => {
@@ -666,7 +722,7 @@ export function collect(inputs: string[]): { files: string[]; symlinks: string[]
         for (const n of readdirSync(p).sort()) walk(join(p, n));
       } else if (st.isFile() && /\.jsonl(\.zst)?$/.test(p)) {
         files.add(p);
-        seenIdentity.set(p, `${st.dev}:${st.ino}`);
+        identity.set(p, `${st.dev}:${st.ino}`);
       }
     } catch (e) {
       errors.push({ path: p, error: String((e as Error).message ?? e).slice(0, 200) });
@@ -687,11 +743,11 @@ export function collect(inputs: string[]): { files: string[]; symlinks: string[]
     }
     walk(root);
   }
-  return { files: [...files].sort(), symlinks: [...symlinks].sort(), errors };
+  return { files: [...files].sort(), identity, symlinks: [...symlinks].sort(), errors };
 }
 
 export function dryRun(inputs: string[]) {
-  const { files, symlinks, errors } = collect(inputs);
+  const { files, identity, symlinks, errors } = collect(inputs);
   const approved = new Set(files);
   // Pi forks name their parent file. Only parents among the approved inputs are read, once, on demand.
   const cache = new Map<string, Set<string> | undefined>();
@@ -699,14 +755,14 @@ export function dryRun(inputs: string[]) {
     if (!approved.has(p) || PI_SUBAGENT.test(p)) return undefined;
     if (!cache.has(p)) {
       try {
-        cache.set(p, piEntryKeys(p));
+        cache.set(p, piEntryKeys(p, identity.get(p)));
       } catch {
         cache.set(p, undefined);
       }
     }
     return cache.get(p);
   };
-  const results = files.map((f) => analyzeFile(f, parentKeys));
+  const results = files.map((f) => analyzeFile(f, { parentKeys, identity: identity.get(f) }));
   const total = emptyResult("(total)");
   const skipped: Record<string, string[]> = {};
   for (const r of results) {
@@ -714,7 +770,7 @@ export function dryRun(inputs: string[]) {
       (skipped[r.reason!] ??= []).push(r.path);
       continue;
     }
-    for (const k of ["records", "evidence", "offTail", "branchPoints", "inherited", "unresolved", "tornLines", "malformedLines", "exchanges", "spans", "oversizedSpans", "digestBytes", "lexicalBytes", "lexicalChunks", "forestInternalNodes"] as const)
+    for (const k of ["records", "evidence", "offTail", "branchPoints", "views", "prefixSpans", "unpairedCalls", "inherited", "unresolved", "tornLines", "malformedLines", "exchanges", "spans", "oversizedSpans", "digestBytes", "summaryInputBytes", "lexicalBytes", "lexicalChunks", "forestInternalNodes"] as const)
       total[k] += r[k];
     for (const [k, v] of Object.entries(r.nonContent)) inc(total.nonContent, k, v);
     for (const [k, v] of Object.entries(r.extensionTypes)) inc(total.extensionTypes, k, v);
