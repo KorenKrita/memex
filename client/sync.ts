@@ -2,7 +2,7 @@
 // progress lives on the server, a lost receipt is retried with the same commit id.
 //
 // Outbound authorization (§7) comes first: a source outside the allowed scopes makes no request at all.
-import { blockHashes, CHUNK, readSession, type Harness, type ReadResult } from "./records.ts";
+import { blockHashes, CHUNK, piHeaderId, readSession, sourceIdOf, type Harness, type ReadResult } from "./records.ts";
 import type { Policy } from "./policy.ts";
 import { allowed, scopeOf } from "./policy.ts";
 
@@ -16,12 +16,18 @@ export type SyncOutcome =
 const MAX_CHANGES = 2_000;
 const MAX_BYTES = 6 * 1024 * 1024;
 
-export async function syncFile(t: Transport, policy: Policy, path: string, harness: Harness, opts: { leaf?: string | null; collector: string; meta?: object; parent?: string | null; scanChunks?: boolean } ): Promise<SyncOutcome> {
+export async function syncFile(t: Transport, policy: Policy, path: string, harness: Harness, opts: { leaf?: string | null; collector: string; meta?: object; scanChunks?: boolean }): Promise<SyncOutcome> {
   const scope = scopeOf(policy, path);
   if (!allowed(policy, scope, "sync", "memex")) return { status: "skipped", reason: "not-authorized" };
   const pre = readSession(path, harness);
   if (!pre.ok) return { status: "skipped", reason: pre.reason };
-  const decl = { source: pre.sourceId, harness, nativeId: pre.nativeId, scope, parent: opts.parent ?? null, meta: opts.meta ?? {} };
+  // Fork parent (§4.1). Pi names a parent file: only one in the same scope is opened. Codex names a thread id.
+  // The server links a parent only if it is registered in the same scope; otherwise the copied prefix stays
+  // unresolved rather than tied to a session this scope may not read.
+  let parentNative = pre.parentNative;
+  if (pre.parentPath) parentNative = scopeOf(policy, pre.parentPath) === scope ? piHeaderId(pre.parentPath) : undefined;
+  const parent = parentNative ? sourceIdOf(harness, parentNative) : null;
+  const decl = { source: pre.sourceId, harness, nativeId: pre.nativeId, scope, parent, meta: opts.meta ?? {} };
   let lease: number;
   try {
     lease = (await t("POST", "/v1/sync/lease", { ...decl, collector: opts.collector })).lease;

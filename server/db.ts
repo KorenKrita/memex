@@ -103,14 +103,18 @@ export async function claimJob(db: Db, kinds: string[]): Promise<Job | undefined
   return j ? { ...j, id: Number(j.id), claimed_req: Number(j.claimed_req), claim: Number(j.claim) } : undefined;
 }
 
-/** Finish a claimed job inside the caller's publishing transaction. Returns false if the claim was lost
- *  (lock lapsed and someone else claimed it): the caller must then roll back. */
-export async function finishJob(tx: Tx, j: Job): Promise<boolean> {
+/** Finish a claimed job first thing in the caller's publishing transaction: "done" → publish; "rerun" →
+ *  requeued, publish nothing; "lost" (lock lapsed, someone else holds it) → publish nothing. */
+export async function finishJob(tx: Tx, j: Job): Promise<"done" | "rerun" | "lost"> {
   const [r] = await tx`select req, claim, state from job where id = ${j.id} for update`;
-  if (!r || r.state !== "running" || Number(r.claim) !== j.claim) return false;
-  if (Number(r.req) === j.claimed_req) await tx`update job set state = 'done', locked_until = null, updated_at = now() where id = ${j.id}`;
-  else await tx`update job set state = 'queued', attempts = 0, locked_until = null, updated_at = now() where id = ${j.id}`;
-  return true;
+  if (!r || r.state !== "running" || Number(r.claim) !== j.claim) return "lost";
+  if (Number(r.req) === j.claimed_req) {
+    await tx`update job set state = 'done', locked_until = null, updated_at = now() where id = ${j.id}`;
+    return "done";
+  }
+  // New input arrived after this run read its own: the run's result is stale, do not publish it.
+  await tx`update job set state = 'queued', attempts = 0, locked_until = null, updated_at = now() where id = ${j.id}`;
+  return "rerun";
 }
 
 /** A failed run: back off and retry, or give up after MAX_ATTEMPTS (state failed keeps the error). */

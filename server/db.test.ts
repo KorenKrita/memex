@@ -21,7 +21,7 @@ test("enqueue twice before a claim: one job; finish marks it done", async () => 
   await enqueue(db, "project", "s1");
   const j = (await claimJob(db, ["project"]))!;
   expect(await claimJob(db, ["project"])).toBeUndefined();
-  expect(await db.begin((tx) => finishJob(tx, j))).toBe(true);
+  expect(await db.begin((tx) => finishJob(tx, j))).toBe("done");
   expect(await state()).toEqual(["done:2"]);
 });
 
@@ -29,10 +29,10 @@ test("a request during a run sends the job back to queued", async () => {
   await enqueue(db, "project", "s1");
   const j = (await claimJob(db, ["project"]))!;
   await enqueue(db, "project", "s1"); // new input after the run read its input
-  expect(await db.begin((tx) => finishJob(tx, j))).toBe(true);
+  expect(await db.begin((tx) => finishJob(tx, j))).toBe("rerun");
   expect(await state()).toEqual(["queued:2"]);
   const j2 = (await claimJob(db, ["project"]))!;
-  expect(await db.begin((tx) => finishJob(tx, j2))).toBe(true);
+  expect(await db.begin((tx) => finishJob(tx, j2))).toBe("done");
   expect(await state()).toEqual(["done:2"]);
 });
 
@@ -43,10 +43,10 @@ test("a run whose lock lapsed and was re-claimed cannot finish or fail the job",
   await db`update job set locked_until = clock_timestamp() - interval '1 second'`;
   const j2 = (await claimJob(db, ["project"]))!;
   expect(j2.id).toBe(j.id);
-  expect(await db.begin((tx) => finishJob(tx, j))).toBe(false);
+  expect(await db.begin((tx) => finishJob(tx, j))).toBe("lost");
   await failJob(db, j, new Error("stale"));
   expect((await db`select state, error from job`)[0]).toEqual({ state: "running", error: null });
-  expect(await db.begin((tx) => finishJob(tx, j2))).toBe(true);
+  expect(await db.begin((tx) => finishJob(tx, j2))).toBe("done");
 });
 
 test("failure backs off; a done job is not reused by a new request", async () => {

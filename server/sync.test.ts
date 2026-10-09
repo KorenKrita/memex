@@ -166,3 +166,21 @@ test("a record the copy no longer holds leaves the merged L0 and re-queues proje
   const [j] = await db`select count(*)::int n from job where kind = 'project' and key = ${src} and state = 'queued'`;
   expect(j.n).toBe(1);
 });
+
+test("Pi fork parent is sent only when the parent file is in the same scope", async () => {
+  const t = transport(base, key);
+  const par = piFile(allowDir, "par", 1, "par-id");
+  const kid = join(allowDir, "kid.jsonl");
+  const head = (p: string, id: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-01-01T00:00:00Z", cwd: "/x", parentSession: p });
+  writeFileSync(kid, head(par, "kid-id") + "\n");
+  await syncFile(t, policy, kid, "pi", { collector: "m1" });
+  const outside = piFile(denyDir, "par-out", 1, "par-out-id");
+  const kid2 = join(allowDir, "kid2.jsonl");
+  writeFileSync(kid2, head(outside, "kid2-id") + "\n");
+  await syncFile(t, policy, kid2, "pi", { collector: "m1" });
+  const rows = [...(await db`select native_id, parent_id from source`)].sort((a: any, b: any) => (a.native_id < b.native_id ? -1 : 1));
+  expect(rows).toEqual([
+    { native_id: "kid-id", parent_id: sourceIdOf("pi", "par-id") },
+    { native_id: "kid2-id", parent_id: null }, // the parent file outside the scope is never opened
+  ]);
+});

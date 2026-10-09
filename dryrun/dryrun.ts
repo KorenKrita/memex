@@ -245,13 +245,32 @@ type ViewSpan = { start: number; end: number; id?: string }; // id undefined: no
 type FileViews = {
   trie: Map<string, { node: number; view: number }>; // `${parentNode}|${recordKey}` → trie node
   viewSpans: ViewSpan[][]; // per view, in partition order, record offsets on that view's path
+  paths: string[][]; // per view, its record keys in order
 };
+// Views from several partitions as one source for `partition` (earlier lists win a tie).
+function joinViews(...lists: { paths: string[][]; viewSpans: ViewSpan[][] }[]): FileViews {
+  const fv: FileViews = { trie: new Map(), viewSpans: [], paths: [] };
+  for (const l of lists)
+    l.paths.forEach((keys, i) => {
+      const vi = fv.viewSpans.length;
+      let node = 0;
+      for (const k of keys) {
+        const t = fv.trie.get(`${node}|${k}`);
+        if (t) node = t.node;
+        else fv.trie.set(`${node}|${k}`, { node: (node = fv.trie.size + 1), view: vi });
+      }
+      fv.viewSpans.push(l.viewSpans[i]);
+      fv.paths.push(keys);
+    });
+  return fv;
+}
 type Family = {
   spanId: Map<string, string>; // ordered record keys → span id
   prefixIds: Set<string>; // spans used as a prefix span P by some view (counted once, whichever role came first)
   nodeId: Map<string, string>; // `${left},${right}` → node id
+  idOf?: (recs: Rec[]) => string; // persistent span id (server projection); default: a per-run counter id
 };
-const newFamily = (): Family => ({ spanId: new Map(), prefixIds: new Set(), nodeId: new Map() });
+const newFamily = (idOf?: Family["idOf"]): Family => ({ spanId: new Map(), prefixIds: new Set(), nodeId: new Map(), idOf });
 // Longest prefix of `path` in a file's trie, and the first view holding it.
 function sharedPrefix(fv: FileViews, path: Rec[]): { shared: number; src: number; node: number } {
   let node = 0;
@@ -273,12 +292,12 @@ const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all 
 // a call never leaves its result) followed by its own spans. Spans never cross a user message.
 // Assumption: spans are taken as finally cut; whether a span was still open at fork time is not in the logs.
 function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), parentViews?: FileViews, onSpan?: SpanSink): FileViews {
-  const own: FileViews = { trie: new Map(), viewSpans: [] };
+  const own: FileViews = { trie: new Map(), viewSpans: [], paths: [] };
   const unpaired = new Set<string>();
   const pending = new Map<string, string>(); // this file's new nodes, published only if it is not short
   let longest = 0;
   let n = 0;
-  const register = (us: Rec[][], start: number, prefix: boolean, path: Rec[]): ViewSpan => {
+  const register = (us: Rec[][], start: number, prefix: boolean, path: Rec[], cut?: string): ViewSpan => {
     const recs = us.flat();
     const end = start + recs.length;
     const size = recs.reduce((a, r) => a + digestSize(r), 0);
@@ -286,7 +305,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
     const key = recs.map((r) => r.key).join("\u0000");
     let id = fam.spanId.get(key);
     if (id === undefined) {
-      fam.spanId.set(key, (id = `${res.path}#s${n++}`));
+      fam.spanId.set(key, (id = fam.idOf ? fam.idOf(recs) : `${res.path}#s${n++}`));
       if (onSpan) {
         const rec = (r: Rec) => ({ id: r.id, key: r.key, kind: r.kind, digest: digestOf(r) });
         // DESIGN §4.3 <context>: the same path's raw text before the span, the last user message and the
@@ -294,7 +313,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
         const before = path.slice(0, start).filter((r) => digestSize(r) > 0);
         const u = before.findLastIndex((r) => r.kind === "user");
         const ctx = u < 0 ? [] : [before[u], ...before.slice(u + 1).filter((r) => r.kind === "assistant").slice(0, 1)];
-        onSpan({ id, prefix, records: recs.filter((r) => digestSize(r) > 0).map(rec), context: ctx.map((r) => ({ ...rec(r), digest: clip(digestOf(r), CONTEXT_MAX / 2) })) });
+        onSpan({ id, prefix, cut, records: recs.filter((r) => digestSize(r) > 0).map(rec), context: ctx.map((r) => ({ ...rec(r), digest: clip(digestOf(r), CONTEXT_MAX / 2) })) });
       }
       res.spans++;
       res.summaryInputBytes += size;
@@ -326,6 +345,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
     const mine: ViewSpan[] = [];
     let pos = 0;
     let limit = shared; // where a prefix span must end at the latest
+    let cut: string | undefined; // the source span a prefix span P is cut from
     for (const sp of srcSpans) {
       if (sp.end <= shared && unitAt.has(sp.end)) {
         mine.push(sp); // whole on the shared prefix and ending on one of this view's unit boundaries
@@ -333,13 +353,14 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
         continue;
       }
       limit = Math.min(shared, sp.end);
+      cut = sp.id;
       break;
     }
     let ui = unitAt.get(pos)!;
     let k = 0;
     while (ui + k < us.length && starts[ui + k] + us[ui + k].length <= limit) k++;
     if (k > 0) {
-      mine.push(register(us.slice(ui, ui + k), pos, true, path));
+      mine.push(register(us.slice(ui, ui + k), pos, true, path, cut));
       ui += k;
     }
     while (ui < us.length) {
@@ -356,6 +377,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
       ui += len;
     }
     own.viewSpans.push(mine);
+    own.paths.push(path.map((r) => r.key));
     // Forest over this view's span list: binary carries; identical subtrees are one node (DESIGN §4.4).
     const order = mine.flatMap((s) => (s.id ? [s.id] : []));
     longest = Math.max(longest, order.length);
@@ -810,7 +832,8 @@ function codexFile(path: string, lines: Record<string, any>[], res: FileResult):
       }
     }
     const rs = codexRecords(l, res, calls);
-    recs.push(...rs);
+    const v = contentHash(l).slice(0, 16);
+    recs.push(...rs.map((r) => ({ ...r, key: `${meta.id}/${l.ordinal}:${v}#${r.key.slice(r.key.indexOf("#") + 1)}` })));
   }
   return { recs, views: [recs.filter(inSpan)] }; // rollback replay is out of scope: one linear view
 }
@@ -825,7 +848,7 @@ function skip(res: FileResult, reason: FileResult["reason"]): Parsed {
 
 // A newly counted span and its summary-input records (digest text), for local sampling tools (eval/).
 export type SpanRecord = { id: string; key: string; kind: string; digest: string };
-export type SpanSink = (span: { id: string; prefix: boolean; records: SpanRecord[]; context: SpanRecord[] }) => void;
+export type SpanSink = (span: { id: string; prefix: boolean; cut?: string; records: SpanRecord[]; context: SpanRecord[] }) => void;
 // One record of the lexical index (raw text, not clipped; memory results never reach it), once per unique record.
 export type LexicalSink = (rec: { id: string; key: string; kind: string; text: string }) => void;
 
@@ -846,7 +869,17 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
   if (PI_SUBAGENT.test(path)) return skip(res, "child-thread"), (res.harness = "pi"), { res };
   if (path.endsWith(".zst")) return skip(res, "compressed"), { res };
   try {
-    const lines = readLines(path, res, opts.identity, opts.contentHash);
+    return analyzeLines(path, readLines(path, res, opts.identity, opts.contentHash), res, opts);
+  } catch (e) {
+    const fresh = emptyResult(path);
+    Object.assign(res, fresh, { status: "skipped", reason: "unreadable", error: String((e as Error).message ?? e).slice(0, 200) });
+    return { res };
+  }
+}
+
+type Analysis = { res: FileResult; parent?: ParentInfo; views?: Rec[][]; fileViews?: FileViews };
+function analyzeLines(path: string, lines: Record<string, any>[], res: FileResult, opts: AnalyzeOptions & { idOf?: Family["idOf"]; prior?: FileViews }): Analysis {
+  {
     if (lines.length === 0) return skip(res, "empty"), { res };
     let parsed: Parsed & { keys?: Map<string, string> };
     if (lines[0].type === "session") parsed = piFile(lines, res, opts.parent ?? (() => undefined));
@@ -854,17 +887,42 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
     else return skip(res, "unknown-format"), { res };
     if (res.status !== "indexed") return { res };
     account(parsed.recs, res, opts.onLexical);
-    const family = parsed.from?.family ?? newFamily();
-    const fileViews = partition(parsed.views, res, family, parsed.from?.views, opts.onSpan);
+    const family = parsed.from?.family ?? newFamily(opts.idOf);
+    const source = opts.prior && parsed.from ? joinViews(opts.prior, parsed.from.views) : (opts.prior ?? parsed.from?.views);
+    const fileViews = partition(parsed.views, res, family, source, opts.onSpan);
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
-    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews } : undefined };
-  } catch (e) {
-    const fresh = emptyResult(path);
-    Object.assign(res, fresh, { status: "skipped", reason: "unreadable", error: String((e as Error).message ?? e).slice(0, 200) });
-    return { res };
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews } : undefined, views: parsed.views, fileViews };
   }
+}
+
+// ---------- server projection (DESIGN §4.3, §5.5) ----------
+
+/** A view's closed part as persisted: record keys in order and the spans over them (never re-cut). */
+export type PriorView = { keys: string[]; spans: { id?: string; start: number; end: number }[] };
+export type ProjectedView = { recs: { key: string; id: string; kind: string }[]; spans: { id?: string; start: number; end: number }[] };
+export type Projection = { res: FileResult; parent?: ParentInfo; views: ProjectedView[] };
+export interface ProjectOptions {
+  idOf: (recs: { key: string }[]) => string; // persistent span id from the ordered record keys
+  prior?: PriorView[]; // this source's previous partition, closed spans only: they are never re-cut
+  parent?: () => ParentInfo | "invalid" | undefined; // the fork parent's projection (Pi), undefined: not known
+  // A persisted parent: rebuild its ParentInfo from what its own projection stored (no re-analysis).
+  onSpan?: SpanSink;
+  onLexical?: LexicalSink;
+}
+
+/** Project one source from its L0 lines (in file order) the way the dry-run analyses a file. */
+export function projectLines(label: string, lines: Record<string, any>[], opts: ProjectOptions): Projection {
+  const res = emptyResult(label);
+  const prior = opts.prior?.length ? joinViews({ paths: opts.prior.map((v) => v.keys), viewSpans: opts.prior.map((v) => v.spans) }) : undefined;
+  const a = analyzeLines(label, lines, res, { parent: opts.parent && (() => opts.parent!()), idOf: opts.idOf, prior, onSpan: opts.onSpan, onLexical: opts.onLexical });
+  const views = (a.views ?? []).map((path, i) => ({ recs: path.map((r) => ({ key: r.key, id: r.id, kind: r.kind })), spans: a.fileViews!.viewSpans[i] }));
+  return { res: a.res, parent: a.parent, views };
+}
+export type { ParentInfo };
+export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"]): ParentInfo {
+  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }) };
 }
 
 // Regular files under the inputs; symlinks are never followed (reported instead), paths deduplicated.

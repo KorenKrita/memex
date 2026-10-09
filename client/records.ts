@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 export type Harness = "pi" | "codex";
 export type Rec = { id: string; hash: string; raw: string };
 export type ReadResult =
-  | { ok: true; harness: Harness; nativeId: string; sourceId: string; records: Rec[]; bytes: number }
+  | { ok: true; harness: Harness; nativeId: string; sourceId: string; records: Rec[]; bytes: number; parentPath?: string; parentNative?: string }
   | { ok: false; reason: "missing" | "empty" | "legacy" | "child-thread" | "not-a-session" | "bad-line" | "duplicate-id"; detail?: string };
 
 export const sha256 = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
@@ -37,6 +37,8 @@ export function readSession(path: string, harness: Harness): ReadResult {
   const recs: Rec[] = [];
   const seen = new Set<string>();
   let nativeId: string | undefined;
+  let parentPath: string | undefined; // Pi: the parent file named by the header (its id is read separately)
+  let parentNative: string | undefined; // Codex: forked_from_id
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     if (!raw.trim()) continue;
@@ -51,6 +53,7 @@ export function readSession(path: string, harness: Harness): ReadResult {
       if (i === 0) {
         if (d?.type !== "session" || typeof d.id !== "string") return { ok: false, reason: "not-a-session" };
         nativeId = d.id;
+        if (typeof d.parentSession === "string" && d.parentSession) parentPath = d.parentSession;
         id = "header";
       } else if (typeof d?.id === "string") id = d.id;
       else return { ok: false, reason: "bad-line", detail: `line ${i + 1} has no id` };
@@ -61,6 +64,7 @@ export function readSession(path: string, harness: Harness): ReadResult {
         if (meta.history_mode !== "paginated") return { ok: false, reason: "legacy" };
         if (codexIsChild(meta)) return { ok: false, reason: "child-thread" };
         nativeId = String(meta.id);
+        if (typeof meta.forked_from_id === "string" && meta.forked_from_id) parentNative = meta.forked_from_id;
       }
       if (typeof d?.ordinal !== "number") return { ok: false, reason: "legacy", detail: `line ${i + 1} has no ordinal` };
       id = String(d.ordinal);
@@ -69,7 +73,7 @@ export function readSession(path: string, harness: Harness): ReadResult {
     seen.add(id);
     recs.push({ id, hash: sha256(raw), raw });
   }
-  return { ok: true, harness, nativeId: nativeId!, sourceId: sourceIdOf(harness, nativeId!), records: recs, bytes: end };
+  return { ok: true, harness, nativeId: nativeId!, sourceId: sourceIdOf(harness, nativeId!), records: recs, bytes: end, parentPath, parentNative };
 }
 
 /** Manifest blocks (§5.1): consecutive records in file order, CHUNK per block; block hash over (id, hash). */
@@ -79,4 +83,16 @@ export function blockHashes(recs: { id: string; hash: string }[]): string[] {
   for (let i = 0; i < recs.length; i += CHUNK)
     out.push(sha256(recs.slice(i, i + CHUNK).map((r) => `${r.id}\u0000${r.hash}`).join("\n")));
   return out;
+}
+
+/** Native id of a Pi session file from its header line only (fork parents, §4.1). */
+export function piHeaderId(path: string): string | undefined {
+  try {
+    const buf = readFileSync(path);
+    const nl = buf.indexOf(0x0a);
+    const d = JSON.parse(buf.subarray(0, nl < 0 ? buf.length : nl).toString("utf8"));
+    return d?.type === "session" && typeof d.id === "string" && d.id ? d.id : undefined;
+  } catch {
+    return undefined;
+  }
 }
