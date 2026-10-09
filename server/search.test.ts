@@ -724,3 +724,91 @@ test("forget a querying session that never reached L0, before delivery: not answ
   expect(res.status).toBe(410);
   expect(await res.text()).not.toContain("history-four");
 });
+
+// ---------- corrections reach every rerank document that needs them ----------
+
+const lastRerank = () => requests.filter((x) => x.path.endsWith("/rerank")).at(-1)!.body.documents as string[];
+
+test("two candidates followed by the same correction: each rerank document carries it", async () => {
+  // One exchange, two records that both match; the user corrects in the next exchange.
+  const lines = [header("tw"), msg("user", "u0", null, "use port 8080 alpha"), msg("assistant", "a0", "u0", "set port 8080 in conf"),
+    msg("user", "u1", "a0", "不对，改成 9090"), msg("assistant", "a1", "u1", "done")];
+  await put("tw", lines);
+  await drain(db);
+  const r = await body(Q("port 8080"));
+  const docs = lastRerank().filter((d) => d.includes("8080"));
+  expect(docs.length).toBeGreaterThanOrEqual(2);
+  for (const d of docs) expect(d).toContain("改成 9090");
+  void r;
+});
+
+test("a record hit in a fork copy: the correction on the fork's own next exchange is attached too", async () => {
+  const P = sourceIdOf("pi", "fx");
+  const pl = [header("fx"), msg("user", "u0", null, "deploy target is host-a7"), msg("assistant", "a0", "u0", "ok host-a7")];
+  await put("fx", [...pl, msg("user", "u1", "a0", "thanks"), msg("assistant", "a1", "u1", "np")]);
+  await drain(db);
+  // A fork continues from a0 with a correction that the parent never has.
+  await put("fy", [header("fy", { parentSession: "/x/fx.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "不对，host-b9 才对"), msg("assistant", "k2", "k1", "改了")], "personal", P);
+  await drain(db);
+  await body(Q("host-a7"));
+  const docs = lastRerank().filter((d) => d.includes("host-a7"));
+  expect(docs.length).toBeGreaterThan(0);
+  for (const d of docs) expect(d).toContain("host-b9");
+});
+
+test("a failure line later in the hit record itself is attached", async () => {
+  const lines = [header("sf"), msg("user", "u0", null, "run the migration"),
+    msg("assistant", "a0", "u0", "running migrate-v3 now\nstep two\n[error] migrate-v3 failed: relation missing")];
+  await put("sf", lines);
+  await drain(db);
+  await body(Q("migrate-v3"));
+  const docs = lastRerank().filter((d) => d.includes("running migrate-v3"));
+  expect(docs.length).toBeGreaterThan(0);
+  for (const d of docs) expect(d).toContain("[later in span] [error] migrate-v3 failed");
+});
+
+test("signals over their budget: the candidate is marked incomplete, not silently trimmed", async () => {
+  const many = Array.from({ length: 40 }, (_, i) => `[error] failure number ${i} ${"e".repeat(30)}`).join("\n");
+  await put("sb", [header("sb"), msg("user", "u0", null, "build sb-token"), msg("assistant", "a0", "u0", "building sb-token\n" + many)]);
+  await drain(db);
+  const r = await body(Q("sb-token"));
+  const hit = r.results.find((x: any) => (x.excerpt?.text ?? "").includes("sb-token"));
+  expect(hit.incomplete).toContain("signals-dropped");
+  expect(hit.injectable).toBe(false);
+});
+
+test("a unit hit through two representations: corrections after both support sets are attached", async () => {
+  const P = sourceIdOf("pi", "ur");
+  const pl = [header("ur"), msg("user", "u0", null, "alpha choose db"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis"),
+    msg("user", "u1", "a1", "不对，去掉 redis"), msg("assistant", "a2", "u1", "ok")];
+  summaryOf = (input) => (input.includes("and redis") ? "S: alpha db postgres and redis" : input.includes("postgres") ? "P: alpha db postgres" : "other");
+  await put("ur", pl);
+  await drain(db);
+  // The fork branches inside S after a0 and corrects differently.
+  await put("us", [header("us", { parentSession: "/x/ur.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "不对，换成 mysql"), msg("assistant", "k2", "k1", "ok")], "personal", P);
+  await drain(db);
+  await body(Q("alpha"));
+  const doc = lastRerank().find((d) => d.includes("P: alpha db postgres") && d.includes("S: alpha db postgres and redis"));
+  expect(doc).toBeTruthy();
+  expect(doc).toContain("去掉 redis");
+  expect(doc).toContain("换成 mysql");
+});
+
+test("a record hit in a record that both S and its fork prefix P hold: corrections after either end are attached", async () => {
+  const P = sourceIdOf("pi", "rp2");
+  const pl = [header("rp2"), msg("user", "u0", null, "choose-db-token please"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis"),
+    msg("user", "u1", "a1", "不对，去掉 redis"), msg("assistant", "a2", "u1", "ok")];
+  await put("rp2", pl);
+  await drain(db);
+  await put("rq2", [header("rq2", { parentSession: "/x/rp2.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "不对，换成 mysql"), msg("assistant", "k2", "k1", "ok")], "personal", P);
+  await drain(db);
+  expect((await db`select count(*)::int n from span where keys[1] like 'rp2/u0:%'`)[0].n).toBe(2); // S and P
+  await body(Q("choose-db-token", { dests: ["rerank"] }));
+  // The record candidate (lexical, the user message) and the unit candidates whose summaries quote it.
+  const docs = lastRerank().filter((d) => d.includes("[excerpt] choose-db-token"));
+  expect(docs.length).toBeGreaterThan(0);
+  for (const d of docs) {
+    expect(d).toContain("去掉 redis");
+    expect(d).toContain("换成 mysql");
+  }
+});

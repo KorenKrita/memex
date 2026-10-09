@@ -74,14 +74,19 @@ const clip = (t: string, n: number) => {
 };
 const terms = (q: string) => [...new Set(q.split(/\s+/).filter(Boolean))].slice(0, MAX_TERMS);
 
-/** Excerpt of `text` around the first occurrence of any term (±EXCERPT_SIDE bytes). */
-function around(text: string, ts: string[]) {
+/** Character offset of the first occurrence of any term, or -1. */
+function firstHit(text: string, ts: string[]) {
   const low = text.toLowerCase();
   let at = -1;
   for (const t of ts) {
     const i = low.indexOf(t.toLowerCase());
     if (i >= 0 && (at < 0 || i < at)) at = i;
   }
+  return at;
+}
+/** Excerpt of `text` around the first occurrence of any term (±EXCERPT_SIDE bytes). */
+function around(text: string, ts: string[]) {
+  const at = firstHit(text, ts);
   if (at < 0) return null;
   const pre = Buffer.from(text.slice(0, at));
   const start = Math.max(0, pre.length - EXCERPT_SIDE);
@@ -257,69 +262,96 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   }
   chosen.sort((a, b) => b.fused - a.fused || (a.key < b.key ? -1 : 1));
 
-  // Rerank inputs: excerpts, signals after the hit inside its span, next-exchange starts from every view.
+  // Rerank inputs (§6.3), per candidate: each rerank document is scored on its own, so every candidate gets
+  // its own corrections; repetition is only removed inside one candidate (by record version).
   const lexText = async (keys: string[]) => {
     const rows = await q`select key, source, string_agg(text, '' order by part) text from lexical
                          where key = any(${q.array(keys, "text")}) and source = any(${q.array(valid, "text")}) group by key, source`;
     return new Map<string, { source: string; text: string }>(rows.map((x: any) => [x.key, { source: x.source, text: x.text }]));
   };
-  const seenNext = new Set<string>();
   for (const c of chosen) {
-    let support: string[]; // record keys, in span order, the hit's position = `from`
-    let from = 0;
+    // Evidence positions: [record keys in order, index of the hit (-1: no located hit, the whole set counts)].
+    const ev: [string[], number][] = [];
+    const hitAt = new Map<string, number>(); // record key → character offset of the hit inside it
     if (c.kind === "record") {
-      c.excerpt = { key: c.hit!.key, text: around(c.hit!.text, ts) ?? clip(c.hit!.text, 2 * EXCERPT_SIDE) };
-      const [sp] = await q`select keys from span where keys @> array[${c.hit!.key}]::text[] and source = any(${q.array(valid, "text")}) limit 1`;
-      support = sp?.keys ?? [c.hit!.key];
-      from = Math.max(0, support.indexOf(c.hit!.key));
+      const k = c.hit!.key;
+      c.excerpt = { key: k, text: around(c.hit!.text, ts) ?? clip(c.hit!.text, 2 * EXCERPT_SIDE) };
+      const full = (await lexText([k])).get(k)?.text ?? c.hit!.text;
+      hitAt.set(k, Math.max(0, firstHit(full, ts)));
+      // Every span that holds this record version (fork copies share the key), not one of them.
+      const sps = await q`select keys from span where keys @> array[${k}]::text[] and source = any(${q.array(valid, "text")})`;
+      for (const sp of sps) ev.push([sp.keys, (sp.keys as string[]).indexOf(k)]);
+      if (!ev.length) ev.push([[k], 0]);
     } else {
-      const best = c.reps[0];
-      support = best.keys;
-      const texts = await lexText(support);
-      // Only a vector hit: the support chunk with most query-term overlap; otherwise the representation alone.
+      const seenRep = new Set<string>();
+      for (const p of c.reps) {
+        if (seenRep.has(p.span)) continue;
+        seenRep.add(p.span);
+        ev.push([p.keys, -1]);
+      }
+      // An excerpt: the support record with most query-term overlap over all hit representations.
+      const all = [...new Set(c.reps.flatMap((p) => p.keys))];
+      const texts = await lexText(all);
       let pick: { key: string; text: string } | undefined;
       let n = 0;
-      for (const k of support) {
+      for (const k of all) {
         const t = texts.get(k)?.text ?? "";
         const m = ts.filter((x) => t.toLowerCase().includes(x.toLowerCase())).length;
         if (m > n) (n = m), (pick = { key: k, text: around(t, ts)! });
       }
-      if (pick) (c.excerpt = pick), (from = support.indexOf(pick.key));
+      if (pick) {
+        c.excerpt = pick;
+        hitAt.set(pick.key, Math.max(0, firstHit(texts.get(pick.key)!.text, ts)));
+      }
     }
-    const texts = await lexText(support.slice(from + 1));
+    // Correction signals after the hit: in the hit record after the hit position, and in later records of
+    // each evidence span (with no located hit, every record of the support set).
+    const later = new Map<string, number>(); // record key → character offset from which to scan
+    for (const [keys, i] of ev)
+      keys.forEach((k, j) => {
+        const from = j === i || (i < 0 && hitAt.has(k)) ? hitAt.get(k) ?? 0 : j > i ? 0 : -1;
+        if (from >= 0 && (!later.has(k) || later.get(k)! > from)) later.set(k, from);
+      });
+    const lt = await lexText([...later.keys()]);
     let budget = SIGNAL_MAX;
-    for (const k of support.slice(from + 1)) {
-      const t = texts.get(k);
+    for (const [k, from] of later) {
+      const t = lt.get(k);
       if (!t) continue;
-      for (const line of t.text.split("\n"))
-        if (SIGNAL.test(line) && budget > 0) {
-          const s = clip(line, budget);
-          if (s.length < line.length) c.incomplete.push("signal-clipped");
-          budget -= Buffer.byteLength(s);
-          c.attach.push({ what: "signal", key: k, source: t.source, text: s });
-          c.sources.add(t.source);
+      for (const line of t.text.slice(from).split("\n")) {
+        if (!SIGNAL.test(line)) continue;
+        if (budget <= 0) {
+          c.incomplete.push("signals-dropped");
+          break;
         }
+        const s = clip(line, budget);
+        if (s.length < line.length) c.incomplete.push("signal-clipped");
+        budget -= Buffer.byteLength(s);
+        c.attach.push({ what: "signal", key: k, source: t.source, text: s });
+        c.sources.add(t.source);
+      }
     }
-    // Next exchange after the last support record, on every valid view that has it (dedup by record version).
-    const last = support.at(-1)!;
-    const views = await q`select v.source, v.keys, v.recs from view v where v.keys @> array[${last}]::text[] and v.source = any(${q.array(valid, "text")})`;
-    const want: string[] = [];
+    // Next exchange after each evidence span's end, on every valid view that holds that record (a user's
+    // "不对，改成 B" is most often the next message, and it may differ per fork).
+    const ends = [...new Set(ev.map(([keys]) => keys.at(-1)!))];
+    const views = await q`select v.keys, v.recs from view v where v.keys && ${q.array(ends, "text")}::text[] and v.source = any(${q.array(valid, "text")})`;
+    const want = new Map<string, "user" | "assistant">();
     for (const v of views) {
-      const i = (v.keys as string[]).indexOf(last);
       const recs = v.recs as { key: string; kind: string }[];
-      const u = recs.findIndex((x, j) => j > i && x.kind === "user");
-      if (u < 0 || seenNext.has(recs[u].key)) continue;
-      seenNext.add(recs[u].key);
-      want.push(recs[u].key);
-      const a = recs.findIndex((x, j) => j > u && x.kind === "assistant");
-      if (a >= 0 && (recs.slice(u + 1, a).every((x) => x.kind !== "user"))) want.push(recs[a].key);
+      for (const e of ends) {
+        const i = (v.keys as string[]).indexOf(e);
+        if (i < 0) continue;
+        const u = recs.findIndex((x, j) => j > i && x.kind === "user");
+        if (u < 0) continue;
+        want.set(recs[u].key, "user");
+        const a = recs.findIndex((x, j) => j > u && x.kind === "assistant");
+        if (a >= 0 && recs.slice(u + 1, a).every((x) => x.kind !== "user")) want.set(recs[a].key, "assistant");
+      }
     }
-    const nt = await lexText(want);
-    for (const k of want) {
+    const nt = await lexText([...want.keys()]);
+    for (const [k, kind] of want) {
       const t = nt.get(k);
       if (!t) continue;
-      const max = views.some((v: any) => (v.recs as any[]).find((x) => x.key === k)?.kind === "user") ? NEXT_USER : NEXT_ASSISTANT;
-      const s = clip(t.text, max);
+      const s = clip(t.text, kind === "user" ? NEXT_USER : NEXT_ASSISTANT);
       if (s.length < t.text.length) c.incomplete.push("next-clipped");
       c.attach.push({ what: "next", key: k, source: t.source, text: s });
       c.sources.add(t.source);
