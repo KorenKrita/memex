@@ -49,6 +49,7 @@ export type SearchReq = {
   query: string;
   dests: string[]; // destinations the plugin allows for this query: "embedding", "rerank"
   inContext?: string[]; // native record ids of the querying session still in the host's context
+  leaf?: string; // the querying session's current leaf (native id): its own results are labelled against it
   limit?: number;
 };
 
@@ -111,6 +112,7 @@ function validate(b: any): SearchReq {
     query: s(b.query, "query", 8192),
     dests: Array.isArray(b.dests) ? b.dests.filter((d: unknown) => d === "embedding" || d === "rerank") : [],
     inContext: Array.isArray(b.inContext) ? b.inContext.filter((x: unknown) => typeof x === "string").slice(0, 10_000) : [],
+    leaf: typeof b.leaf === "string" && b.leaf && b.leaf.length <= 256 ? b.leaf : undefined,
     limit: Number.isInteger(b.limit) && b.limit > 0 ? Math.min(b.limit, 40) : 10,
   };
 }
@@ -383,23 +385,47 @@ function fit(chosen: Cand[]): string[] | null {
   return base.map((b, i) => (att[i] ? b + "\n" + att[i] : b));
 }
 
-/** Path label of evidence `keys` against the target source's view (§4.2, §4.3). */
-async function pathLabel(q: Tx, source: string, keys: string[]) {
-  const views = await q`select ord, tip, keys from view where source = ${source} order by ord`;
-  if (!views.length || !keys.length) return { label: "unlocated", basis: "unknown" as const };
-  const leaves = [...new Set((await q`select leaf from collector_view where source = ${source} and leaf is not null`).map((x: any) => x.leaf))];
-  let v: any, basis: "observed" | "inferred-tail" | "unknown";
-  if (leaves.length > 1) basis = "unknown";
-  else if (leaves.length === 1 && (v = views.find((x: any) => x.tip === leaves[0]))) basis = "observed";
-  else {
-    const [t] = await q`select rec from record where source = ${source} order by first_pos desc limit 1`;
-    v = views.find((x: any) => x.tip === t?.rec) ?? views.at(-1);
-    basis = "inferred-tail";
+type ViewBasis = "observed" | "inferred-tail" | "unknown";
+export type TargetView = {
+  views: { ord: number; tip: string; keys: string[] }[];
+  v?: { tip: string; keys: string[] }; // the view labels are taken against; absent when basis is unknown
+  basis: ViewBasis;
+  at: string | null; // when an observed leaf was reported
+  reason?: string; // why the basis is unknown
+};
+
+/**
+ * The target session's view (§4.2): the leaf its own plugin reported most recently (observed), else the host's
+ * resume rule (Pi: the last entry written → inferred-tail). A reported leaf that names no projected view gives
+ * `unknown` (it is not replaced by the tail: that would label against a path the user is not on).
+ */
+async function targetView(q: Tx, source: string, leaf?: { tip: string; at: string | null }): Promise<TargetView> {
+  const views = (await q`select ord, tip, keys from view where source = ${source} order by ord`) as TargetView["views"];
+  const [rep] = leaf ? [leaf] : await q`select leaf as tip, at from collector_view where source = ${source} and leaf is not null order by at desc limit 1`;
+  if (rep) {
+    const at = rep.at ? new Date(rep.at).toISOString() : null;
+    const v = views.find((x) => x.tip === rep.tip);
+    return v ? { views, v, basis: "observed", at } : { views, basis: "unknown", at, reason: "leaf-not-projected" };
   }
-  if (views.length === 1) return { label: keys.every((k) => views[0].keys.includes(k)) ? "on-path" : "unlocated", basis: basis === "unknown" ? "inferred-tail" : basis };
-  if (basis === "unknown") return { label: "branched", basis };
-  const on = keys.filter((k) => v.keys.includes(k)).length;
-  return { label: on === keys.length ? "on-path" : on === 0 ? "off-path" : "mixed", basis, tip: v.tip as string };
+  if (!views.length) return { views, basis: "unknown", at: null, reason: "no-view" };
+  const [t] = await q`select rec from record where source = ${source} order by first_pos desc limit 1`;
+  return { views, v: views.find((x) => x.tip === t?.rec) ?? views.at(-1)!, basis: "inferred-tail", at: null };
+}
+
+/** Path label of evidence `keys` against a target view (§4.3). */
+function labelOf(t: TargetView, keys: string[]): string {
+  if (!keys.length || !t.views.some((v) => keys.every((k) => v.keys.includes(k)) || keys.some((k) => v.keys.includes(k)))) return "unlocated";
+  if (t.views.length === 1) return keys.every((k) => t.views[0].keys.includes(k)) ? "on-path" : "unlocated";
+  if (!t.v) return "branched";
+  const on = keys.filter((k) => t.v!.keys.includes(k)).length;
+  return on === keys.length ? "on-path" : on === 0 ? "off-path" : "mixed";
+}
+
+/** A candidate's label from its representations' labels: never stronger than the weakest (§4.3). */
+export function mergeLabels(ls: string[]): string {
+  if (!ls.length) return "unlocated";
+  for (const weak of ["unlocated", "branched"]) if (ls.includes(weak)) return weak;
+  return ls.every((x) => x === ls[0]) ? ls[0] : "mixed";
 }
 
 export const searchHooks = { beforeTrace: async () => {} };
@@ -422,11 +448,21 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       else if (!process.env.MEMEX_RERANK_URL) rerankSkip = "not-configured";
       else for (const sc of rerankScopes) if (!(await granted(q, sc, r.purpose, "rerank"))) rerankSkip = "not-granted";
       const [dr] = await q`select v from vis_version where key = 'd:rerank'`;
+      // Labels against each target session's view (the querying session's own: the leaf it sends).
+      const tv = new Map<string, TargetView>();
+      const viewOf = async (src: string) => {
+        if (!tv.has(src)) tv.set(src, await targetView(q, src, src === r.source && r.leaf ? { tip: r.leaf, at: null } : undefined));
+        return tv.get(src)!;
+      };
       const labels = new Map<string, any>();
       for (const c of rc.chosen) {
         const src = c.kind === "record" ? c.hit!.source : c.reps[0].source;
-        const keys = c.kind === "record" ? [c.hit!.key] : c.reps[0].keys;
-        labels.set(c.key, { ...(await pathLabel(q, src, keys)), reps: await Promise.all(c.reps.map(async (p) => (await pathLabel(q, p.source, p.keys)).label)) });
+        const t = await viewOf(src);
+        const reps = await Promise.all(c.reps.map(async (p) => labelOf(await viewOf(p.source), p.keys)));
+        // A unit's label merges all its representations (the excerpt never upgrades it); a record's is its own.
+        const label = c.kind === "record" ? labelOf(t, [c.hit!.key]) : mergeLabels(reps);
+        const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: b.valid.get(src)!.deps["s:" + src] ?? null, at: t.at };
+        labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps });
       }
       return { b, rc, rerankSkip, dRerank: Number(dr?.v ?? 1), labels };
     });
@@ -472,7 +508,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         key: c.key,
         source: c.kind === "record" ? c.hit!.source : c.reps[0].source,
         scope: b.valid.get(c.kind === "record" ? c.hit!.source : c.reps[0].source)!.scope,
-        path: { label: L.label, view_basis: L.basis, tip: L.tip ?? null },
+        path: { label: L.label, view_basis: L.basis, view_key: L.view_key, ...(L.reason ? { reason: L.reason } : {}) },
         score: x.adj,
         rerank_score: rerankSkip ? null : scores[x.i],
         reps: c.reps.map((p, j) => ({ span: p.span, channel: p.channel, text: p.text, path: L.reps[j] })),
@@ -553,9 +589,22 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
       if (!sp || (await q`select 1 from tomb where key = any(${q.array((sp.canons as string[]).map((c) => "canon:" + c), "text")}) limit 1`).length)
         throw new HttpError(404, "not found or not readable");
-      // The view: the leaf the caller names, else the result's view basis (same rule as search labels).
+      // The view: the search result's view_key tip when given, else the same rule as search labels. A tip
+      // that names no view holding this span is reported (view_basis unknown, no neighbours), not replaced.
       const views = await q`select ord, tip, spans, span_ids from view where source = ${sp.source} and span_ids @> array[${sid}]::text[] order by ord`;
-      const v = views.find((x: any) => x.tip === body.leaf) ?? views.at(-1);
+      let v: any, vb: ViewBasis, reason: string | null = null;
+      if (typeof body.view_tip === "string") {
+        v = views.find((x: any) => x.tip === body.view_tip);
+        vb = "unknown";
+        if (!v) reason = "view-not-found";
+        else vb = typeof body.view_basis === "string" && ["observed", "inferred-tail"].includes(body.view_basis) ? body.view_basis : "observed";
+      } else {
+        const t = await targetView(q, sp.source);
+        v = t.v && views.find((x: any) => x.tip === t.v!.tip);
+        vb = t.basis;
+        reason = t.reason ?? null;
+        if (t.v && !v) (vb = "unknown"), (reason = "span-off-view");
+      }
       const order = v ? (v.spans as any[]).filter((x) => x.id).map((x) => x.id as string) : [sid];
       const i = order.indexOf(sid);
       const t = await texts(q, sp.keys, valid);
@@ -582,7 +631,7 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       return {
         deps: depsOf(b, [sp.source, ...[...t.values()].map((x) => x.source)]),
         body: {
-          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, summary, records, more, next_offset: more ? offset + limit : null,
+          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, view_basis: vb, ...(reason ? { reason } : {}), summary, records, more, next_offset: more ? offset + limit : null,
           before: i > 0 ? "span:" + order[i - 1] : null, after: i >= 0 && i < order.length - 1 ? "span:" + order[i + 1] : null,
         },
       };

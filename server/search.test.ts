@@ -6,7 +6,7 @@ import { connect, migrate, bump, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, Guarded, httpHooks, route, serve, transport } from "./http.ts";
-import { search, zoom, grep, GUARANTEED, searchHooks } from "./search.ts";
+import { search, zoom, grep, GUARANTEED, searchHooks, mergeLabels } from "./search.ts";
 import { forgetSource } from "./forget.ts";
 import { drain } from "./worker.ts";
 import { sourceIdOf } from "../client/records.ts";
@@ -865,4 +865,95 @@ test("a fresh database: the entry point creates every table before serving", asy
     else process.env.MEMEX_PG_URL = prev;
     await db.unsafe(`drop database if exists ${name} with (force)`);
   }
+});
+
+// ---------- view keys (§4.2, §6.4) ----------
+
+/** One file, two branches: view a2 = S[u0 a0 a1] + [u1 a2]; view b2 = P[u0 a0] + [b1] + [v1 b2] (written last). */
+async function branched(leaf?: string) {
+  const l1 = [header("br"), msg("user", "u0", null, "alpha choose db"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis brtoken-off"),
+    msg("user", "u1", "a1", "next q"), msg("assistant", "a2", "u1", "ok")];
+  const src = await put("br", l1);
+  await drain(db);
+  await put("br", [...l1, msg("assistant", "b1", "a0", "only postgres brtoken-on"), msg("user", "v1", "b1", "go on"), msg("assistant", "b2", "v1", "fine")], "personal", null, leaf);
+  await drain(db);
+  const sp = async (first: string, n: number) => (await db`select id from span where source = ${src} and keys[1] like ${"br/" + first + ":%"} and cardinality(keys) = ${n}`)[0].id as string;
+  return { src, S: await sp("u0", 3), P: await sp("u0", 2), B1: await sp("b1", 1), U1: await sp("u1", 2) };
+}
+const rec = (r: any, text: string) => r.results.find((x: any) => x.kind !== "unit" && (x.excerpt?.text ?? "").includes(text));
+
+test("no reported leaf: results carry the inferred-tail view key; the other branch is off-path", async () => {
+  const { src } = await branched();
+  const r = await body(Q("brtoken", { dests: [] }));
+  const on = rec(r, "brtoken-on"), off = rec(r, "brtoken-off");
+  expect(on.path).toMatchObject({ label: "on-path", view_basis: "inferred-tail", view_key: { source: src, tip: "b2", basis: "inferred-tail" } });
+  expect(typeof on.path.view_key.version).toBe("number");
+  expect(off.path.label).toBe("off-path");
+});
+
+test("the session's plugin reported a leaf: observed basis with its time, labels against that branch", async () => {
+  await branched("a2");
+  const r = await body(Q("brtoken", { dests: [] }));
+  const off = rec(r, "brtoken-off");
+  expect(off.path).toMatchObject({ label: "on-path", view_basis: "observed", view_key: { tip: "a2", basis: "observed" } });
+  expect(Date.parse(off.path.view_key.at)).toBeGreaterThan(Date.now() - 60_000);
+  expect(rec(r, "brtoken-on").path.label).toBe("off-path");
+});
+
+test("a reported leaf that names no view: unknown basis, branched, not replaced by the tail or down-weighted", async () => {
+  await branched("zz-not-a-record");
+  const r = await body(Q("brtoken", { dests: [] }));
+  for (const t of ["brtoken-on", "brtoken-off"]) {
+    const x = rec(r, t);
+    expect(x.path).toMatchObject({ label: "branched", view_basis: "unknown", reason: "leaf-not-projected", view_key: { tip: null } });
+  }
+});
+
+test("the querying session's own results are labelled against the leaf it sends", async () => {
+  const { src } = await branched();
+  const r = await body(Q("brtoken", { dests: [], source: src, leaf: "a2" }));
+  expect(rec(r, "brtoken-off").path).toMatchObject({ label: "on-path", view_basis: "observed", view_key: { tip: "a2" } });
+});
+
+test("a unit's label merges its representations; an on-path excerpt does not upgrade it", async () => {
+  const { S } = await branched();
+  const r = await body(Q("alpha choose", { dests: [] }));
+  const u = r.results.find((x: any) => x.key === "unit:" + S);
+  expect(u).toBeTruthy();
+  // On the tail view b2: P's records are all on-path, S's a1 is not → S mixed → the unit is mixed.
+  expect(u.reps.map((p: any) => p.path).sort()).toEqual(["mixed", "on-path"]);
+  expect(u.path.label).toBe("mixed");
+  // With the session observed on a2 both representations are on-path.
+  await db`insert into collector_view values (${sourceIdOf("pi", "br")}, 'c9', 'a2', now())`;
+  const r2 = await body(Q("alpha choose", { dests: [] }));
+  expect(r2.results.find((x: any) => x.key === "unit:" + S).path.label).toBe("on-path");
+});
+
+test("zoom follows the search result's view key; a view key it cannot find is reported, not replaced", async () => {
+  const { S, P, B1, U1 } = await branched();
+  const on = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on");
+  const vk = on.path.view_key;
+  // Along b2: P → b1 → (v1 b2).
+  let z = (await zoom(db, T0({ id: "span:" + P, view_tip: vk.tip, view_basis: vk.basis }))).body as any;
+  expect(z).toMatchObject({ view_tip: "b2", view_basis: "inferred-tail", before: null, after: "span:" + B1 });
+  // S is not on b2: no neighbours, the reason given (it is not quietly zoomed along a2).
+  z = (await zoom(db, T0({ id: "span:" + S, view_tip: vk.tip }))).body as any;
+  expect(z).toMatchObject({ view_tip: null, view_basis: "unknown", reason: "view-not-found", before: null, after: null });
+  expect(z.records.length).toBe(3);
+  // Without a view key: the target session's own view rule; S off the tail view → unknown as well.
+  z = (await zoom(db, T0({ id: "span:" + S }))).body as any;
+  expect(z).toMatchObject({ view_basis: "unknown", reason: "span-off-view", after: null });
+  // An observed leaf on a2: S → (u1 a2).
+  await db`insert into collector_view values (${sourceIdOf("pi", "br")}, 'c9', 'a2', now())`;
+  z = (await zoom(db, T0({ id: "span:" + S }))).body as any;
+  expect(z).toMatchObject({ view_tip: "a2", view_basis: "observed", after: "span:" + U1 });
+});
+
+test("label merge: unanimous stays, disagreement is mixed, an unlocated or branched representation wins", () => {
+  expect(mergeLabels(["on-path", "on-path"])).toBe("on-path");
+  expect(mergeLabels(["off-path", "off-path"])).toBe("off-path");
+  expect(mergeLabels(["on-path", "off-path"])).toBe("mixed");
+  expect(mergeLabels(["on-path", "unlocated"])).toBe("unlocated");
+  expect(mergeLabels(["on-path", "branched"])).toBe("branched");
+  expect(mergeLabels([])).toBe("unlocated");
 });
