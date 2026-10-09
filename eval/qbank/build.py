@@ -25,7 +25,7 @@ checked separately with span-distance.ts (see eval/README.md).
 Pi evidence paths are relative to CORPUS/pi (entry = record id); Codex paths start with codex/ or
 codex-archived/ (entry = str(ordinal) of a response_item: message, tool call or tool output).
 """
-import hashlib, json, os, subprocess, sys
+import hashlib, json, os, re, subprocess, sys
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,11 +42,10 @@ def fail(msg):
     raise SystemExit(msg)
 
 
-ref = json.loads(subprocess.run(["bun", f"{HERE}/indexable.ts", CORPUS], check=True, capture_output=True, text=True).stdout)
-INDEXABLE = set(ref["indexed"])
-for k in INDEXABLE:
-    if k not in MANIFEST:
-        fail(f"dry-run indexes {k}, which is not in the frozen manifest")
+def indexable(root):
+    """corpus-relative files the reference dry-run indexes under root, minus Pi run-N subagent runs"""
+    out = subprocess.run(["bun", f"{HERE}/indexable.ts", root], check=True, capture_output=True, text=True).stdout
+    return set(json.loads(out)["indexed"])
 
 
 def text_of(m):
@@ -115,7 +114,10 @@ def load(key):
         sha = hashlib.sha256(data).hexdigest()
         if MANIFEST[key] != sha:
             fail(f"{key} differs from the frozen corpus manifest")
-        cache[key] = (sha, data) + (parse(key, data) if key in INDEXABLE else ([], {}))
+        if key.endswith(".zst"):
+            cache[key] = (sha, data, [], {})  # compressed: the dry-run skips it, so it is never visible
+        else:
+            cache[key] = (sha, data) + parse(key, data)
     return cache[key]
 
 
@@ -124,21 +126,51 @@ ids = [q["id"] for q in drafts]
 if len(ids) != len(set(ids)):
     fail("duplicate ids")
 evkey = lambda f: f if f.startswith(("codex/", "codex-archived/")) else "pi/" + f
+session_of = lambda f: f.split("/")[-1]  # native session file (Pi and Codex file names carry the session id)
 seen = {}
 for q in drafts:
     groups = [("task_cluster", q["task_cluster"])] + [("fact_group", g) for g in q.get("fact_group", [])]
-    groups += [("answer record", f"{evkey(e['file'])}#{e['entry']}") for e in q["evidence"] if e["use"] == "answer"]
+    groups += [("session file", session_of(e["file"])) for e in q["evidence"]]
     for kind, g in groups:
         if seen.setdefault((kind, g), q["split"]) != q["split"]:
             fail(f"{q['id']}: {kind} {g!r} spans splits")
+
+# Per cutoff, the corpus as it stood then (public/views/<cutoff>/, what the system under test indexes): every
+# file cut to the lines before its first record at or after the cutoff (whole files are APFS clones, only
+# files that span the cutoff are rewritten), Pi run-N subagent runs left out. The reference dry-run then
+# decides indexability on that view, so later data cannot decide what was indexable earlier (e.g. copies
+# that only diverge after the cutoff).
+old_umask = os.umask(0o077)
+for d in ("public/visible", "public/views", "grader/evidence"):
+    os.makedirs(f"{outdir}/{d}")
+cutoffs = sorted({q["cutoff"] for q in drafts})
+vis_name = {c: c.replace(":", "") + ".json" for c in cutoffs}
+RUN = re.compile(r"^pi/.*/run-\d+/")
+VIS = {}  # cutoff -> {key: (sha256 of the whole frozen file, visible lines)}
+for c in cutoffs:
+    root = f"{outdir}/public/views/{vis_name[c][:-5]}"
+    cut = {}
+    whole = {}  # target dir -> whole files to clone there (one cp per directory)
+    for key in MANIFEST:
+        sha, data, stamps, _ = load(key)
+        k = prefix(stamps, c) if stamps else 0
+        if not k or RUN.match(key):
+            continue
+        os.makedirs(os.path.dirname(f"{root}/{key}"), exist_ok=True)
+        if k == len(stamps):
+            whole.setdefault(os.path.dirname(f"{root}/{key}"), []).append(f"{CORPUS}/{key}")
+        else:
+            open(f"{root}/{key}", "wb").write(b"\n".join(data.split(b"\n")[:k]) + b"\n")
+        cut[key] = (sha, k)
+    for d, srcs in whole.items():
+        subprocess.run(["cp", "-c", *srcs, d + "/"], check=True)
+    VIS[c] = {key: cut[key] for key in indexable(root)}
 for q in drafts:
     for ev in q["evidence"]:
         key = evkey(ev["file"])
         sha, _, stamps, es = load(key)
-        if key not in INDEXABLE:
-            if q["needs_history"]:
-                fail(f"{q['id']}: evidence {ev['entry']} is in a non-indexed file {key}")
-            stamps, es = parse(key, cache[key][1])
+        if q["needs_history"] and key not in VIS[q["cutoff"]]:
+            fail(f"{q['id']}: evidence {ev['entry']} is in a file not indexable at the cutoff: {key}")
         if ev["entry"] not in es:
             fail(f"{q['id']}: no entry {ev['entry']} in {key}")
         n, t, role, text = es[ev["entry"]]
@@ -161,19 +193,9 @@ for q in drafts:
         if not other and min(e["line"] for e in c) <= o["line"]:
             fail(f"{q['id']}: correction is not after the old claim")
 
-old_umask = os.umask(0o077)
-for d in ("public/visible", "grader/evidence"):
-    os.makedirs(f"{outdir}/{d}")
 man_sha = hashlib.sha256(MAN_BYTES).hexdigest()
-cutoffs = sorted({q["cutoff"] for q in drafts})
-vis_name = {c: c.replace(":", "") + ".json" for c in cutoffs}
 for c in cutoffs:
-    files = {}
-    for key in sorted(INDEXABLE):
-        sha, _, stamps, _ = load(key)
-        k = prefix(stamps, c)
-        if k:
-            files[key] = [sha, k]
+    files = {key: list(VIS[c][key]) for key in sorted(VIS[c])}
     with open(f"{outdir}/public/visible/{vis_name[c]}", "w") as f:
         json.dump({"corpus": CORPUS, "corpus_manifest_sha256": man_sha, "cutoff": c, "files": files}, f, indent=0)
 public = ["id", "question", "current_context", "cutoff"]

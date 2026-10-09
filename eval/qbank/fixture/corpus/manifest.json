@@ -7,6 +7,8 @@
 "codex/2026/01/01/rollout-sub.jsonl": "edcb992371a07f4db3eab1b3b8a1738cc050dbe0f9653e75c3558392896a6171",
 "pi/p/s1.jsonl": "301925ab859762cd1c65ee693d9280f19dd04ad12410b6cd5f8af276e74cbb4f",
 "pi/p/s1/r1/run-0/session.jsonl": "de2f3f9aaf8e2f8c0d67ec3ae41a689939947b3661b4281300f1a62273530e1b",
-"pi/p/subagent-artifacts/x_transcript.jsonl": "fd11d058ae064ccd6e89277cf1a78ba5f24a7fd642c05918836dc4c56976cc7b"
+"pi/p/subagent-artifacts/x_transcript.jsonl": "fd11d058ae064ccd6e89277cf1a78ba5f24a7fd642c05918836dc4c56976cc7b",
+"pi/q/s2.jsonl": "790dfc25de9893c7ee5d5ea808ea52451354d4c9eb8175b64d5dddafcfdfdd71",
+"pi/r/s2.jsonl": "1d51155c173b5bbe39b0d66e2292a4b0bb3a46b60394a2ba71aeb168144cbfbe"
 }
 }

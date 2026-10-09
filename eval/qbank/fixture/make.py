@@ -29,6 +29,12 @@ w("codex/2026/01/01/rollout-guardian.jsonl", [X(0, "2026-01-01T00:00:00Z", "sess
 w("codex/2026/01/01/rollout-legacy.jsonl", [X(0, "2026-01-01T00:00:00Z", "session_meta", {"id": "1", "source": "cli"}),
     X(1, "2026-01-01T00:00:02Z", "response_item", msg("assistant", "legacy GREY"))])
 open(f"{C}/codex/2026/01/01/rollout-old.jsonl.zst", "wb").write(b"\x28\xb5\x2f\xfd not a real frame\n")
+# Two copies of one Pi session (same header id): identical before the cutoff, different after it. Before the
+# cutoff they are one session (one copy indexed); only the full files conflict.
+cp_head = [{"type": "session", "version": 3, "id": "s2", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"},
+    M("c1", None, "2026-01-01T00:00:01Z", "user", "copy says TEAL")]
+w("pi/q/s2.jsonl", cp_head + [M("c2", "c1", "2026-01-01T00:00:20Z", "assistant", "later in copy A")])
+w("pi/r/s2.jsonl", cp_head + [M("c2", "c1", "2026-01-01T00:00:20Z", "assistant", "later in copy B")])
 files = {}
 for dp, _, fs in os.walk(C):
     for fn in fs:
@@ -55,6 +61,8 @@ cases = {
     "split": [Q("x1", [E(S1, "a1", "RED")]), Q("x2", [E(S1, "a2", "RED")], split="tune")],
     "factgroup": [Q("f1", [E(S1, "a1", "RED")], cl="k1", fg=["g"]), Q("f2", [E(S1, "a2", "RED")], cl="k2", split="tune", fg=["g"])],
     "sameanswer": [Q("y1", [E(S1, "a2", "RED")], cl="k1"), Q("y2", [E(S1, "a2", "RED")], cl="k2", split="tune")],
+    "samesession": [Q("z1", [E(S1, "a2", "RED")], cl="k1"), Q("z2", [E(S1, "b2", "BLUE", "source-only")], cl="k2", split="tune")],
+    "futurecopy": [Q("fc", [E("q/s2.jsonl", "c1", "TEAL")])],
     "quote": [Q("qq", [E(S1, "a2", "PURPLE")])],
     "corrsame": [Q("cs", [E(S1, "a2", "RED", "old-claim"), E(S1, "a2", "RED", "correction")], typ="correction-next-exchange")],
     "corrother": [Q("co", [E(S1, "a1", "RED", "old-claim"), E(S1, "b2", "BLUE", "correction")], typ="correction-other-session")],
