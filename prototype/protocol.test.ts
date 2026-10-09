@@ -352,6 +352,35 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
     expect(Number(n)).toBe(0);                   // rows written before the hook were rolled back too
     expect(await P.scanProgress(db, "P", "M")).toBe(0);
   });
+  test("an inherited budget already partly spent before re-arming is not restarted in full", async () => {
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "1000" } } as any);
+    try {
+      const l = await P.acquireLease(pool, "P", "M", 10_000);
+      let armedMs = -1;
+      await P.syncCommit(pool, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }] }, {
+        afterLeaseCheck: async () => { await Bun.sleep(400); },   // spends inherited budget; outcome is asserted, not timed
+        afterMergeRead: async (tx) => {
+          const [{ ms }] = await tx`select extract(epoch from current_setting('transaction_timeout')::interval) * 1000 as ms`;
+          armedMs = Number(ms);
+        },
+      });
+      expect(armedMs).toBeGreaterThan(0);
+      expect(armedMs).toBeLessThanOrEqual(600);     // 1000 - >=400 elapsed: subtracted, not restarted at 1000
+    } finally { await pool.close(); }
+  });
+  test("a lease rejection keeps the inherited deadline (timer not left disabled)", async () => {
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "300" } } as any);
+    try {
+      const l = await P.acquireLease(pool, "P", "M", 150);
+      await waitUntilExpired(l);
+      let inside: string | null = null;
+      const r = await P.syncCommit(pool, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }] },
+        { afterRejectProbe: async (tx) => { [{ t: inside }] = await tx`select current_setting('transaction_timeout') t`; } });
+      expect(r).toEqual({ ok: false, reason: "lease" });
+      expect(inside).not.toBeNull();
+      expect(inside).not.toBe("0");                 // still bounded by the inherited 300ms remaining
+    } finally { await pool.close(); }
+  });
   test("an inherited stricter transaction_timeout is not relaxed by the lease lifetime", async () => {
     const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "300" } } as any);
     try {

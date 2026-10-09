@@ -189,13 +189,9 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
   await c`begin isolation level read committed`;
   let commitAttempted = false;
   try {
-    // A new value does not reschedule an already-active (inherited) timer: clear it, then re-arm with
-    // min(our deadline, inherited remaining) so a stricter inherited deadline is never relaxed.
-    const [{ inh }] = await c`select current_setting('transaction_timeout') as inh`;
-    await c`select set_config('transaction_timeout', '0', true)`;
-    await c`select set_config('transaction_timeout', least(${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}::bigint,
-              case when ${inh}::interval = interval '0' then null
-                   else greatest(1, floor(extract(epoch from (${inh}::interval - (clock_timestamp() - now()))) * 1000)::bigint) end)::text, true)`;
+    // A new value does not reschedule an already-active (inherited) timer: in ONE statement (no client round trip
+    // with the timer off) capture the inherited value, clear it, re-arm with min(our deadline, inherited remaining).
+    await rearmTimeout(c, Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS)), null);
     let now: Record<string, number>;
     if (opts.lockAndReadOneStatement) {                              // broken: snapshot taken before the lock wait
       now = await readVectorWithLock(c, keys);
@@ -225,6 +221,27 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
 const LOCK_DEADLINE_MS = 2000;                                       // prototype default; product value is [待标定]
 /** Best-effort rollback; on a terminated connection Bun throws synchronously, which must not mask the cause. */
 async function safeRollback(c: Db) { try { await c`rollback`; } catch {} }
+
+/**
+ * Re-arm transaction_timeout to min(ownMs, lease remaining, inherited remaining) in ONE statement: capture the
+ * inherited value, clear it (a new value does not reschedule an active timer), arm the minimum. No client round
+ * trip runs with the timer off. Inherited remaining = inherited - (clock_timestamp() - now()), now() being the
+ * transaction start; an exhausted inherited budget arms 1ms. With no own bound (ownMs and leaseId null), the
+ * inherited remaining alone is re-armed, so a rejection path keeps the inherited deadline.
+ */
+async function rearmTimeout(q: Tx, ownMs: number | null, leaseId: number | null) {
+  await q`with cap as materialized (select current_setting('transaction_timeout')::interval as inh),
+               clr as materialized (select set_config('transaction_timeout', '0', true) as z from cap)
+          select set_config('transaction_timeout', ms::text, true)
+          from (select least(${ownMs}::bigint,
+                             (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint
+                              from lease where id = ${leaseId}::bigint),
+                             case when cap.inh = interval '0' then null
+                                  else greatest(1, floor(extract(epoch from (cap.inh - (clock_timestamp() - now()))) * 1000)::bigint) end
+                            ) as ms                     -- least() skips NULLs; all NULL => no bound => timer stays off
+                from clr, cap) s
+          where ms is not null`;   // ms <= lease ttl or inherited (both < 2^31 ms); a lease remaining is > 0 here
+}
 
 /** Broken variant helper: take the lock and read versions in ONE statement (its snapshot predates the wait). */
 async function readVectorWithLock(q: Tx, keys: string[]): Promise<Record<string, number>> {
@@ -310,6 +327,7 @@ export type SyncOpts = {
   afterLeaseCheck?: () => Promise<void>;       // holding the lease row lock, before the barrier wait
   afterMergeRead?: (tx: Tx) => Promise<void>;  // merge inputs computed, shared state not yet written
   noLeaseDeadline?: boolean;                   // broken variant: no server-side bound after the lease check
+  afterRejectProbe?: (tx: Tx) => Promise<void>; // test seam: lease rejected, transaction still open
 };
 
 /**
@@ -337,19 +355,13 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     // before the next lease is granted, even if COMMIT itself (not covered by transaction_timeout, PG17
     // CommitTransaction disables it) finishes after expires_at.
     // LIVENESS: transaction_timeout bounds the pre-COMMIT rest of the transaction by the remaining lifetime, so an
-    // in-flight commit cannot hold the queue far past expiry. Re-setting a value does not reschedule an active
-    // (inherited) timer, so it is cleared first and re-armed with min(lease remaining, inherited remaining); an
-    // inherited stricter deadline (measured from transaction start, now()) is never relaxed.
-    const [{ inh }] = await tx`select current_setting('transaction_timeout') as inh`;
-    if (!opts.noLeaseDeadline) await tx`select set_config('transaction_timeout', '0', true)`;
-    const [v] = await tx`select left_ms, case when left_ms > 0 and ${!opts.noLeaseDeadline}
-                           then set_config('transaction_timeout', least(left_ms, inh_left, 2147483647)::text, true) end as armed
-                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms,
-                                      case when ${inh}::interval = interval '0' then null
-                                           else greatest(1, floor(extract(epoch from (${inh}::interval
-                                                - (clock_timestamp() - now()))) * 1000)::bigint) end as inh_left
-                               from lease where id = ${c.leaseId} and granted_at is not null) s`;
-    if (!v || Number(v.left_ms) <= 0) return { ok: false, reason: "lease" } as const;
+    // in-flight commit cannot hold the queue far past expiry. Computed and armed in ONE statement (rearmTimeout):
+    // min(lease remaining, inherited remaining); on rejection the inherited remaining is kept, never dropped.
+    const [v] = await tx`select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms
+                         from lease where id = ${c.leaseId} and granted_at is not null`;
+    const accepted = !!v && Number(v.left_ms) > 0;
+    if (!opts.noLeaseDeadline) await rearmTimeout(tx, null, accepted ? c.leaseId : null);
+    if (!accepted) { await opts.afterRejectProbe?.(tx); return { ok: false, reason: "lease" } as const; }
     const merged: { rec: string; next: { state: string; hash: string | null }; old: any }[] = [];
     for (const r of c.records) {
       await tx`insert into body values (${r.rec}, ${r.hash}) on conflict do nothing`;   // dedupe stores body once

@@ -40,12 +40,12 @@ file on exit, full log). Deleting or weakening one rule in `protocol.ts` turned 
 fresh read after the lock, each vector component (view / query / destination), remap bumping the occurrence's
 session, writer and publisher barrier locks, the locked-section deadline, merge serialization, lease expiry on the
 server clock, commit-id short-circuit, conflict bumping the version, generation-vector validity, FIFO grant, no
-grant over a valid lease, conflict in the exact check; later rounds (17/17 in the last run): generation-vector
+grant over a valid lease, conflict in the exact check; later rounds (17/17 in the last run, log /tmp/memex-review/mutate-final-102142.log): generation-vector
 check inside `publish`, `transaction_timeout` instead of `statement_timeout`, granting the queue head on any
 poll, re-checking lease expiry after the barrier wait, the commit-id lock, records restricted to the lease's
 source, reporting a lease only while unexpired and not done, `uncertain` after COMMIT, the `commitAttempted`
-flag, exclusive (not shared) merge lock, the lease-lifetime timer, resetting an inherited timer (publish and
-sync), never relaxing a stricter inherited timeout (publish and sync), the 64-bit remaining-lifetime cast, and the successor's grant having to touch the expired lease row.
+flag, exclusive (not shared) merge lock, the lease-lifetime timer, clearing the inherited timer, keeping a stricter
+inherited timeout, subtracting already-elapsed inherited time, re-arming on lease rejection, the 64-bit remaining-lifetime cast, and the successor's grant having to touch the expired lease row.
 
 ## Prototype choices (not performance conclusions)
 
@@ -56,14 +56,17 @@ sync), never relaxing a stricter inherited timeout (publish and sync), the 64-bi
   which releases the lock and discards the publication. It does **not** cover the COMMIT phase itself (PG17
   `CommitTransaction()` disables it before the durable commit), so a publication whose COMMIT started in time
   can finish after the deadline, with no proven upper bound (WAL/disk stalls); writers wait that long. `statement_timeout` is not enough: many short statements can hold the lock
-  indefinitely. `publish()` reserves its own pool connection, and re-arms the timeout
-  (setting a new value does not reschedule an already-active inherited timer) with min(own deadline, inherited
-  remaining), so a stricter inherited deadline is never relaxed.
+  indefinitely. `publish()` reserves its own pool connection. Setting a new value does not reschedule an
+  already-active inherited timer, so `rearmTimeout()` captures the inherited value, clears it and arms
+  min(own deadline, lease remaining, inherited remaining) in ONE statement (no client round trip with the timer
+  off); on a lease rejection it re-arms the inherited remaining alone, so a stricter inherited deadline is never
+  relaxed or dropped.
 - When the deadline fires during a statement, Bun receives SQLSTATE `25P04` → `timeout` (confirmed). When it fires
   while the session is idle in transaction (client pause), Bun reports only `ERR_POSTGRES_CONNECTION_CLOSED`,
   indistinguishable from any other disconnect. `publish()` therefore classifies a closed connection by position:
   before COMMIT was attempted = `aborted` (definitely not committed, cause unknown); after = `uncertain`
-  (could be "committed, ack lost"; the caller must not assume a rollback).
+  (could be "committed, ack lost"; the caller must not assume a rollback). This classifies the transactional
+  `publication` row only; a response already handed to a socket cannot be recalled by a later rollback.
 - Bun 1.4.2 quirk: on a closed reserved connection the `IN ${sql(list)}` helper raises an extra unhandled
   rejection that escapes try/catch; version reads use `= any(${sql.array(keys, "text")})` instead.
 - A lease queue advances on any caller's poll: the oldest pending request is granted even if its client is gone,
