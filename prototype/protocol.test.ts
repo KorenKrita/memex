@@ -39,6 +39,15 @@ async function waitForLockWaiter() {
   }
   throw new Error("no lock waiter appeared");
 }
+/** Resolves once the given backend no longer exists (terminated by the server). */
+async function waitForBackendGone(pid: number) {
+  for (let i = 0; i < 500; i++) {
+    const [r] = await db`select count(*)::int n from pg_stat_activity where pid = ${pid}`;
+    if (r.n === 0) return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`backend ${pid} still alive`);
+}
 /** Holds the global barrier exclusively on its own connection until release() is called. */
 async function holdBarrier() {
   const h = await conn();
@@ -150,13 +159,23 @@ describe("publish barrier (§5.5)", () => {
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
 
-  test("connection lost once COMMIT was sent is reported as uncertain, not as a definite abort", async () => {
+  test("COMMIT sent on a connection the server already terminated is reported as uncertain", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
-    // The pause pushes COMMIT past the deadline; the server is already gone, so this run did not commit, but the
-    // client cannot tell that apart from "committed, ack lost" and must not claim a rollback.
-    const r = await P.publish(db, "R1", { beforeCommit: () => Bun.sleep(500) }, { lockDeadlineMs: 300 });
-    expect(r).toBe("uncertain");
+    let pid = 0;
+    const r = await P.publish(db, "R1", {
+      inLock: async (tx) => { [{ pid }] = await tx`select pg_backend_pid() as pid`; },
+      beforeCommit: () => waitForBackendGone(pid),   // observed: the deadline killed the backend before COMMIT
+    }, { lockDeadlineMs: 300 });
+    expect(r).toBe("uncertain");                     // client cannot tell this apart from "committed, ack lost"
     expect(await P.publicationCount(db, "R1")).toBe(0);
+  });
+
+  test("COMMIT that succeeded but whose acknowledgement was lost is uncertain, and the publication exists", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    const lost = Object.assign(new Error("Connection closed"), { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+    const r = await P.publish(db, "R1", { afterCommit: async () => { throw lost; } });
+    expect(r).toBe("uncertain");
+    expect(await P.publicationCount(db, "R1")).toBe(1);
   });
 
   test("a pure client pause holding the lock: the server releases it and the writer finishes before the publisher resumes", async () => {
@@ -219,15 +238,16 @@ describe("multi-collector projections (§4.1)", () => {
     await commit("M", "B", "c1"); await commit("M", "B'", "c2"); await commit("M", "B", "c3");
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "ok", hash: "B" });
   });
-  test("two collectors committing different content concurrently end in conflict (both wait on the barrier)", async () => {
+  test("a commit merging under the barrier blocks the other collector's commit until it finishes; result is conflict", async () => {
     const lm = await P.acquireLease(db, "P", "M", 10_000), ln = await P.acquireLease(db, "P", "N", 10_000);
-    const h = await holdBarrier();
-    const both = Promise.all([
-      P.syncCommit(db, { leaseId: lm, commitId: "m", records: [{ rec: "P:r1", hash: "B" }] }),
-      P.syncCommit(db, { leaseId: ln, commitId: "n", records: [{ rec: "P:r1", hash: "B'" }] }),
-    ]);
-    await waitForAdvisoryWaiter(2);     // both passed their lease checks and are queued on the barrier
-    await h.release(); await both;
+    let release!: () => void; const gate = new Promise<void>(r => (release = r));
+    let paused!: () => void; const isPaused = new Promise<void>(r => (paused = r));
+    const m = P.syncCommit(db, { leaseId: lm, commitId: "m", records: [{ rec: "P:r1", hash: "B" }] },
+      { afterMergeRead: async () => { paused(); await gate; } });   // M holds the barrier, merge inputs read
+    await isPaused;
+    const n = P.syncCommit(db, { leaseId: ln, commitId: "n", records: [{ rec: "P:r1", hash: "B'" }] });
+    await waitForAdvisoryWaiter();      // N is blocked on the barrier M holds (a shared lock would not block)
+    release(); await Promise.all([m, n]);
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "conflict" });
   });
   test("broken variant caught: merging without the global barrier lets both commits miss each other", async () => {
@@ -285,6 +305,21 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
     expect(await commit).toEqual({ ok: false, reason: "lease" });
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
     expect(await P.scanProgress(db, "P", "M")).toBe(0);
+  });
+  test("a lease that expires after the check, during the merge, commits nothing", async () => {
+    const l = await P.acquireLease(db, "P", "M", 500);
+    const commit = P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
+      { afterMergeRead: () => waitUntilExpired(l) });
+    await expect(commit).rejects.toThrow();     // server terminated the transaction at lease expiry
+    expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
+    expect(await P.scanProgress(db, "P", "M")).toBe(0);
+  });
+  test("broken variant caught: without the lease-lifetime bound an expired lease's commit succeeds", async () => {
+    const l = await P.acquireLease(db, "P", "M", 500);
+    const r = await P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
+      { afterMergeRead: () => waitUntilExpired(l), noLeaseDeadline: true });
+    expect(r).toEqual({ ok: true });
+    expect(await P.scanProgress(db, "P", "M")).toBe(1);
   });
   test("two overlapping retries of one commit id both get the original success", async () => {
     const l = await P.acquireLease(db, "P", "M", 10_000);

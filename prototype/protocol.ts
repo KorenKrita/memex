@@ -152,6 +152,7 @@ export type PublishHooks = {
   beforeLock?: () => Promise<void>;             // about to open step 2
   inLock?: (tx: Tx) => Promise<void>;           // holding the shared lock, before compare
   beforeCommit?: () => Promise<void>;           // publication inserted, COMMIT about to be sent
+  afterCommit?: () => Promise<void>;            // test seam: COMMIT completed; throwing here simulates a lost ack
 };
 export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean; sampleLate?: boolean; lockAndReadOneStatement?: boolean; lockDeadlineMs?: number };
 
@@ -203,6 +204,7 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
     await hooks.beforeCommit?.();
     commitSent = true;
     await c`commit`;
+    await hooks.afterCommit?.();
     return "published";
   } catch (e: any) {
     await safeRollback(c);
@@ -299,6 +301,7 @@ export type SyncOpts = {
   noMergeLock?: boolean;                       // broken variant: merge without the global barrier
   afterLeaseCheck?: () => Promise<void>;       // holding the lease row lock, before the barrier wait
   afterMergeRead?: () => Promise<void>;        // merge inputs computed, shared state not yet written
+  noLeaseDeadline?: boolean;                   // broken variant: no server-side bound after the lease check
 };
 
 /**
@@ -320,9 +323,15 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     if (!c.records.every(r => sessOf(r.rec) === l.source)) return { ok: false, reason: "source" } as const;
     await opts.afterLeaseCheck?.();
     if (!opts.noMergeLock) await tx`select pg_advisory_xact_lock(${BARRIER})`;
-    const [v] = await tx`select granted_at is not null and expires_at > clock_timestamp() as valid
-                         from lease where id = ${c.leaseId}`;
-    if (!v.valid) return { ok: false, reason: "lease" } as const;
+    // Lease validity on the server clock, after every lock wait; the rest of the transaction is then bounded by
+    // the lease's remaining lifetime (floor: dies no later than expiry). Expiry mid-transaction terminates the
+    // backend and rolls everything back; the caller sees a closed connection and retries with the same commit id.
+    // One statement computes the remaining lifetime and arms the timer (PG17 starts it at the SET), no gap between.
+    const [v] = await tx`select left_ms, case when left_ms > 0 and ${!opts.noLeaseDeadline}
+                           then set_config('transaction_timeout', left_ms::text, true) end as armed
+                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::int as left_ms
+                               from lease where id = ${c.leaseId} and granted_at is not null) s`;
+    if (!v || v.left_ms <= 0) return { ok: false, reason: "lease" } as const;
     const merged: { rec: string; next: { state: string; hash: string | null }; old: any }[] = [];
     for (const r of c.records) {
       await tx`insert into body values (${r.rec}, ${r.hash}) on conflict do nothing`;   // dedupe stores body once
