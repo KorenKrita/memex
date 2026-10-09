@@ -6,6 +6,7 @@ import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, httpHooks, serve, transport } from "./http.ts";
 import { search, zoom, grep, GUARANTEED } from "./search.ts";
+import { forgetSource } from "./forget.ts";
 import { drain } from "./worker.ts";
 import { sourceIdOf } from "../client/records.ts";
 
@@ -411,4 +412,93 @@ test("zoom over HTTP: a forget committed before delivery is not answered from th
   expect(fired).toBe(1); // the first delivery found its vector stale; recomputing finds nothing readable
   expect(res.status).toBe(404);
   expect(await res.text()).not.toContain("zoom-forget-me");
+});
+
+// ---------- forget (§7) ----------
+
+const hasText = async (t: string) => {
+  const g = (await grep(db, T0({ pattern: t }))).body as any;
+  const s = (await search(db, Q(t, { dests: [] }))).body as any;
+  return g.hits.length > 0 || JSON.stringify(s.results).includes(t);
+};
+
+test("forget: nothing of the session is searchable, stored, or accepted again", async () => {
+  const s = await put("fg", linear("fg", [["forget-me-token alpha", "reply"]]));
+  await put("keep", linear("keep", [["keep-me-token alpha", "reply"]]));
+  await drain(db);
+  await search(db, Q("forget-me-token", { source: s })); // a trace bound to the forgotten session
+  expect(await hasText("forget-me-token")).toBe(true);
+  const r = await http()("POST", "/v1/forget", { source: s });
+  expect(r.records).toBe(3);
+  expect(await hasText("forget-me-token")).toBe(false);
+  expect(await hasText("keep-me-token")).toBe(true);
+  for (const t of ["body", "record", "projection", "lexical", "view", "projected", "span", "search_trace"])
+    expect((await db.unsafe(`select count(*)::int n from ${t} where source = $1`, [s]))[0].n).toBe(0);
+  expect((await db`select count(*)::int n from span_summary ss where not exists (select 1 from span where id = ss.span)`)[0].n).toBe(0);
+  // Sync refuses it again; the worker derives nothing more.
+  await expect(requestLease(db, { source: s, harness: "pi", nativeId: "fg", scope: "personal" }, "m1")).rejects.toThrow("forgotten");
+  requests = [];
+  await db`insert into job (kind, key) values ('project', ${s})`; // a stray queued projection
+  await drain(db);
+  expect(requests.length).toBe(0);
+  expect((await db`select count(*)::int n from projected where source = ${s}`)[0].n).toBe(0);
+});
+
+test("forget a fork parent: the child keeps its own records, the copied prefix is gone and stays gone", async () => {
+  const P = sourceIdOf("pi", "fp");
+  const pl = [header("fp"), msg("user", "u0", null, "parent-only-secret"), msg("assistant", "a0", "u0", "parent reply")];
+  await put("fp", pl);
+  await drain(db);
+  const kid = [header("fk", { parentSession: "/x/fp.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "child-own-fact"), msg("assistant", "k2", "k1", "child reply")];
+  const K = await put("fk", kid, "personal", P);
+  await drain(db);
+  expect(await hasText("parent-only-secret")).toBe(true);
+  expect(await hasText("child-own-fact")).toBe(true);
+  const r = await forgetSource(db, P);
+  expect(r.copies).toBe(2);
+  const mark = requests.length;
+  await drain(db);
+  expect(await hasText("parent-only-secret")).toBe(false);
+  expect(await hasText("child-own-fact")).toBe(true);
+  // The child's collector syncs the same file again: the copies are refused, not revived as the child's own.
+  const l = await requestLease(db, { source: K, harness: "pi", nativeId: "fk", scope: "personal", parent: P }, "m1");
+  await tryGrant(db, l);
+  const c = await commit(db, { leaseId: l, commitId: "again", length: kid.length, changes: kid.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(c).toMatchObject({ ok: true, refused: 2 });
+  await drain(db);
+  expect(await hasText("parent-only-secret")).toBe(false);
+  expect(await hasText("child-own-fact")).toBe(true);
+  // Summaries sent after the forget never carry the parent's text.
+  const after = requests.slice(mark).filter((x) => x.path.endsWith("/chat/completions"));
+  expect(after.length).toBeGreaterThan(0); // the child's spans were summarized again
+  expect(after.every((x) => !JSON.stringify(x.body).includes("parent-only-secret"))).toBe(true);
+});
+
+test("forget racing a search delivery: the response computed before it is recomputed", async () => {
+  const s = await put("fr", linear("fr", [["race-token alpha", "r"]]));
+  await drain(db);
+  let fired = 0;
+  httpHooks.beforeGuard = async () => {
+    if (fired++) return;
+    await forgetSource(db, s);
+  };
+  const r = await http()("POST", "/v1/search", Q("race-token", { dests: [] }));
+  expect(fired).toBe(2);
+  expect(JSON.stringify(r)).not.toContain("race-token");
+});
+
+test("forget tombs every native record: a fork imported later cannot revive them through its prefix", async () => {
+  const P = sourceIdOf("pi", "lp");
+  const pl = [header("lp"), msg("user", "u0", null, "late-parent-secret"), msg("assistant", "a0", "u0", "r")];
+  await put("lp", pl);
+  await drain(db);
+  await forgetSource(db, P);
+  // A child that forked before the forget is imported only now. Its copies resolve to canon:P:u0/a0.
+  const tombs = (await db`select key from tomb where key like ${"canon:" + P + ":%"}`).map((r: any) => r.key).sort();
+  expect(tombs).toEqual(["canon:" + P + ":a0", "canon:" + P + ":u0", "canon:" + P + ":header"].sort());
+  const kid = [header("lk", { parentSession: "/x/lp.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "late-child-own")];
+  await put("lk", kid, "personal", P);
+  await drain(db);
+  expect(await hasText("late-parent-secret")).toBe(false);
+  expect(await hasText("late-child-own")).toBe(true);
 });

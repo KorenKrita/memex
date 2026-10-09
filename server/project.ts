@@ -110,13 +110,15 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    if (!src.parent_id) delete lines[0].parentSession; // unknown or other-scope parent: a root session
+    const gone = src.parent_id && (await q`select 1 from tomb where key = ${"source:" + src.parent_id}`).length;
+    // Unknown, other-scope or forgotten parent: a root session. A forgotten parent's copies were removed from
+    // this L0 by forget, so only the records new here remain (their first parentId dangles: an orphan root).
+    if (!src.parent_id || gone) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
-      const [p] = await q`select s.scope, pr.status, pr.keys, (select count(*) from tomb where key = ${"source:" + src.parent_id})::int forgotten
-                          from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
+      const [p] = await q`select s.scope, pr.status, pr.keys from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
       if (!p || !p.status) parent = undefined; // not projected yet: quarantined until it is
-      else if (p.scope !== src.scope || p.forgotten || p.status !== "ok" || !p.keys) parent = "invalid";
+      else if (p.scope !== src.scope || p.status !== "ok" || !p.keys) parent = "invalid";
       else {
         const vs = await q`select keys, spans from view where source = ${src.parent_id} order by ord`;
         parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf);
@@ -170,6 +172,7 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     const fin = await finishJob(tx, job);
     if (fin !== "done") return fin;
     if (!(await tx`select 1 from source where id = ${source}`).length) return fin;
+    if ((await tx`select 1 from tomb where key = ${"source:" + source}`).length) return fin; // forgotten: nothing is derived again
     const a = await analyse(tx, source);
     let withdrawn = false;
     const [before] = await tx`select status, keys, deps from projected where source = ${source}`;

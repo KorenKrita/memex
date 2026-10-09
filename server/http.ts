@@ -61,6 +61,8 @@ route("POST", /^\/v1\/sync\/lease\/(\d+)\/commit$/, async (db, b, p) =>
 route("POST", /^\/v1\/search$/, async (db, b) => (await import("./search.ts")).search(db, b));
 route("POST", /^\/v1\/zoom$/, async (db, b) => (await import("./search.ts")).zoom(db, b));
 route("POST", /^\/v1\/grep$/, async (db, b) => (await import("./search.ts")).grep(db, b));
+route("POST", /^\/v1\/forget$/, async (db, b) =>
+  (await import("./forget.ts")).forgetSource(db, str(b.source, "source", 64)));
 
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 export async function addApiKey(db: Db, name: string): Promise<string> {
