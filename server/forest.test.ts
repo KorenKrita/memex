@@ -628,13 +628,13 @@ test("a large forest (128 leaves) is written in one bounded step; a held exclusi
   const { runOne } = await import("./worker.ts");
   try {
     await runOne(db, ["forest"]);
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect((await nodes()).length).toBe(0);
   } finally {
     delete process.env.MEMEX_FOREST_HOLD_MS;
+    release();
+    await blocker;
   }
-  expect(performance.now() - t0).toBeLessThan(3000);
-  expect((await nodes()).length).toBe(0);
-  release();
-  await blocker;
   await db`update job set not_before = now() where kind = 'forest'`;
   await coldThenStructure();
   expect((await nodes()).length).toBe(127);
@@ -727,4 +727,54 @@ test("an ancestor of the closing view withdraws after the check, before the view
   }
   // The first attempt is refused at the send; the retry checks again, finds C's projection stale, stops.
   expect(requests.length).toBe(n);
+});
+
+test("a child published concurrently with the planner inserting its parent (commit after the insert): the parent is still merged", async () => {
+  // 8 leaves: root R over [A B]; A written; B unwritten and its last child unwritten.
+  const s = await put("lx", linear("lx", 8));
+  await coldThenStructure();
+  const [R] = await db`select id, kids from forest_node where size = 8`;
+  const [A, B] = (R.kids as any[]).map((k) => k.node as string);
+  const [, B2] = ((await db`select kids from forest_node where id = ${B}`)[0].kids as any[]).map((k) => k.node as string);
+  for (const id of [...(await db`select id from forest_node where size = 2`).map((r: any) => r.id).filter((x: string) => x !== B2)]) await runMerge(db, (await claimJobFor("merge", id))!);
+  await runMerge(db, (await claimJobFor("merge", A))!);
+  await db`delete from forest_node where id = ${R.id}`; // R is inserted by the racing planner
+  await db`delete from job where kind in ('merge', 'forest')`;
+  await db`insert into forest_access values (${s})`;
+  const { snapshotHook, runForest } = await import("./forest.ts");
+  // The planner's snapshot sees B2 and B unwritten (so B is not queued by it, R is new). Then B2 and B are
+  // merged; B's publish looks for parents (R not inserted yet) and pauses before its commit.
+  let resume!: () => void;
+  const paused = new Promise<void>((r) => (resume = r));
+  let atPause!: () => void;
+  const reachedPause = new Promise<void>((r) => (atPause = r));
+  snapshotHook.beforeMergeCommit = async (node) => {
+    if (node !== B) return;
+    snapshotHook.beforeMergeCommit = async () => {};
+    atPause();
+    await paused;
+  };
+  let mergeB: Promise<unknown> | undefined;
+  try {
+    // The planner's snapshot happens while B is still unwritten (B's merge has not started).
+    snapshotHook.afterSnapshot = async () => {
+      snapshotHook.afterSnapshot = async () => {};
+      await runMerge(db, (await claimJobFor("merge", B2))!);
+      mergeB = runMerge(db, (await claimJobFor("merge", B))!);
+      await reachedPause; // B has looked for parents (none: R not inserted yet), not committed
+      setTimeout(resume, 300); // B commits later on its own (the planner may wait for B's job row meanwhile)
+    };
+    await db`insert into job (kind, key) values ('forest', ${s})`;
+    await runForest(db, (await claimJobFor("forest", s))!);
+    // 3. R's merge, if queued, runs now and cannot see B yet.
+    const { runOne } = await import("./worker.ts");
+    while (await runOne(db, ["merge"]));
+  } finally {
+    snapshotHook.afterSnapshot = async () => {};
+    resume();
+    await mergeB;
+    snapshotHook.beforeMergeCommit = async () => {};
+  }
+  await drain(db);
+  expect((await db`select text is not null w from forest_node where id = ${R.id}`)[0].w).toBe(true);
 });

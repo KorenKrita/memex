@@ -24,7 +24,7 @@ export const FOREST_VERSION = "forest-merge-v1";
 /** Test seam: runs in runForest's transaction right after it takes the barrier. */
 export const forestHooks = { underBarrier: async (_tx: Tx) => {} };
 /** Test seam: runs in runForest between its snapshot and its write. */
-export const snapshotHook = { afterSnapshot: async () => {} };
+export const snapshotHook = { afterSnapshot: async () => {}, beforeMergeCommit: async (_node: string) => {} };
 export const MIN_LEAVES = 4; // DESIGN §4.4 [待标定 4]
 const NODE_MAX = 1200; // UTF-8 bytes [待标定]
 const MAX_TRIES = 3;
@@ -111,10 +111,11 @@ export async function runForest(db: Db, job: Job) {
       const r = stored.get(n.id);
       if (r?.written) {
         if (!(await unchanged(q, r.deps))) merge.push(n.id);
-      } else if (h?.hot && (!r || n.kids.every((k) => !("node" in k) || stored.get(k.node)?.written))) merge.push(n.id);
-      // (A node this run inserts is queued even if a child looked unwritten: that child may be published
-      // between this snapshot and the insert, when its wake-up cannot find the parent yet. Not ready yet,
-      // the merge ends without a call and the child's publication queues it again.)
+      } else if (h?.hot) merge.push(n.id);
+      // (Every unwritten node of a hot session is queued, whether its children looked written or not: a
+      // child published concurrently can miss a parent this run inserts (its wake-up looked before the
+      // insert). A merge whose children are not ready ends without a call; the child's publication, or this
+      // job's next run, queues it again.)
     }
     return { fresh, merge, spans: [...new Set(nodes.flatMap((n) => n.spans))] };
   });
@@ -242,6 +243,7 @@ export async function runMerge(db: Db, job: Job) {
                                    deps = ${c.deps}, at = now() where id = ${job.key} and text is null returning id`;
       // Written once; the parents that were waiting for it can merge now.
       if (done.length) for (const p of await tx`select id from forest_node where kid_ids @> array[${job.key}]::text[] and text is null`) await enqueue(tx, "merge", p.id);
+      await snapshotHook.beforeMergeCommit(job.key);
     });
   }
   throw new Error(problem ? `merge invalid after ${MAX_TRIES} tries` : "inputs kept changing");
