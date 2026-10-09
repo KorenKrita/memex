@@ -21,14 +21,20 @@ beforeEach(async () => {
 });
 afterAll(async () => { for (const c of conns.splice(0)) c.release(); await db.close(); });
 
-/** Resolves once some other backend is waiting on an advisory lock (the writer is really blocked). */
-async function waitForAdvisoryWaiter() {
+/** Resolves once at least `n` backends are waiting on an advisory lock (really blocked, observed in pg_locks). */
+async function waitForAdvisoryWaiter(n = 1) {
   for (let i = 0; i < 500; i++) {
     const [r] = await db`select count(*)::int n from pg_locks where locktype = 'advisory' and not granted`;
-    if (r.n > 0) return;
+    if (r.n >= n) return;
     await Bun.sleep(10);
   }
-  throw new Error("no advisory lock waiter appeared");
+  throw new Error(`fewer than ${n} advisory lock waiters appeared`);
+}
+/** Holds the global barrier exclusively on its own connection until release() is called. */
+async function holdBarrier() {
+  const h = await conn();
+  await h`begin`; await h`select pg_advisory_xact_lock(1)`;
+  return { release: async () => { await h`commit`; } };
 }
 /** Resolves once the server clock has passed the lease's expiry. */
 async function waitUntilExpired(leaseId: number) {
@@ -67,8 +73,7 @@ describe("publish barrier (§5.5)", () => {
       for (const at of ["duringCheck", "afterCheck", "beforeLock"] as const)
         test(`${art.id}: ${name} committed ${at} -> not published`, async () => {
           await seedFork(); await P.createArtifact(db, art);
-          const c = await conn();
-          const r = await P.publish(c, art.id, { [at]: write });
+          const r = await P.publish(db, art.id, { [at]: write });
           expect(r).toBe("rejected");
           expect(await P.publicationCount(db, art.id)).toBe(0);
         });
@@ -76,15 +81,13 @@ describe("publish barrier (§5.5)", () => {
   test("unrelated session change does not block publishing", async () => {
     await seedFork(); await P.seed(db, { occurrences: [{ occ: "Z:r1", view: "Z", canon: "Z:r1" }], dests: [] });
     await P.createArtifact(db, forkRoot);
-    const c = await conn();
-    expect(await P.publish(c, "R1", { afterCheck: () => P.forgetRecord(db, "Z:r1") })).toBe("published");
+    expect(await P.publish(db, "R1", { afterCheck: () => P.forgetRecord(db, "Z:r1") })).toBe("published");
   });
 
   test("publisher holding the shared lock makes the writer wait; writer then invalidates the published copy", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
-    const c = await conn();
     let writer: Promise<void> | undefined;
-    const r = await P.publish(c, "R1", {
+    const r = await P.publish(db, "R1", {
       inLock: async () => { writer = P.forgetRecord(db, "P:r1"); await waitForAdvisoryWaiter(); },
     });
     expect(r).toBe("published");
@@ -94,28 +97,24 @@ describe("publish barrier (§5.5)", () => {
 
   test("broken variant caught: sampling versions after the check (separate snapshot) publishes stale content", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
-    const c = await conn();
-    expect(await P.publish(c, "R1", { duringCheck: () => P.revokeDest(db, "E") }, { sampleLate: true })).toBe("published");
+    expect(await P.publish(db, "R1", { duringCheck: () => P.revokeDest(db, "E") }, { sampleLate: true })).toBe("published");
   });
 
   test("broken variant caught: step 2 reusing the step-1 REPEATABLE READ snapshot publishes stale content", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
-    const c = await conn();
-    const r = await P.publish(c, "R1", { afterCheck: () => P.revokeDest(db, "E") }, { reuseSnapshot: true });
+    const r = await P.publish(db, "R1", { afterCheck: () => P.revokeDest(db, "E") }, { reuseSnapshot: true });
     expect(r).toBe("published");          // the bug the correct protocol prevents
   });
 
   test("broken variant caught: vector without view sessions misses forget(view F) for inherited-only content", async () => {
     await seedFork(); await P.createArtifact(db, inheritedOnly);
-    const c = await conn();
-    expect(await P.publish(c, "R2", { afterCheck: () => P.hideView(db, "F") }, { omitViewSessions: true })).toBe("published");
+    expect(await P.publish(db, "R2", { afterCheck: () => P.hideView(db, "F") }, { omitViewSessions: true })).toBe("published");
   });
 
-  test("locked section over its deadline is cancelled server-side: no publication, waiting writer proceeds", async () => {
+  test("locked section over its deadline (one long statement) is terminated: no publication, waiting writer proceeds", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
-    const c = await conn();
     let writer: Promise<void> | undefined;
-    const r = await P.publish(c, "R1", {
+    const r = await P.publish(db, "R1", {
       inLock: async (tx) => {
         writer = P.forgetRecord(db, "P:r1");
         await waitForAdvisoryWaiter();
@@ -125,6 +124,44 @@ describe("publish barrier (§5.5)", () => {
     expect(r).toBe("timeout");
     await writer;                       // would hang for 5s if the lock were still held
     expect(await P.publicationCount(db, "R1")).toBe(0);
+  });
+
+  test("deadline covers the whole locked transaction: many short statements and a client pause still time out", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    let writer: Promise<void> | undefined;
+    const r = await P.publish(db, "R1", {
+      inLock: async (tx) => {
+        writer = P.forgetRecord(db, "P:r1");
+        await waitForAdvisoryWaiter();
+        for (let i = 0; i < 4; i++) await tx`select pg_sleep(0.1)`;   // each well under the deadline
+        await Bun.sleep(400);                                         // client-side pause holding the lock
+      },
+    }, { lockDeadlineMs: 300 });
+    expect(r).toBe("timeout");
+    await writer;
+    expect(await P.publicationCount(db, "R1")).toBe(0);
+  });
+
+  test("writer commits while the publisher is waiting for the lock: the fresh read after the lock rejects", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    let release!: () => void; const hold = new Promise<void>(r => (release = r));
+    let held!: () => void; const isHeld = new Promise<void>(r => (held = r));
+    const writer = P.forgetRecord(db, "P:r1", { beforeCommit: async () => { held(); await hold; } });
+    const pub = P.publish(db, "R1", { beforeLock: async () => { await isHeld; } });
+    await waitForAdvisoryWaiter();      // publisher's step 2 is blocked on the barrier the writer holds
+    release(); await writer;
+    expect(await pub).toBe("rejected");
+  });
+
+  test("broken variant caught: lock and version read in ONE statement reads a pre-wait snapshot", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    let release!: () => void; const hold = new Promise<void>(r => (release = r));
+    let held!: () => void; const isHeld = new Promise<void>(r => (held = r));
+    const writer = P.forgetRecord(db, "P:r1", { beforeCommit: async () => { held(); await hold; } });
+    const pub = P.publish(db, "R1", { beforeLock: async () => { await isHeld; } }, { lockAndReadOneStatement: true });
+    await waitForAdvisoryWaiter();
+    release(); await writer;
+    expect(await pub).toBe("published");
   });
 });
 
@@ -149,23 +186,31 @@ describe("multi-collector projections (§4.1)", () => {
     await commit("M", "B", "c1"); await commit("M", "B'", "c2"); await commit("M", "B", "c3");
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "ok", hash: "B" });
   });
-  test("two collectors committing different content concurrently end in conflict", async () => {
+  test("two collectors committing different content concurrently end in conflict (both wait on the barrier)", async () => {
     const lm = await P.acquireLease(db, "P", "M", 10_000), ln = await P.acquireLease(db, "P", "N", 10_000);
-    await Promise.all([
+    const h = await holdBarrier();
+    const both = Promise.all([
       P.syncCommit(db, { leaseId: lm, commitId: "m", records: [{ rec: "P:r1", hash: "B" }] }),
       P.syncCommit(db, { leaseId: ln, commitId: "n", records: [{ rec: "P:r1", hash: "B'" }] }),
     ]);
+    await waitForAdvisoryWaiter(2);     // both passed their lease checks and are queued on the barrier
+    await h.release(); await both;
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "conflict" });
   });
-  test("broken variant caught: merging without the global write barrier lets both commits miss each other", async () => {
+  test("broken variant caught: merging without the global barrier lets both commits miss each other", async () => {
     const lm = await P.acquireLease(db, "P", "M", 10_000), ln = await P.acquireLease(db, "P", "N", 10_000);
     let arrived = 0, release!: () => void; const gate = new Promise<void>(r => (release = r));
-    const barrier = async () => { if (++arrived === 2) release(); await gate; };
+    const barrier = async () => { if (++arrived === 2) release(); await gate; };   // both computed merge inputs
     await Promise.all([
-      P.syncCommit(db, { leaseId: lm, commitId: "m", records: [{ rec: "P:r1", hash: "B" }] }, { noMergeLock: true, beforeMerge: barrier }),
-      P.syncCommit(db, { leaseId: ln, commitId: "n", records: [{ rec: "P:r1", hash: "B'" }] }, { noMergeLock: true, beforeMerge: barrier }),
+      P.syncCommit(db, { leaseId: lm, commitId: "m", records: [{ rec: "P:r1", hash: "B" }] }, { noMergeLock: true, afterMergeRead: barrier }),
+      P.syncCommit(db, { leaseId: ln, commitId: "n", records: [{ rec: "P:r1", hash: "B'" }] }, { noMergeLock: true, afterMergeRead: barrier }),
     ]);
     expect((await P.sharedState(db, "P:r1")).state).toBe("ok");   // conflict lost: the bug
+  });
+  test("a lease cannot write records of another source", async () => {
+    const l = await P.acquireLease(db, "Z", "M", 10_000);
+    expect(await P.syncCommit(db, { leaseId: l, commitId: "x", records: [{ rec: "P:r1", hash: "old" }] })).toEqual({ ok: false, reason: "source" });
+    expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
   });
 });
 
@@ -181,6 +226,42 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
     await P.syncCommit(db, { leaseId: a, commitId: "a", records: [{ rec: "P:r1", hash: "X" }] });
     expect(await P.tryGrant(db, c)).toBe(false);   // b is ahead
     expect(await P.tryGrant(db, b)).toBe(true);
+  });
+  test("a head request whose client vanished is granted, expires and is reaped; the next request gets the lease", async () => {
+    const dead = await P.requestLease(db, "P", "M", 150);           // never polls again
+    const b = await P.requestLease(db, "P", "M", 10_000);
+    expect(await P.tryGrant(db, b)).toBe(false);                    // grants the dead head instead
+    await waitUntilExpired(dead);
+    expect(await P.tryGrant(db, b)).toBe(true);
+  });
+  test("a done or expired lease is never reported as held", async () => {
+    const a = await P.acquireLease(db, "P", "M", 10_000);
+    await P.syncCommit(db, { leaseId: a, commitId: "a", records: [{ rec: "P:r1", hash: "X" }] });
+    expect(await P.tryGrant(db, a)).toBe(false);
+    const e = await P.acquireLease(db, "P", "N", 150);
+    await waitUntilExpired(e);
+    expect(await P.tryGrant(db, e)).toBe(false);
+  });
+  test("a lease that expires while its commit waits on the barrier is rejected", async () => {
+    const l = await P.acquireLease(db, "P", "M", 300);
+    const h = await holdBarrier();
+    const commit = P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 });
+    await waitForAdvisoryWaiter();
+    await waitUntilExpired(l);
+    await h.release();
+    expect(await commit).toEqual({ ok: false, reason: "lease" });
+    expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
+    expect(await P.scanProgress(db, "P", "M")).toBe(0);
+  });
+  test("two overlapping retries of one commit id both get the original success", async () => {
+    const l = await P.acquireLease(db, "P", "M", 10_000);
+    const h = await holdBarrier();
+    const req = { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 };
+    const both = Promise.all([P.syncCommit(db, req), P.syncCommit(db, req)]);
+    await waitForAdvisoryWaiter(2);     // one on the barrier, one on the commit-id lock
+    await h.release();
+    expect(await both).toEqual([{ ok: true }, { ok: true }]);
+    expect(await P.scanProgress(db, "P", "M")).toBe(1);
   });
   test("a stale read arriving after its lease expired and a newer commit landed is rejected", async () => {
     const old = await P.acquireLease(db, "P", "M", 200);       // reads B, then is slow
@@ -230,10 +311,10 @@ describe("conflict lifecycle and derived artifacts (§4.1, §6.2)", () => {
     expect(await P.isArtifactValid(db, "K")).toBe(true);
     await commit("N", "B'", "n1");                                   // enters conflict
     expect(await P.isArtifactValid(db, "K")).toBe(false);
-    const c = await conn();
-    expect(await P.publish(c, "K")).toBe("rejected");
+    expect(await P.publish(db, "K")).toBe("rejected");
     await commit("N", "B", "n2");                                    // conflict resolved
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "ok", hash: "B" });
+    expect(await P.publish(db, "K")).toBe("rejected");                // permanently dead K cannot be re-published
     expect(await P.isArtifactValid(db, "K")).toBe(false);            // same K stays dead
     await P.createArtifact(db, { id: "K2", occs: ["P:r1"], query: "Q", dest: "E" });
     expect(await P.isArtifactValid(db, "K2")).toBe(true);

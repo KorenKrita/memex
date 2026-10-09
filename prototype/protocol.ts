@@ -95,14 +95,18 @@ export async function createArtifact(db: Db, a: ArtSpec) {
   });
 }
 
-/** Valid = every key of its generation vector unchanged AND exact check passes (an advanced key kills it forever). */
+/** Generation-vector validity: every key the artifact was generated under is still at that version. */
+async function genVecOk(q: Tx, id: string): Promise<boolean> {
+  const [a] = await q`select gen_vec from artifact where id = ${id}`;
+  if (!a) return false;
+  const gen: Record<string, number> = a.gen_vec;
+  const now = await readVector(q, Object.keys(gen));
+  return Object.entries(gen).every(([k, v]) => now[k] === v);
+}
+
+/** Valid = generation vector unchanged AND exact check passes (an advanced key kills it forever). */
 export async function isArtifactValid(db: Db, id: string): Promise<boolean> {
-  return db.begin("isolation level repeatable read", async (tx: Tx) => {
-    const [a] = await tx`select gen_vec from artifact where id = ${id}`;
-    const gen: Record<string, number> = a.gen_vec;
-    const now = await readVector(tx, Object.keys(gen));
-    return Object.entries(gen).every(([k, v]) => now[k] === v) && (await exactOk(tx, id));
-  });
+  return db.begin("isolation level repeatable read", async (tx: Tx) => (await genVecOk(tx, id)) && (await exactOk(tx, id)));
 }
 
 export async function publicationCount(db: Db, id: string) {
@@ -113,29 +117,32 @@ export async function publicationCount(db: Db, id: string) {
 // ------------------------------------------------------------------------------------------------ writers
 // Each invalidating change: exclusive barrier lock + state change + advance >=1 key an old vector observes.
 
-async function invalidating(db: Db, fn: (tx: Tx) => Promise<void>) {
+/** Optional pause inside a writer's transaction: holding the exclusive lock, change made, not yet committed. */
+export type WriterHooks = { beforeCommit?: () => Promise<void> };
+async function invalidating(db: Db, fn: (tx: Tx) => Promise<void>, h: WriterHooks = {}) {
   await db.begin(async (tx: Tx) => {
     await tx`select pg_advisory_xact_lock(${BARRIER})`;
     await fn(tx);
+    await h.beforeCommit?.();
   });
 }
 const bump = (tx: Tx, key: string) =>
   tx`insert into vis_version values (${key}, 2) on conflict (key) do update set v = vis_version.v + 1`;
 
-export const forgetRecord = (db: Db, canon: string) =>
-  invalidating(db, async tx => { await tx`insert into tomb values (${"rec:" + canon}) on conflict do nothing`; await bump(tx, "s:" + sessOf(canon)); });
-export const hideView = (db: Db, view: string) =>
-  invalidating(db, async tx => { await tx`insert into tomb values (${"view:" + view}) on conflict do nothing`; await bump(tx, "s:" + view); });
-export const forgetQuerySession = (db: Db, s: string) =>
-  invalidating(db, async tx => { await tx`insert into tomb values (${"query:" + s}) on conflict do nothing`; await bump(tx, "s:" + s); });
-export const revokeDest = (db: Db, d: string) =>
-  invalidating(db, async tx => { await tx`update dest set allowed = false where name = ${d}`; await bump(tx, "d:" + d); });
+export const forgetRecord = (db: Db, canon: string, h?: WriterHooks) =>
+  invalidating(db, async tx => { await tx`insert into tomb values (${"rec:" + canon}) on conflict do nothing`; await bump(tx, "s:" + sessOf(canon)); }, h);
+export const hideView = (db: Db, view: string, h?: WriterHooks) =>
+  invalidating(db, async tx => { await tx`insert into tomb values (${"view:" + view}) on conflict do nothing`; await bump(tx, "s:" + view); }, h);
+export const forgetQuerySession = (db: Db, s: string, h?: WriterHooks) =>
+  invalidating(db, async tx => { await tx`insert into tomb values (${"query:" + s}) on conflict do nothing`; await bump(tx, "s:" + s); }, h);
+export const revokeDest = (db: Db, d: string, h?: WriterHooks) =>
+  invalidating(db, async tx => { await tx`update dest set allowed = false where name = ${d}`; await bump(tx, "d:" + d); }, h);
 /** Remap advances the OCCURRENCE's view session (an old vector observes it), not only the new canonical source. */
-export const remap = (db: Db, occ: string, canon: string) =>
+export const remap = (db: Db, occ: string, canon: string, h?: WriterHooks) =>
   invalidating(db, async tx => {
     const [o] = await tx`update occurrence set canon = ${canon} where occ = ${occ} returning view`;
     await bump(tx, "s:" + o.view);
-  });
+  }, h);
 
 // ------------------------------------------------------------------------------------------------ publish
 
@@ -145,47 +152,69 @@ export type PublishHooks = {
   beforeLock?: () => Promise<void>;             // about to open step 2
   inLock?: (tx: Tx) => Promise<void>;           // holding the shared lock, before compare
 };
-export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean; sampleLate?: boolean; lockDeadlineMs?: number };
+export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean; sampleLate?: boolean; lockAndReadOneStatement?: boolean; lockDeadlineMs?: number };
 
 /**
- * Two-step publish (§5.5). `c` must be a reserved connection (deadline cancellation is per backend).
- * Step 1: one REPEATABLE READ snapshot runs the exact check AND samples the full dependency vector.
- * Step 2: a NEW READ COMMITTED transaction takes the shared barrier lock in its own statement; the
- *         version read is the NEXT statement, so its snapshot is taken after the lock was granted.
- *         statement_timeout bounds every locked statement server-side; on timeout the txn rolls back.
+ * Two-step publish (§5.5). Reserves its own connection from `pool` (the deadline may terminate it).
+ * Step 1: one REPEATABLE READ snapshot checks generation-vector validity and the exact predicate AND samples
+ *         the full dependency vector.
+ * Step 2: a NEW READ COMMITTED transaction takes the shared barrier lock in its own statement; the version
+ *         read is the NEXT statement, so its snapshot is taken after the lock was granted. `transaction_timeout`
+ *         bounds the WHOLE locked transaction server-side (including client pauses between statements); on
+ *         expiry Postgres terminates the backend, which releases the lock and discards the publication.
  */
-export async function publish(c: Db, id: string, hooks: PublishHooks = {}, opts: PublishOpts = {}):
+export async function publish(pool: Db, id: string, hooks: PublishHooks = {}, opts: PublishOpts = {}):
   Promise<"published" | "rejected" | "timeout"> {
+  const c = await pool.reserve();
+  try { return await publishOn(c, id, hooks, opts); } finally { c.release(); }
+}
+async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOpts): Promise<"published" | "rejected" | "timeout"> {
   if (opts.reuseSnapshot) return publishBrokenReuseSnapshot(c, id, hooks, opts);
   let keys: string[] = [], vec: Record<string, number> = {}, ok = false;
   await c`begin isolation level repeatable read`;
   try {
-    ok = await exactOk(c, id);
+    ok = (await genVecOk(c, id)) && (await exactOk(c, id));
     await hooks.duringCheck?.();                                     // another txn commits; our snapshot is fixed
     keys = await vectorKeys(c, id, opts);
     if (!opts.sampleLate) vec = await readVector(c, keys);
     await c`commit`;
     if (opts.sampleLate) vec = await readVector(c, keys);           // broken: versions from a later, separate snapshot
-  } catch (e) { await c`rollback`; throw e; }
+  } catch (e) { await c`rollback`.catch(() => {}); throw e; }
   await hooks.afterCheck?.();
   if (!ok) return "rejected";
   await hooks.beforeLock?.();
 
   await c`begin isolation level read committed`;
   try {
-    if (opts.lockDeadlineMs) await c.unsafe(`set local statement_timeout = ${Math.floor(opts.lockDeadlineMs)}`);
-    await c`select pg_advisory_xact_lock_shared(${BARRIER})`;
-    await hooks.inLock?.(c);
-    const now = await readVector(c, keys);                           // fresh read, after the lock
+    await c.unsafe(`set local transaction_timeout = ${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}`);
+    let now: Record<string, number>;
+    if (opts.lockAndReadOneStatement) {                              // broken: snapshot taken before the lock wait
+      now = await readVectorWithLock(c, keys);
+      await hooks.inLock?.(c);
+    } else {
+      await c`select pg_advisory_xact_lock_shared(${BARRIER})`;
+      await hooks.inLock?.(c);
+      now = await readVector(c, keys);                               // fresh read, after the lock
+    }
     if (!keys.every(k => now[k] === vec[k])) { await c`rollback`; return "rejected"; }
     await c`insert into publication (artifact) values (${id})`;       // "hand to transport" stand-in
     await c`commit`;
     return "published";
   } catch (e: any) {
     await c`rollback`.catch(() => {});
-    if (e?.errno === "57014") return "timeout";                      // query_canceled (statement_timeout)
+    if (e?.errno === "25P04" || e?.code === "ERR_POSTGRES_CONNECTION_CLOSED") return "timeout";   // transaction_timeout
     throw e;
   }
+}
+const LOCK_DEADLINE_MS = 2000;                                       // prototype default; product value is [待标定]
+
+/** Broken variant helper: take the lock and read versions in ONE statement (its snapshot predates the wait). */
+async function readVectorWithLock(q: Tx, keys: string[]): Promise<Record<string, number>> {
+  const rows = await q`select l.ok, v.key, v.v from (select pg_advisory_xact_lock_shared(${BARRIER}) is null as ok) l
+                       left join vis_version v on v.key in ${q(keys)}`;
+  const out: Record<string, number> = Object.fromEntries(keys.map(k => [k, 1]));
+  for (const r of rows) if (r.key) out[r.key] = Number(r.v);
+  return out;
 }
 
 /** Deliberately broken: compares in the step-1 snapshot after taking the lock. Used only to prove the test bites. */
@@ -216,55 +245,77 @@ export async function requestLease(db: Db, source: string, collector: string, tt
 }
 
 /**
- * Grant `id` iff it is the oldest pending request of its queue and no lease of that queue is currently valid.
- * Serialized per queue with a transaction-scoped advisory lock on hash(source, collector).
+ * Advance the queue of `id`'s (source, collector) and report whether `id` now holds a valid lease.
+ * Under the per-queue advisory lock: expired granted leases leave the queue; if no lease is valid, the OLDEST
+ * pending request is granted — whoever calls. So a request whose client died is still granted, expires after its
+ * ttl and is reaped; it cannot block the queue forever. A granted lease is reported only while unexpired and
+ * not done.
  */
 export async function tryGrant(db: Db, id: number): Promise<boolean> {
   return db.begin(async (tx: Tx) => {
-    const [me] = await tx`select source, collector, granted_at from lease where id = ${id}`;
-    if (me.granted_at) return true;
+    const [me] = await tx`select source, collector from lease where id = ${id}`;
+    if (!me) return false;
     await tx`select pg_advisory_xact_lock(hashtext(${me.source}), hashtext(${me.collector}))`;   // two-key form: never collides with BARRIER (one-key)
-    // expired, uncommitted leases leave the queue (their holder must re-request)
     await tx`update lease set done = true where source = ${me.source} and collector = ${me.collector}
              and granted_at is not null and not done and expires_at <= clock_timestamp()`;
     const [busy] = await tx`select count(*)::int n from lease where source = ${me.source} and collector = ${me.collector}
                             and granted_at is not null and not done`;
-    if (busy.n > 0) return false;
-    const [head] = await tx`select id from lease where source = ${me.source} and collector = ${me.collector}
-                            and granted_at is null and not done order by id limit 1`;
-    if (Number(head.id) !== id) return false;
-    await tx`update lease set granted_at = clock_timestamp(),
-             expires_at = clock_timestamp() + make_interval(secs => ttl_ms / 1000.0) where id = ${id}`;
-    return true;
+    if (busy.n === 0)
+      await tx`update lease set granted_at = clock_timestamp(),
+               expires_at = clock_timestamp() + make_interval(secs => ttl_ms / 1000.0)
+               where id = (select id from lease where source = ${me.source} and collector = ${me.collector}
+                           and granted_at is null and not done order by id limit 1)`;
+    const [r] = await tx`select granted_at is not null and not done and expires_at > clock_timestamp() as mine
+                         from lease where id = ${id}`;
+    return !!r.mine;
   });
+}
+
+/** Cancel a lease request or give back a lease (client gave up). Server-side expiry covers crashed clients. */
+export async function cancelLease(db: Db, id: number) {
+  await db`update lease set done = true where id = ${id}`;
 }
 
 export async function acquireLease(db: Db, source: string, collector: string, ttlMs: number): Promise<number> {
   const id = await requestLease(db, source, collector, ttlMs);
   for (let i = 0; i < 2000; i++) { if (await tryGrant(db, id)) return id; await Bun.sleep(5); }
+  await cancelLease(db, id);
   throw new Error("lease not granted");
 }
 
 // ------------------------------------------------------------------------------------------------ sync commit
 
 export type SyncCommit = { leaseId: number; commitId: string; records: { rec: string; hash: string }[]; scanChunks?: number };
-export type SyncResult = { ok: true } | { ok: false; reason: "lease" };
-export type SyncOpts = { noMergeLock?: boolean; beforeMerge?: () => Promise<void> };
+export type SyncResult = { ok: true } | { ok: false; reason: "lease" | "source" };
+export type SyncOpts = {
+  noMergeLock?: boolean;                       // broken variant: merge without the global barrier
+  afterLeaseCheck?: () => Promise<void>;       // holding the lease row lock, before the barrier wait
+  afterMergeRead?: () => Promise<void>;        // merge inputs computed, shared state not yet written
+};
 
 /**
- * One atomic transaction (§4.1, §5.1): commit-id short-circuit → lease validity on the server clock →
- * body dedupe → projection update → merge under the global barrier (conflict entry = visibility tightening,
- * bumps the canonical source session) → scan progress → record result → release lease.
+ * One atomic transaction (§4.1, §5.1):
+ *   commit-id lock + short-circuit (a concurrent retry waits, then reads the original result)
+ *   → lease row lock → records must belong to the lease's source
+ *   → global barrier (serializes the shared merge; also the visibility barrier)
+ *   → lease validity on the server clock, checked AFTER every lock wait
+ *   → body dedupe → projection update → merge (conflict entry = visibility tightening, bumps the session)
+ *   → scan progress → record result → release lease.
  */
 export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Promise<SyncResult> {
   return db.begin(async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock(${COMMIT_NS}, hashtext(${c.commitId}))`;
     const [prev] = await tx`select result from commit_result where commit_id = ${c.commitId}`;
     if (prev) return prev.result as SyncResult;
-    const [l] = await tx`select source, collector, done, granted_at is not null and expires_at > clock_timestamp() as valid
-                         from lease where id = ${c.leaseId} for update`;
-    if (!l || l.done || !l.valid) return { ok: false, reason: "lease" } as const;   // not recorded: a retry may still be rejected
-    if (opts.beforeMerge) await opts.beforeMerge();
-    if (!opts.noMergeLock) await tx`select pg_advisory_xact_lock(${BARRIER})`;      // serializes shared merge
+    const [l] = await tx`select source, collector, done from lease where id = ${c.leaseId} for update`;
+    if (!l || l.done) return { ok: false, reason: "lease" } as const;   // not recorded: a retry may still be rejected
+    if (!c.records.every(r => sessOf(r.rec) === l.source)) return { ok: false, reason: "source" } as const;
+    await opts.afterLeaseCheck?.();
+    if (!opts.noMergeLock) await tx`select pg_advisory_xact_lock(${BARRIER})`;
+    const [v] = await tx`select granted_at is not null and expires_at > clock_timestamp() as valid
+                         from lease where id = ${c.leaseId}`;
+    if (!v.valid) return { ok: false, reason: "lease" } as const;
+    const merged: { rec: string; next: { state: string; hash: string | null }; old: any }[] = [];
     for (const r of c.records) {
       await tx`insert into body values (${r.rec}, ${r.hash}) on conflict do nothing`;   // dedupe stores body once
       await tx`insert into projection values (${r.rec}, ${l.collector}, ${r.hash})
@@ -272,9 +323,13 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
       const hashes = await tx`select distinct hash from projection where rec = ${r.rec}`;
       const next = hashes.length === 1 ? { state: "ok", hash: hashes[0].hash } : { state: "conflict", hash: null };
       const [old] = await tx`select state, hash from shared where rec = ${r.rec}`;
-      await tx`insert into shared values (${r.rec}, ${next.state}, ${next.hash})
+      merged.push({ rec: r.rec, next, old });
+    }
+    await opts.afterMergeRead?.();                                   // test hook: both sides computed their merge
+    for (const { rec, next, old } of merged) {
+      await tx`insert into shared values (${rec}, ${next.state}, ${next.hash})
                on conflict (rec) do update set state = excluded.state, hash = excluded.hash`;
-      if (old && (old.state !== next.state || old.hash !== next.hash)) await bump(tx, "s:" + sessOf(r.rec));
+      if (old && (old.state !== next.state || old.hash !== next.hash)) await bump(tx, "s:" + sessOf(rec));
     }
     if (c.scanChunks) await tx`insert into scan_progress values (${l.source}, ${l.collector}, ${c.scanChunks})
                                on conflict (source, collector) do update set chunks = scan_progress.chunks + excluded.chunks`;
@@ -284,6 +339,7 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     return result;
   });
 }
+const COMMIT_NS = 0x6d656d78;                                        // two-key advisory namespace for commit ids
 
 export async function sharedState(db: Db, rec: string): Promise<{ state: "ok"; hash: string } | { state: "conflict" } | { state: "absent" }> {
   const [r] = await db`select state, hash from shared where rec = ${rec}`;
