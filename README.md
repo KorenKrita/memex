@@ -27,7 +27,8 @@ Tests: a Postgres 17 with pgvector and pg_trgm at `MEMEX_PG_URL` (default
 - The trace does not store the query as its own object (DESIGN §6.5): the query text is not kept at all, and
   the trace row is bound to the querying source and deleted with it on forget.
 - The trace has no artefact versions (summary / embedding version per candidate) and no injection
-  confirmation: `returned` and `pool[].returned` mean "in the response", not "injected into a context" —
-  the plugins (stage 4) report what they inject.
+  confirmation: `returned` and `pool[].returned` mean "assembled into the response to be delivered" — not
+  delivered, not injected into a context; the plugins (stage 4) report what they inject. `pool[].selected`
+  means chosen for rerank; it was sent only when `rerank_skipped` is null.
 - Regex `mem_grep` joins every readable record's text and relies on the 5 s statement timeout; its cost at
   real corpus size is not measured.

@@ -81,7 +81,7 @@ beforeEach(async () => {
 });
 
 /** The trace's rerank inputs, in the order they were sent. */
-const inputs = (d: any) => d.pool.filter((c: any) => c.rerank_input).sort((a: any, b: any) => a.rerank_input_pos - b.rerank_input_pos);
+const inputs = (d: any) => d.pool.filter((c: any) => c.selected).sort((a: any, b: any) => a.selected_pos - b.selected_pos);
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
 const header = (id: string, extra = {}) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...extra });
@@ -248,8 +248,8 @@ test("over the rerank budget: attachments are dropped and marked incomplete", as
   expect(inputs(t.data).slice(0, first).some((c: any) => c.attached > 0)).toBe(true);
   expect(out.every((x: any) => !x.injectable && x.attachments.length === 0)).toBe(true);
   expect(r.results.filter((x: any) => !x.incomplete.length).every((x: any) => x.injectable)).toBe(true);
-  expect(sent.filter((d) => d.includes("[next exchange]")).length).toBeGreaterThan(0);
-  expect(sent.filter((d) => d.includes("[next exchange]")).length).toBeLessThan(40);
+  expect(sent.filter((d) => d.includes("[next exchange,")).length).toBeGreaterThan(0);
+  expect(sent.filter((d) => d.includes("[next exchange,")).length).toBeLessThan(40);
 });
 
 test("both summary channels' representations of a unit reach rerank; a fork prefix labels on-path", async () => {
@@ -804,7 +804,7 @@ test("a failure line later in the hit record itself is attached", async () => {
   await body(Q("migrate-v3"));
   const docs = lastRerank().filter((d) => d.includes("running migrate-v3"));
   expect(docs.length).toBeGreaterThan(0);
-  for (const d of docs) expect(d).toContain("[later in span] [error] migrate-v3 failed");
+  for (const d of docs) expect(d).toContain("[later in span, on-path] [error] migrate-v3 failed");
 });
 
 test("signals over their budget: the candidate is marked incomplete, not silently trimmed", async () => {
@@ -1128,7 +1128,7 @@ test("the trace records every stage: channel tops, fused order, the cut, the ret
   // Every candidate of the pool, in fused order, including those the cut left out (past the 10th of them too).
   expect(d.pool.map((c: any) => c.fused_rank)).toEqual(d.pool.map((_: any, i: number) => i + 1));
   for (let i = 1; i < d.pool.length; i++) expect(d.pool[i - 1].fused).toBeGreaterThanOrEqual(d.pool[i].fused);
-  const cut = d.pool.filter((c: any) => !c.rerank_input);
+  const cut = d.pool.filter((c: any) => !c.selected);
   expect(cut.length).toBeGreaterThan(10);
   expect(inputs(d).length).toBe(40);
   for (const c of cut) expect(c.rerank_rank).toBeUndefined();
@@ -1284,4 +1284,24 @@ test("zoom a record under a view_key of another session: refused (the key does n
   const vkA = (await body(Q("katoken", { dests: [] }))).results.find((x: any) => x.source === A).path.view_key;
   await expect(zoom(db, T0({ id: "record:" + B + ":u0", view_key: vkA }))).rejects.toThrow("not found");
   expect(((await zoom(db, T0({ id: "record:" + A + ":u0", view_key: vkA }))).body as any).records[0].text).toContain("katoken");
+});
+
+test("corrections are labelled on their own: a fix only on the other branch is attached and marked off-path", async () => {
+  // Shared prefix u0 a0, then two branches; the user corrects on a2's branch only. The view is b2 (tail).
+  const l = [header("cb"), msg("user", "u0", null, "alpha cbtoken pick postgres"), msg("assistant", "a0", "u0", "ok postgres"),
+    msg("user", "u1", "a0", "不对，改成 mysql"), msg("assistant", "a1", "u1", "改了"),
+    msg("user", "w1", "a0", "thanks, go on"), msg("assistant", "w2", "w1", "fine")];
+  await put("cb", l);
+  await drain(db);
+  const r = await body(Q("cbtoken"));
+  const hit = r.results.find((x: any) => x.key.startsWith("record:") && (x.excerpt?.text ?? "").includes("cbtoken"));
+  expect(hit.path).toMatchObject({ label: "on-path", view_key: { tip: "w2" } });
+  const fix = hit.attachments.find((a: any) => a.text.includes("改成 mysql"));
+  const ok = hit.attachments.find((a: any) => a.text.includes("thanks, go on"));
+  expect(fix.path).toBe("off-path");
+  expect(ok.path).toBe("on-path");
+  // The rerank document names each attachment's path, so the candidate's on-path does not cover the fix.
+  const doc = lastRerank().find((d) => d.includes("改成 mysql"))!;
+  expect(doc).toContain("[next exchange, off-path] 不对，改成 mysql");
+  expect(doc).toContain("[next exchange, on-path] thanks, go on");
 });

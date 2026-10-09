@@ -64,7 +64,8 @@ type Cand = {
   reps: Rep[]; // unit: hit representations (both channels kept)
   hit?: { key: string; source: string; text: string }; // record: the best chunk
   excerpt?: { key: string; text: string };
-  attach: { what: "signal" | "next"; key: string; source: string; text: string }[];
+  // `path`: the attachment's own label against the result's reference view (set with the result's labels).
+  attach: { what: "signal" | "next"; key: string; source: string; text: string; path?: string }[];
   incomplete: string[];
   sources: Set<string>; // every source whose text this candidate carries
 };
@@ -362,7 +363,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   }
   // Trace (§6.5): each channel's first 10 by key, and every candidate of the pool (bounded by the channel
   // limits) with its per-channel ranks, the representations it was hit through, its fused rank and whether it
-  // reached rerank. Keys and numbers only.
+  // was selected for rerank (sent only when rerank_skipped is null). Keys and numbers only.
   const top = (rows: any[], f: (x: any) => string) => [...new Set(rows.map(f))].slice(0, 10);
   const fusedOrder = [...cands.values()].sort((a, b) => b.fused - a.fused || (a.key < b.key ? -1 : 1));
   return {
@@ -372,7 +373,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
     pool: fusedOrder.map((c, i) => ({
       key: c.key, ranks: c.ranks, fused: Number(c.fused.toFixed(5)), fused_rank: i + 1,
       reps: c.reps.map((p) => `${p.channel}:${p.span}`), ...(c.hit ? { hit: c.hit.key } : {}),
-      rerank_input: chosen.includes(c),
+      selected: chosen.includes(c), // chosen for rerank; whether it was sent is rerank_skipped
     })),
   };
 }
@@ -381,7 +382,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
 const docBase = (c: Cand) =>
   [...new Set(c.reps.map((p) => p.text))].map((t) => `[summary] ${t}`).concat(c.excerpt ? `[excerpt] ${c.excerpt.text}` : c.hit ? `[excerpt] ${clip(c.hit.text, 2 * EXCERPT_SIDE)}` : "")
     .filter(Boolean).join("\n");
-const docAttach = (c: Cand) => c.attach.map((a) => `[${a.what === "next" ? "next exchange" : "later in span"}] ${a.text}`).join("\n");
+const docAttach = (c: Cand) => c.attach.map((a) => `[${a.what === "next" ? "next exchange" : "later in span"}, ${a.path ?? "unlocated"}] ${a.text}`).join("\n");
 
 /** Fit the documents in the budget: drop attachments from the lowest-ranked candidate up (incomplete). */
 function fit(chosen: Cand[]): string[] | null {
@@ -494,6 +495,8 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         const reps = c.reps.map((p) => labelOf(t, p.keys));
         // A unit's label merges all its representations (the excerpt never upgrades it); a record's is its own.
         const label = c.kind === "record" ? labelOf(t, [c.hit!.key]) : mergeLabels(reps);
+        // Each attachment on its own (a correction may sit on another branch than the hit).
+        for (const a of c.attach) a.path = labelOf(t, [a.key]);
         const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: viewVersion(b, src), at: t.at };
         labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps });
       }
@@ -565,7 +568,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
     const pool = rc.pool.map((p) => {
       const h = byKey.get(p.key);
       if (!h) return p;
-      return { ...p, rerank_input_pos: h.i + 1, rerank: scores[h.i], rerank_rank: rerankRank.get(h.c) ?? null, final_rank: final.findIndex((x) => x.c === h.c) + 1,
+      return { ...p, selected_pos: h.i + 1, rerank: scores[h.i], rerank_rank: rerankRank.get(h.c) ?? null, final_rank: final.findIndex((x) => x.c === h.c) + 1,
                returned: final.findIndex((x) => x.c === h.c) < r.limit!, attached: h.c.attach.length, incomplete: [...new Set(h.c.incomplete)] };
     });
     // The trace is published like any derived artefact: under the shared barrier, only while the query's
