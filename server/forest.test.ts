@@ -270,6 +270,7 @@ async function coldThenStructure() {
 async function claimJobFor(kind: string, key: string) {
   await db`insert into job (kind, key) values (${kind}, ${key}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
   await db`update job set not_before = now() + interval '1 hour' where state = 'queued' and not (kind = ${kind} and key = ${key})`;
+  await db`update job set not_before = now() where state = 'queued' and kind = ${kind} and key = ${key}`;
   const j = await claimJob(db, [kind]);
   await db`update job set not_before = now() where state = 'queued'`;
   expect(j?.key).toBe(key);
@@ -777,4 +778,46 @@ test("a child published concurrently with the planner inserting its parent (comm
   }
   await drain(db);
   expect((await db`select text is not null w from forest_node where id = ${R.id}`)[0].w).toBe(true);
+});
+
+test("a span check refused only because its view's projection is momentarily stale: summaries and vectors recover on their own", async () => {
+  const lines = linear("st", 4); // 4 closed, tail [u4 a4] open
+  const s = await put("st", lines);
+  await drain(db, ["project"]);
+  // A revision in the open tail: the version moves; the closed spans' inputs do not change.
+  const rev = [...lines];
+  rev[rev.length - 2] = msg("user", "u4", "a3", "t4 changed");
+  await put("st", rev);
+  const [first] = await db`select id from span where source = ${s} and keys[1] like 'st/u0:%'`;
+  const { runSummarize } = await import("./derive.ts");
+  const n = requests.length;
+  await runSummarize(db, (await claimJobFor("summarize", first.id))!);
+  expect(requests.length).toBe(n);
+  await drain(db);
+  // The refused check came back as a later job, not as a finished one.
+  const [later] = await db`select not_before > now() later from job where kind = 'summarize' and key = ${first.id} and state = 'queued'`;
+  expect(later?.later).toBe(true);
+  await db`update job set not_before = now() where state = 'queued'`;
+  await drain(db);
+  expect((await db`select count(*)::int n from span_summary where embedding is not null`)[0].n).toBe(4);
+  expect((await readForest(db, s, await tipOf(s)))!.items.map((i) => i.size)).toEqual([4]);
+});
+
+test("an embed refused only because the projection is momentarily stale: the vector is made later", async () => {
+  const lines = linear("se", 4);
+  const s = await put("se", lines);
+  // Summaries now; the embed jobs are held back.
+  await drain(db, ["project", "summarize"]);
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'embed'`;
+  const rev = [...lines];
+  rev[rev.length - 2] = msg("user", "u4", "a3", "t4 changed");
+  await put("se", rev);
+  const [first] = await db`select id from span where source = ${s} and keys[1] like 'se/u0:%'`;
+  const { runEmbed } = await import("./derive.ts");
+  await runEmbed(db, (await claimJobFor("embed", first.id))!);
+  expect((await db`select embedding is null e from span_summary where span = ${first.id}`)[0].e).toBe(true);
+  await drain(db, ["project"]);
+  await db`update job set not_before = now() where state = 'queued'`;
+  await drain(db);
+  expect((await db`select count(*)::int n from span_summary where embedding is not null`)[0].n).toBe(4);
 });

@@ -93,15 +93,21 @@ export async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Ch
                           and not exists (select 1 from tomb t where t.key = 'source:' || v.source)`;
   const usable: { source: string; deps: Record<string, number> }[] = [];
   let ungranted: string[] | null = null;
+  let stale = false;
   for (const c of [...cands].sort((a: any, b: any) => Number(b.source === span.source) - Number(a.source === span.source) || (a.source < b.source ? -1 : 1))) {
-    if (!(await unchanged(q, c.deps))) continue;
+    if (!(await unchanged(q, c.deps))) {
+      stale = true;
+      continue;
+    }
     if (!(await q`select 1 from grant_rule where scope = ${c.scope} and purpose = 'derive' and dest = ${dest}`).length) {
       ungranted ??= [c.scope];
       continue;
     }
     usable.push({ source: c.source, deps: c.deps });
   }
-  if (!usable.length) return ungranted ? { ok: false, reason: "not-granted:" + dest, scopes: ungranted } : { ok: false, reason: "not-closed" };
+  // A stale projection is not a verdict: it is projected again soon, and then this check can pass.
+  if (!usable.length)
+    return ungranted ? { ok: false, reason: "not-granted:" + dest, scopes: ungranted } : { ok: false, reason: stale ? "projection-stale" : "not-closed" };
   const closer = usable[0].source === span.source ? null : usable[0].source;
   const closeDeps = usable[0].deps;
   const want = [...span.records, ...span.context].map((r: any) => {
@@ -264,6 +270,12 @@ const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex"
 export async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
   await hooks.beforeSkip();
   return db.begin(async (tx: Tx) => {
+    if (reason === "projection-stale") {
+      // Not a verdict: look again after the projection has had its turn (it was queued with the change).
+      const fin = await finishJob(tx, job);
+      if (fin === "done") await enqueue(tx, job.kind, job.key, {}, 2_000);
+      return fin;
+    }
     const grant = reason.startsWith("not-granted:");
     if (grant) await tx`select pg_advisory_xact_lock(${GRANT_LOCK})`; // then the job row, as allowGrant does
     const fin = await finishJob(tx, job);
