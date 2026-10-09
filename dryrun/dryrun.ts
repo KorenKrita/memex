@@ -186,6 +186,15 @@ function digestOf(r: Rec): string {
   return `${r.kind}: ${head}\n‹tool-output record=${r.id} bytes=${n}›\n${errors.join("\n")}\n${tail}`;
 }
 const digestSize = (r: Rec) => (DIGEST_KINDS.has(r.kind) && !r.memory ? bytes(digestOf(r)) + 1 : 0);
+const CONTEXT_MAX = 2048; // DESIGN §4.3 [待标定 ≤2KB] raw-text context before a span
+// The first `max` UTF-8 bytes of `s`, never cutting a character.
+function clip(s: string, max: number): string {
+  const b = enc.encode(s);
+  if (b.length <= max) return s;
+  let end = max;
+  while (end > 0 && (b[end] & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(b.slice(0, end));
+}
 
 // ---------- units, spans, views ----------
 
@@ -263,13 +272,13 @@ const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all 
 // unit boundaries; where it forks inside a source span it gets a prefix span P (cut back to whole units, so
 // a call never leaves its result) followed by its own spans. Spans never cross a user message.
 // Assumption: spans are taken as finally cut; whether a span was still open at fork time is not in the logs.
-function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), parentViews?: FileViews): FileViews {
+function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), parentViews?: FileViews, onSpan?: SpanSink): FileViews {
   const own: FileViews = { trie: new Map(), viewSpans: [] };
   const unpaired = new Set<string>();
   const pending = new Map<string, string>(); // this file's new nodes, published only if it is not short
   let longest = 0;
   let n = 0;
-  const register = (us: Rec[][], start: number, prefix: boolean): ViewSpan => {
+  const register = (us: Rec[][], start: number, prefix: boolean, path: Rec[]): ViewSpan => {
     const recs = us.flat();
     const end = start + recs.length;
     const size = recs.reduce((a, r) => a + digestSize(r), 0);
@@ -278,6 +287,15 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
     let id = fam.spanId.get(key);
     if (id === undefined) {
       fam.spanId.set(key, (id = `${res.path}#s${n++}`));
+      if (onSpan) {
+        const rec = (r: Rec) => ({ id: r.id, key: r.key, kind: r.kind, digest: digestOf(r) });
+        // DESIGN §4.3 <context>: the same path's raw text before the span, the last user message and the
+        // start of the assistant reply after it, at most CONTEXT_MAX bytes; for reference only.
+        const before = path.slice(0, start).filter((r) => digestSize(r) > 0);
+        const u = before.findLastIndex((r) => r.kind === "user");
+        const ctx = u < 0 ? [] : [before[u], ...before.slice(u + 1).filter((r) => r.kind === "assistant").slice(0, 1)];
+        onSpan({ id, prefix, records: recs.filter((r) => digestSize(r) > 0).map(rec), context: ctx.map((r) => ({ ...rec(r), digest: clip(digestOf(r), CONTEXT_MAX / 2) })) });
+      }
       res.spans++;
       res.summaryInputBytes += size;
       if (size > SPAN_MAX) res.oversizedSpans++; // only a lone indivisible unit gets here
@@ -321,7 +339,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
     let k = 0;
     while (ui + k < us.length && starts[ui + k] + us[ui + k].length <= limit) k++;
     if (k > 0) {
-      mine.push(register(us.slice(ui, ui + k), pos, true));
+      mine.push(register(us.slice(ui, ui + k), pos, true, path));
       ui += k;
     }
     while (ui < us.length) {
@@ -334,7 +352,7 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
         size += add;
         len++;
       }
-      mine.push(register(us.slice(ui, ui + len), starts[ui], false));
+      mine.push(register(us.slice(ui, ui + len), starts[ui], false, path));
       ui += len;
     }
     own.viewSpans.push(mine);
@@ -804,10 +822,15 @@ function skip(res: FileResult, reason: FileResult["reason"]): Parsed {
   return { recs: [], views: [] };
 }
 
+// A newly counted span and its summary-input records (digest text), for local sampling tools (eval/).
+export type SpanRecord = { id: string; key: string; kind: string; digest: string };
+export type SpanSink = (span: { id: string; prefix: boolean; records: SpanRecord[]; context: SpanRecord[] }) => void;
+
 export interface AnalyzeOptions {
   parent?: ParentLookup; // Pi fork parents among the approved inputs (dryRun supplies it)
   identity?: string; // dev:ino from collect(); the file must still be that inode
   contentHash?: string; // sha256 seen by dryRun's copy pre-pass; the file must still have it
+  onSpan?: SpanSink; // called once per span this file adds
 }
 
 export function analyzeFile(path: string, opts: AnalyzeOptions = {}): FileResult {
@@ -828,7 +851,7 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
     if (res.status !== "indexed") return { res };
     account(parsed.recs, res);
     const family = parsed.from?.family ?? newFamily();
-    const fileViews = partition(parsed.views, res, family, parsed.from?.views);
+    const fileViews = partition(parsed.views, res, family, parsed.from?.views, opts.onSpan);
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
@@ -883,7 +906,8 @@ export function collect(inputs: string[]): { files: string[]; identity: Map<stri
   return { files: [...files].sort(), identity, symlinks: [...symlinks].sort(), errors };
 }
 
-export function dryRun(inputs: string[]) {
+// `onSpan(file, span)`: each counted span with its file, for local sampling (eval/); counting is unchanged.
+export function dryRun(inputs: string[], onSpan?: (file: string, span: Parameters<SpanSink>[0]) => void) {
   const { files, identity, symlinks, errors } = collect(inputs);
   const approved = new Set(files);
   // Pi copies (DESIGN §4.1): files with the same header id are one native session. Identical copies are
@@ -941,7 +965,7 @@ export function dryRun(inputs: string[]) {
         r = { res, parent: run(canon).parent };
       } else {
         busy.add(f);
-        r = analyze(f, { parent, identity: identity.get(f), contentHash: copyHash.get(f) });
+        r = analyze(f, { parent, identity: identity.get(f), contentHash: copyHash.get(f), onSpan: onSpan && ((s) => onSpan(f, s)) });
         busy.delete(f);
       }
       done.set(f, r);

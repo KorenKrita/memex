@@ -955,3 +955,56 @@ describe("input boundary", () => {
     expect(readFileSync(p).equals(before)).toBe(true);
   });
 });
+
+// The span hook used by eval/ sampling must see exactly what dryRun counts.
+describe("span hook", () => {
+  const collectSpans = (d: string) => {
+    const got: { file: string; span: any }[] = [];
+    const r = dryRun([join(dir, d)], (file, span) => got.push({ file, span }));
+    return { r, got };
+  };
+
+  test("one call per counted span, with the records' digests and the same-path context", () => {
+    file("hook/a/s.jsonl", [
+      piHeader(),
+      piMsg("u1", null, user("first question")),
+      piMsg("a1", "u1", say("first answer")),
+      piMsg("u2", "a1", user("second question")),
+      piMsg("a2", "u2", say("second answer")),
+    ]);
+    const { r, got } = collectSpans("hook/a");
+    expect(got.length).toBe(r.total.spans);
+    const second = got.find((g) => g.span.records.some((x: any) => x.id === "u2"))!.span;
+    expect(second.records.map((x: any) => [x.id, x.kind, x.digest])).toEqual([
+      ["u2", "user", "user: second question"],
+      ["a2", "assistant", "assistant: second answer"],
+    ]);
+    expect(second.context.map((x: any) => x.id)).toEqual(["u1", "a1"]);
+    const first = got.find((g) => g.span.records.some((x: any) => x.id === "u1"))!.span;
+    expect(first.context).toEqual([]);
+  });
+
+  test("identical copies of a session are sampled once", () => {
+    const rows = [piHeader({ id: "hk" }), piMsg("u", null, user("u"))];
+    file("hook/copies/a.jsonl", rows);
+    file("hook/copies/b.jsonl", rows);
+    const { r, got } = collectSpans("hook/copies");
+    expect(got.length).toBe(1);
+    expect(r.total.spans).toBe(1);
+  });
+
+  test("a resolved fork's spans carry the parent's canonical keys for inherited records", () => {
+    // P: [u a] is one span. C forks after u, inside it: C gets a prefix span [u] (inherited u) and [b].
+    const P = file("hook/fork/P.jsonl", [piHeader({ id: "pp" }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
+    const C = file("hook/fork/C.jsonl", [piHeader({ id: "cc", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const { r, got } = collectSpans("hook/fork");
+    expect(r.forks.resolved).toBe(1);
+    expect(got.length).toBe(r.total.spans);
+    const child = got.filter((g) => g.file === C);
+    const p = child.find((g) => g.span.prefix)!.span;
+    expect(p.records.map((x: any) => x.id)).toEqual(["u"]);
+    expect(p.records[0].key.startsWith("pp/")).toBe(true); // inherited: keeps its native session
+    const own = child.flatMap((g) => g.span.records).find((x: any) => x.id === "b");
+    expect(own.key.startsWith("cc/")).toBe(true);
+  });
+});
