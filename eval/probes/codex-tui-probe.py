@@ -20,6 +20,9 @@ if "--end-wait" in args:
     del args[i : i + 2]
 prompt, model = args
 log = os.environ["MEMEX_PROBE_LOG"]
+home = os.environ.get("CODEX_HOME", "")
+if not home or os.path.realpath(home) == os.path.realpath(os.path.expanduser("~/.codex")):
+    sys.exit("set CODEX_HOME to an isolated probe home (not ~/.codex): this probe stops that home's daemon")
 daemon = ["codex", "app-server", "daemon"]
 subprocess.run(daemon + ["stop"], capture_output=True)
 start = os.path.getsize(log) if os.path.exists(log) else 0
