@@ -36,6 +36,10 @@ beforeAll(async () => {
       const path = new URL(req.url).pathname;
       const body = await req.json();
       requests.push({ path, body });
+      if (path.endsWith("/chat/completions") && body.messages[0].content.startsWith("You merge")) {
+        const parts = [...(body.messages[1].content as string).matchAll(/<part n="\d">\n([\s\S]*?)\n<\/part>/g)].map((m) => m[1]);
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ summary: parts.join(" + ") }) } }] });
+      }
       if (path.endsWith("/chat/completions")) {
         const s = { summary: summaryOf(body.messages[1].content), user_asked: ["q"], assistant_chose: [], verified: [], tasks: [], kind: ["chat"], anchors: [] };
         return Response.json({ choices: [{ message: { content: JSON.stringify(s) } }] });
@@ -56,6 +60,7 @@ beforeAll(async () => {
   api = await serve(db, { port: 0 });
 });
 afterAll(async () => {
+  delete process.env.MEMEX_FOREST_HOT_DAYS;
   srv.stop(true);
   await api.stop();
   await db.close();
@@ -67,9 +72,11 @@ const ALL = [
 ];
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace restart identity cascade`);
+                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
+                   forest_node, forest_access restart identity cascade`);
   for (const [s, p, d] of ALL) await db`insert into grant_rule values (${s}, ${p}, ${d})`;
   process.env.MEMEX_IDLE_CLOSE_MS = "0"; // every tail closes: everything is summarized
+  process.env.MEMEX_FOREST_HOT_DAYS = "100000"; // the fixtures' timestamps are old: count them as recent
   requests = [];
   rerankStatus = 200;
   summaryOf = (input) => /kind="user">\n?([^<]*)/.exec(input.slice(input.indexOf("<input>")))?.[1]?.trim() ?? "s";
@@ -1369,4 +1376,120 @@ test("a unit result's source and scope are its reference source; representations
   expect(u).toBeTruthy();
   expect(u.source).toBe(u.path.view_key.source);
   expect(u.reps.map((p: any) => p.source).sort()).toEqual([C, P].sort());
+});
+
+// ---------- forest through mem_zoom (§4.4, §6.4) ----------
+
+const zb = async (x: object) => (await zoom(db, T0(x))).body as any;
+const lin = (n: string, words: string[]) => linear(n, words.map((w, i) => [w, "r" + i]));
+
+test("zoom navigates session → forest roots → node children → span → records, on one view", async () => {
+  const s = await put("nav", lin("nav", ["w0", "w1", "w2", "w3", "w4"]));
+  await drain(db);
+  const top = await zb({ id: "session:" + s });
+  expect(top.complete).toBe(true);
+  expect(top.items.map((i: any) => i.leaves)).toEqual([[0, 4], [4, 5]]);
+  expect(top.items[0].id).toMatch(/^node:/);
+  const n = await zb({ id: top.items[0].id, view_key: top.view_key });
+  expect(n.items.map((i: any) => i.leaves)).toEqual([[0, 2], [2, 4]]);
+  const n2 = await zb({ id: n.items[0].id, view_key: top.view_key });
+  expect(n2.items.map((i: any) => i.id.slice(0, 5))).toEqual(["span:", "span:"]);
+  const sp = await zb({ id: n2.items[0].id, view_key: top.view_key });
+  expect(sp.records.map((r: any) => r.text).join(" ")).toContain("w0");
+  expect(sp.after).toBe(n2.items[1].id);
+  // A node without the view key it belongs to is refused, not looked up on some branch.
+  await expect(zoom(db, T0({ id: top.items[0].id }))).rejects.toThrow("view_key");
+});
+
+test("zoom forest on two branches: the shared prefix is the same node; nodes of one branch are not found on the other", async () => {
+  const base = lin("fb", ["w0", "w1", "w2", "w3", "w4", "w5"]);
+  const alt = [msg("user", "x4", "a3", "z4"), msg("assistant", "y4", "x4", "q"), msg("user", "x5", "y4", "z5"), msg("assistant", "y5", "x5", "q")];
+  const s = await put("fb", [...base, ...alt]);
+  await drain(db);
+  const views = await db`select tip from view where source = ${s} order by ord`;
+  const tops: any[] = [];
+  for (const v of views) tops.push(await zb({ id: "session:" + s, leaf: undefined, view_key: { source: s, tip: v.tip, basis: "observed", version: (await zb({ id: "session:" + s })).view_key.version } }));
+  const [A, B] = tops;
+  expect(A.items[0].id).toBe(B.items[0].id); // [w0..w3] shared
+  const onlyA = A.items.find((i: any) => i.id.startsWith("node:") && !B.items.some((j: any) => j.id === i.id));
+  expect(onlyA).toBeTruthy();
+  await expect(zoom(db, T0({ id: onlyA.id, view_key: B.view_key }))).rejects.toThrow("not found");
+});
+
+test("zoom forest never calls a model; a cold or partial view is expanded from what is ready", async () => {
+  const s = await put("cz", lin("cz", ["w0", "w1", "w2", "w3"]));
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1"; // cold
+  try {
+    await drain(db);
+  } finally {
+    process.env.MEMEX_FOREST_HOT_DAYS = "100000";
+  }
+  const n = requests.length;
+  const top = await zb({ id: "session:" + s });
+  expect(requests.length).toBe(n);
+  expect(top.complete).toBe(false);
+  expect(top.items.map((i: any) => i.summary)).toEqual(["user: w0", "user: w1", "user: w2", "user: w3"]);
+  expect((await db`select 1 from forest_access where source = ${s}`).length).toBe(1); // asked for, in the background
+  await drain(db);
+  expect((await zb({ id: "session:" + s })).items.length).toBe(1);
+});
+
+test("zoom forest: an unknown leaf or a stale key is not replaced by the current tail", async () => {
+  const s = await put("uk", lin("uk", ["w0", "w1", "w2", "w3"]));
+  await drain(db);
+  const top = await zb({ id: "session:" + s });
+  const u = await zb({ id: "session:" + s, view_key: { ...top.view_key, tip: "nope" } });
+  expect(u).toMatchObject({ view_basis: "unknown", reason: "view-not-found", items: [] });
+  await put("uk", lin("uk", ["w0", "w1 changed", "w2", "w3"]));
+  await drain(db);
+  await expect(zoom(db, T0({ id: top.items[0].id, view_key: top.view_key }))).rejects.toThrow("view-stale");
+});
+
+test("zoom forest hides summaries made from a source not readable now: a fork child's mixed node while the parent's projection is stale", async () => {
+  const pl = lin("wp", ["ptext0", "ptext1", "ptext2"]);
+  const P = await put("wp", pl);
+  const C = await put("wc", [header("wc", { parentSession: "/x/wp.jsonl" }), ...pl.slice(1), msg("user", "c3", "a2", "kid3"), msg("assistant", "d3", "c3", "r")], "personal", P);
+  await drain(db);
+  const top = await zb({ id: "session:" + C });
+  expect(JSON.stringify(top)).toContain("ptext0");
+  // The parent withdraws something (its projection is stale until projected again); the child is still
+  // valid — its own projection names only its version and the parent's old one, so it is stale too, or not:
+  // either way no parent text may come out while the parent is not readable.
+  const rev = [...pl];
+  rev[1] = msg("user", "u0", null, "ptext0 changed");
+  await put("wp", rev);
+  const after = await zoom(db, T0({ id: "session:" + C })).then((g) => JSON.stringify(g.body), (e) => String(e));
+  expect(after).not.toContain("ptext0");
+});
+
+test("zoom forest: a guessed node id of an unreadable session is not served", async () => {
+  const W = await put("ws", lin("ws", ["hidden0", "hidden1", "hidden2", "hidden3"]), "work");
+  await drain(db);
+  const [n] = await db`select id from forest_node where text is not null limit 1`;
+  expect(n).toBeTruthy();
+  await expect(zoom(db, T0({ id: "session:" + W }))).rejects.toThrow("not found");
+  await expect(zoom(db, T0({ id: "node:" + n.id, view_key: { source: W, tip: "a3", basis: "observed", version: "x" } }))).rejects.toThrow("not found");
+});
+
+test("zoom forest: a forgotten parent's text is not served through the child's forest", async () => {
+  const pl = lin("fp", ["ptext0", "ptext1", "ptext2"]);
+  const P = await put("fp", pl);
+  const C = await put("fc", [header("fc", { parentSession: "/x/fp.jsonl" }), ...pl.slice(1), msg("user", "c3", "a2", "kid3"), msg("assistant", "d3", "c3", "r")], "personal", P);
+  await drain(db);
+  expect(JSON.stringify(await zb({ id: "session:" + C }))).toContain("ptext0");
+  await forgetSource(db, P);
+  const read = () => zoom(db, T0({ id: "session:" + C })).then((g) => JSON.stringify(g.body), (e) => String(e));
+  expect(await read()).not.toContain("ptext"); // the child is stale until projected again: not found
+  await drain(db);
+  const r = await read();
+  expect(r).not.toContain("ptext");
+  expect(r).toContain("kid3");
+});
+
+test("zoom forest: a revoke between the read and its delivery is refused (the reply carries the read grant)", async () => {
+  const s = await put("rv", lin("rv", ["w0", "w1", "w2", "w3"]));
+  await drain(db);
+  const g = await zoom(db, T0({ id: "session:" + s }));
+  expect(Object.keys(g.deps)).toContain("d:memex");
+  expect(Object.keys(g.deps)).toContain("s:" + s);
 });

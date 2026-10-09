@@ -20,6 +20,7 @@ import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { EMBED_DIM, guardedPost, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
+import { forestView, leavesOf, nodeOn, wantForest } from "./forest.ts";
 
 export const PURPOSES = new Set(["recall", "tool", "snapshot"]);
 export const CHANNEL_TOP = 50;
@@ -730,6 +731,46 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
           body: { id, source: row.source, ...vout, records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
         };
       }
+      if (id.startsWith("session:") || id.startsWith("node:")) {
+        // The forest (§4.4): `session:<source>` → the roots of its view; `node:<id>` → that node's children.
+        // A node id carries no branch: the view comes from the view key (or, for a session, its target
+        // view); a node not planned on that view is not found, never looked up on another branch.
+        const node = id.startsWith("node:") ? id.slice(5) : null;
+        const src = node ? (vkIn?.source ?? null) : id.slice(8);
+        if (!src) throw new HttpError(400, "node needs view_key");
+        if (!b.valid.has(src)) throw new HttpError(404, "not found or not readable");
+        if (vkIn && vkIn.source !== src) throw new HttpError(400, "view_key is for another session");
+        let v: any, vb: ViewBasis, reason: string | null = null;
+        const allViews = await q`select ord, tip, spans, closed_end from view where source = ${src} order by ord`;
+        if (vkIn) {
+          v = vkIn.tip === null ? undefined : allViews.find((x: any) => x.tip === vkIn!.tip);
+          vb = v && vkIn.basis !== "unknown" ? vkIn.basis : "unknown";
+          if (!v) reason = vkIn.tip === null ? "view-unknown" : "view-not-found";
+        } else {
+          const t = await targetView(q, src);
+          v = t.v && allViews.find((x: any) => x.tip === t.v!.tip);
+          vb = t.basis;
+          reason = t.reason ?? null;
+        }
+        const view_key = { source: src, tip: v?.tip ?? null, basis: vb, version: viewVersion(b, src) };
+        if (!v) return { deps: depsOf(b, [src]), body: { id, view_key, view_basis: vb, reason, items: [], complete: false } };
+        const leaves = leavesOf(v);
+        const sel = node ? await nodeOn(q, leaves, node) : undefined;
+        if (node && !sel) throw new HttpError(404, "not found or not readable");
+        // A summary is shown only if every source it was made from (records and <context>) is readable now.
+        // (Today that follows from the view being valid: its leaves come from this source or its fork
+        // ancestors, which share its scope and whose versions its projection vector holds. The check and
+        // the deps of the sources used keep it true if a summary's inputs ever reach further.)
+        const f = await forestView(q, leaves, (x) => b.valid.has(x), sel ?? undefined);
+        return {
+          deps: depsOf(b, [src, ...f.used]),
+          body: {
+            id, view_key, view_basis: vb, complete: f.complete,
+            items: f.items.map((x) => ({ id: x.node ? "node:" + x.node : "span:" + x.span, leaves: [x.start, x.start + x.size], summary: x.text })),
+          },
+          want: f.complete ? null : src,
+        };
+      }
       const sid = id.replace(/^(span|unit):/, "");
       const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
       if (!sp || (await q`select 1 from tomb where key = any(${q.array((sp.canons as string[]).map((c) => "canon:" + c), "text")}) limit 1`).length)
@@ -765,6 +806,8 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         },
       };
     });
+    // Not ready: asked for in the background, after the read and its checks (the read never waits for it).
+    if ((out as any).want) await wantForest(db, (out as any).want);
     return new Guarded(out.deps, out.body, run);
   };
   return run();

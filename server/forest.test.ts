@@ -55,6 +55,7 @@ beforeEach(async () => {
                    restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('personal', 'derive', 'llm'), ('personal', 'derive', 'embedding')`;
   process.env.MEMEX_IDLE_CLOSE_MS = String(10 * 60_000);
+  delete process.env.MEMEX_FOREST_HOT_DAYS;
   requests = [];
   hold = null;
   embedDown = false;

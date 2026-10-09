@@ -19,6 +19,7 @@
 import { type Db, type Job, type Tx, addMigration, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
 import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot, unchanged } from "./derive.ts";
+import { canonOf } from "./project.ts";
 
 export const FOREST_VERSION = "forest-merge-v1";
 /** Test seam: runs in runForest's transaction right after it takes the barrier. */
@@ -59,7 +60,7 @@ export function roots(n: number): [number, number][] {
 }
 
 type Planned = { id: string; start: number; size: number; kids: [Kid, Kid]; spans: string[] };
-const leavesOf = (v: { spans: any[]; closed_end: number }) => v.spans.filter((x: any) => x.id && x.end <= v.closed_end).map((x: any) => x.id as string);
+export const leavesOf = (v: { spans: any[]; closed_end: number }) => v.spans.filter((x: any) => x.id && x.end <= v.closed_end).map((x: any) => x.id as string);
 
 /** The nodes of one view whose leaves all have a current summary (no model call). */
 async function plan(q: Tx, model: string, leaves: string[]): Promise<Planned[]> {
@@ -251,53 +252,87 @@ export async function runMerge(db: Db, job: Job) {
 
 export type ForestItem = { start: number; size: number; node?: string; span?: string; text: string | null };
 
-/** The forest of one view for reading (zoom, session card): each root as its node when its text is current,
- *  otherwise expanded into its children, down to leaf summaries. Never calls a model: a view not fully
- *  ready is remembered as accessed and its merges are queued in the background. */
-export async function readForest(db: Db, source: string, tip: string) {
+/** The canonical sources a span summary was made from (records and <context>), from its keys. */
+const genSources = (harness: string, span: { records: any[]; context: any[] }) =>
+  [...new Set([...span.records, ...span.context].map((r: any) => canonOf(harness, r.key).split(":")[0]))];
+
+/** Read one view's forest in the caller's snapshot (no model call, no write). `readable(source)` says whether
+ *  a generation source may be shown to this reader: a leaf summary is used only if every source it was made
+ *  from (records and <context>) is readable and none of its records is forgotten; a node only if every leaf
+ *  under it is. `start/size` select a subtree (a node being expanded); default: the whole view. Returns the
+ *  items (a node with current text, else its children, down to leaves), the sources used, and whether every
+ *  item was a ready node or a root leaf. */
+export async function forestView(q: Tx, leaves: string[], readable: (source: string) => boolean, sel?: { start: number; size: number }) {
   const model = env("MEMEX_LLM_MODEL");
+  const rows = await q`select s.id, s.records, s.context, ss.text, src.harness from span s join source src on src.id = s.source
+                       join span_summary ss on ss.span = s.id and ss.input_fp = s.input_fp
+                       where s.id = any(${q.array(leaves, "text")})
+                         and not exists (select 1 from unnest(s.canons) c join tomb t on t.key = 'canon:' || c)`;
+  const sums = new Map<string, { text: string; from: string[] }>();
+  for (const x of rows) {
+    const from = genSources(x.harness, x);
+    if (from.every(readable)) sums.set(x.id, { text: x.text, from });
+  }
+  const planned = new Map((await plan(q, model, leaves)).map((n) => [`${n.start}:${n.size}`, n]));
+  // A node id is planned from the leaves' current input and summary hashes, so a stored node with that id
+  // was made from exactly these leaves: readable while all of them are (its stored vector, with the model
+  // destination, is for publication, not for reading).
+  const nodeRows = await q`select id, text, spans from forest_node where id = any(${q.array([...planned.values()].map((n) => n.id), "text")}) and text is not null`;
+  const usable = new Map<string, string>();
+  for (const x of nodeRows) if ((x.spans as string[]).every((sp) => sums.has(sp))) usable.set(x.id, x.text);
+  let complete = true;
+  const items: ForestItem[] = [];
+  const used = new Set<string>();
+  const addFrom = (from: number, n: number) => leaves.slice(from, from + n).forEach((sp) => sums.get(sp)?.from.forEach((x) => used.add(x)));
+  const expand = (start: number, size: number, top: boolean) => {
+    if (size === 1) {
+      const sm = sums.get(leaves[start]);
+      if (!sm || !top) complete = false;
+      if (sm) addFrom(start, 1);
+      items.push({ start, size, span: leaves[start], text: sm?.text ?? null });
+      return;
+    }
+    const n = planned.get(`${start}:${size}`);
+    const text = n && usable.get(n.id);
+    if (n && text) {
+      addFrom(start, size);
+      return void items.push({ start, size, node: n.id, text });
+    }
+    complete = false;
+    expand(start, size / 2, false);
+    expand(start + size / 2, size / 2, false);
+  };
+  if (sel) {
+    // Children of the selected node (its own text is what the caller already has).
+    if (sel.size > 1) for (const h of [0, sel.size / 2]) expand(sel.start + h, sel.size / 2, true);
+  } else for (const [st, z] of roots(leaves.length)) expand(st, z, true);
+  return { items, used: [...used], complete };
+}
+
+/** Where node `id` sits on a view's leaves, if it is one of that view's planned nodes. */
+export async function nodeOn(q: Tx, leaves: string[], id: string) {
+  const n = (await plan(q, env("MEMEX_LLM_MODEL"), leaves)).find((x) => x.id === id);
+  return n ? { start: n.start, size: n.size } : null;
+}
+
+/** Remember a read that was not fully ready, and ask for its merges in the background (after the read). */
+export async function wantForest(db: Db, source: string) {
+  await db.begin(async (tx: Tx) => {
+    await tx`insert into forest_access values (${source}) on conflict (source) do update set at = now()`;
+    await enqueue(tx, "forest", source);
+  });
+}
+
+/** The forest of one view (tests and internal use): every source counts as readable. */
+export async function readForest(db: Db, source: string, tip: string) {
   const r = await snapshot(db, async (q) => {
     const [v] = await q`select spans, closed_end from view where source = ${source} and tip = ${tip}`;
     if (!v) return null;
     const [pr] = await q`select deps from projected where source = ${source}`;
     if (!pr || !(await unchanged(q, pr.deps))) return { stale: true, complete: false, items: [] as ForestItem[] };
-    const leaves = leavesOf(v as any);
-    const sums = new Map<string, string>(
-      (await q`select s.id, ss.text from span s join span_summary ss on ss.span = s.id and ss.input_fp = s.input_fp
-               where s.id = any(${q.array(leaves, "text")})
-                 and not exists (select 1 from unnest(s.canons) c join tomb t on t.key = 'canon:' || c)`).map((x: any) => [x.id, x.text]),
-    );
-    const planned = new Map((await plan(q, model, leaves)).map((n) => [`${n.start}:${n.size}`, n]));
-    // Read-side validity (as search.ts): the source's projection is current, and the node id is planned from
-    // the leaves' current input and summary hashes, so a matching node was made from exactly these leaves;
-    // it is readable while none of them is forgotten. Its stored vector (with the model destination) is for
-    // publication, not for reading.
-    const rows = await q`select id, text, spans from forest_node where id = any(${q.array([...planned.values()].map((n) => n.id), "text")}) and text is not null`;
-    const usable = new Map<string, string>();
-    for (const x of rows) if ((x.spans as string[]).every((sp) => sums.has(sp))) usable.set(x.id, x.text);
-    let complete = true;
-    const items: ForestItem[] = [];
-    const expand = (start: number, size: number, root: boolean) => {
-      if (size === 1) {
-        const text = sums.get(leaves[start]) ?? null;
-        if (text === null || !root) complete = false;
-        items.push({ start, size, span: leaves[start], text });
-        return;
-      }
-      const n = planned.get(`${start}:${size}`);
-      const text = n && usable.get(n.id);
-      if (n && text) return void items.push({ start, size, node: n.id, text });
-      complete = false;
-      expand(start, size / 2, false);
-      expand(start + size / 2, size / 2, false);
-    };
-    for (const [s, z] of roots(leaves.length)) expand(s, z, true);
-    return { stale: false, complete, items };
+    const f = await forestView(q, leavesOf(v as any), () => true);
+    return { stale: false, complete: f.complete, items: f.items };
   });
-  if (r && !r.complete)
-    await db.begin(async (tx: Tx) => {
-      await tx`insert into forest_access values (${source}) on conflict (source) do update set at = now()`;
-      await enqueue(tx, "forest", source);
-    });
+  if (r && !r.complete) await wantForest(db, source);
   return r;
 }
