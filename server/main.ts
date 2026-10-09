@@ -5,6 +5,8 @@ import "./project.ts";
 import "./derive.ts";
 import "./search.ts";
 import "./forget.ts";
+import "./forest.ts";
+import "./snapshot.ts";
 import { serve } from "./http.ts";
 import { loop } from "./worker.ts";
 

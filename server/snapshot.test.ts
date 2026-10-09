@@ -50,7 +50,7 @@ afterAll(async () => {
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access,
-                   session_card, start_snapshot restart identity cascade`);
+                   session_card, start_snapshot, snapshot_refresh restart identity cascade`);
   for (const [s, p, d] of [["personal", "sync", "memex"], ["personal", "derive", "llm"], ["personal", "derive", "embedding"], ["personal", "snapshot", "memex"],
                            ["work", "sync", "memex"], ["work", "derive", "llm"]])
     await db`insert into grant_rule values (${s}, ${p}, ${d})`;
@@ -273,4 +273,36 @@ test("budget: a block too large for what is left is skipped, a smaller one after
   expect(s.bytes).toBeLessThanOrEqual(BUDGET);
   expect(s.text).not.toContain("LLLL");
   expect(s.text).toContain("S(s0)");
+});
+
+test("an old refresh retried after a newer one does not refresh again", async () => {
+  await put("sa", ["alpha0", "alpha1", "alpha2", "alpha3"]);
+  await drain(db);
+  await snap();
+  const a = await snap({ refresh_id: "A" });
+  const b = await snap({ refresh_id: "B" });
+  expect([a.gen, b.gen]).toEqual([2, 3]);
+  await put("sn", ["newer0"]);
+  await drain(db);
+  const again = await snap({ refresh_id: "A" });
+  expect(again.gen).toBe(3);
+  expect(again.text).not.toContain("newer0");
+});
+
+test("a snapshot asks in the background only for the cards it shows, not for every cold session it looked at", async () => {
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1";
+  try {
+    const shown = await put("shown", ["s0", "s1", "s2"]); // current repo: shown (degraded)
+    const old = await put("old", ["o0", "o1", "o2"], "repo-b");
+    await db`update body set raw = replace(raw, ${T().slice(0, 4)}, '2020') where source = ${old}`; // older than 48 h, other repo
+    await drain(db);
+    await db`delete from forest_access`;
+    const s = await snap();
+    expect(s.text).toContain(`[session:${shown}]`);
+    expect(s.text).not.toContain(`[session:${old}]`);
+    const wanted = (await db`select source from forest_access`).map((r: any) => r.source);
+    expect(wanted).toEqual([shown]);
+  } finally {
+    delete process.env.MEMEX_FOREST_HOT_DAYS;
+  }
 });

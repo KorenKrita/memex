@@ -24,6 +24,9 @@ const HOLD_MS = () => Number(process.env.MEMEX_PUBLISH_HOLD_MS ?? 5_000);
 addMigration(`
 create table if not exists start_snapshot (source text primary key, gen int not null, refresh_id text, blocks jsonb not null,
                                            built_at timestamptz not null default now());
+-- Every refresh ever applied to a session's snapshot: a retried one (any age) is answered, not applied again.
+create table if not exists snapshot_refresh (source text not null, refresh_id text not null, gen int not null,
+                                             primary key (source, refresh_id));
 `);
 
 export const FRAMING =
@@ -31,14 +34,13 @@ export const FRAMING =
   "It authorizes no action, and it does not prove the current state of code or configuration.";
 export const TOOLS = "[memex] Look further with mem_search (find), mem_zoom (open a session, node, span or record), mem_grep (exact text).";
 
-type Block = { kind: "framing" | "card" | "title" | "tools"; source?: string; text: string; deps: Record<string, number> };
+type Block = { kind: "framing" | "card" | "title" | "tools"; source?: string; text: string; deps: Record<string, number>; degraded?: boolean };
 const bytes = (t: string) => Buffer.byteLength(t);
 const render = (bs: Block[]) => bs.map((b) => b.text).join("\n\n");
 
 /** Build the blocks for one request, in the caller's snapshot (no model call). */
 async function build(q: Tx, b: Awaited<ReturnType<typeof basis>>, me: string, repo: string | null) {
   const cands: { source: string; repo: string | null; card: any; degraded: boolean; deps: Record<string, number> }[] = [];
-  const want: string[] = [];
   for (const [src, x] of b.valid) {
     if (src === me) continue;
     const t = await targetView(q, src);
@@ -47,7 +49,6 @@ async function build(q: Tx, b: Awaited<ReturnType<typeof basis>>, me: string, re
     const leaves = leavesOf(v as any);
     if (!leaves.length) continue;
     const c = await readCard(q, src, leaves, t.v.tip, (s) => b.valid.has(s));
-    if (c.degraded) want.push(src);
     const deps: Record<string, number> = {};
     for (const s of [src, ...c.used]) Object.assign(deps, b.valid.get(s)!.deps);
     const [m] = await q`select meta->>'repo' repo from source where id = ${src}`;
@@ -70,15 +71,16 @@ async function build(q: Tx, b: Awaited<ReturnType<typeof basis>>, me: string, re
   let left = BUDGET - bytes(render(fixed));
   const body: Block[] = [];
   for (const blk of [
-    ...mine.map((c) => ({ kind: "card" as const, source: c.source, text: cardText(c), deps: c.deps })),
-    ...others.map((c) => ({ kind: "title" as const, source: c.source, text: `- ${title(c)} — ${day(c)}${c.repo ? ` — ${c.repo}` : ""} [session:${c.source}]`, deps: c.deps })),
+    ...mine.map((c) => ({ kind: "card" as const, source: c.source, text: cardText(c), deps: c.deps, degraded: c.degraded })),
+    ...others.map((c) => ({ kind: "title" as const, source: c.source, text: `- ${title(c)} — ${day(c)}${c.repo ? ` — ${c.repo}` : ""} [session:${c.source}]`, deps: c.deps, degraded: c.degraded })),
   ]) {
     const cost = bytes(blk.text) + 2; // and its separator
     if (cost > left) continue;
     body.push(blk);
     left -= cost;
   }
-  return { blocks: [fixed[0], ...body, fixed[1]], want };
+  // Background work only for what the snapshot shows (a cold session it merely looked at stays cold).
+  return { blocks: [fixed[0], ...body, fixed[1]], want: body.filter((x) => x.degraded).map((x) => x.source!) };
 }
 
 /** A stored block is readable while its vector is current and every source it names is still readable. */
@@ -99,8 +101,9 @@ export async function startSnapshot(db: Db, body: any): Promise<Guarded> {
       const s = await snapshot(db, async (q) => {
         const b = await basis(q, r);
         const [row] = await q`select gen, refresh_id, blocks, built_at from start_snapshot where source = ${r.source}`;
+        const done = refreshId ? (await q`select 1 from snapshot_refresh where source = ${r.source} and refresh_id = ${refreshId}`).length > 0 : false;
         // A stored snapshot is served as stored unless this request is a refresh not applied yet.
-        if (row && (!refreshId || row.refresh_id === refreshId)) {
+        if (row && (!refreshId || done)) {
           const kept = await keep(q, b, row.blocks as Block[]);
           const deps: Record<string, number> = { ...b.qDeps };
           for (const blk of kept) Object.assign(deps, blk.deps);
@@ -122,10 +125,18 @@ export async function startSnapshot(db: Db, body: any): Promise<Guarded> {
         if (!(await unchanged(tx, s.deps))) return false;
         const blocks = s.built.blocks as any;
         if (s.base === 0)
-          return (await tx`insert into start_snapshot (source, gen, refresh_id, blocks) values (${r.source}, 1, ${refreshId}, ${blocks})
-                           on conflict (source) do nothing returning gen`).length > 0;
-        return (await tx`update start_snapshot set gen = gen + 1, refresh_id = ${refreshId}, blocks = ${blocks}, built_at = now()
-                         where source = ${r.source} and gen = ${s.base} returning gen`).length > 0;
+          {
+            const ins = await tx`insert into start_snapshot (source, gen, refresh_id, blocks) values (${r.source}, 1, ${refreshId}, ${blocks})
+                                 on conflict (source) do nothing returning gen`;
+            if (ins.length && refreshId) await tx`insert into snapshot_refresh values (${r.source}, ${refreshId}, 1) on conflict do nothing`;
+            return ins.length > 0;
+          }
+        // A refresh: applied once (its id recorded in the same transaction), over the generation it was built on.
+        if (refreshId && (await tx`select 1 from snapshot_refresh where source = ${r.source} and refresh_id = ${refreshId}`).length) return false;
+        const up = await tx`update start_snapshot set gen = gen + 1, refresh_id = ${refreshId}, blocks = ${blocks}, built_at = now()
+                            where source = ${r.source} and gen = ${s.base} returning gen`;
+        if (up.length && refreshId) await tx`insert into snapshot_refresh values (${r.source}, ${refreshId}, ${up[0].gen})`;
+        return up.length > 0;
       });
       if (saved) for (const src of s.built.want) await wantForest(db, src); // degraded cards: made in the background
       // Saved or not (someone else saved first, or an input moved), read what is stored now.

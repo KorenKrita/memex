@@ -75,6 +75,7 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     await tx`delete from session_card where source = ${source} or deps ? ${"s:" + source}`;
     // Start snapshots: the source's own, and every block made from it in anyone else's (text and all).
     await tx`delete from start_snapshot where source = ${source}`;
+    await tx`delete from snapshot_refresh where source = ${source}`;
     await tx`update start_snapshot set blocks = (select coalesce(jsonb_agg(x), '[]') from jsonb_array_elements(blocks) x where not (x->'deps' ? ${"s:" + source}))
              where blocks @? ${'$[*].deps."s:' + source + '"'}::jsonpath`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
