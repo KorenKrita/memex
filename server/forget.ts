@@ -18,6 +18,7 @@ import { contentHash } from "../dryrun/dryrun.ts";
 import "./project.ts";
 import "./derive.ts";
 import "./search.ts";
+import "./forest.ts";
 
 export const copyTomb = (rec: string, raw: string) => `copy:${rec}:${contentHash(JSON.parse(raw))}`;
 
@@ -61,6 +62,9 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     const spans = (await tx`select id from span where source = ${source}`).map((r: any) => r.id as string);
     await tx`delete from job where state in ('queued', 'failed') and ((kind = 'project' and key = ${source}) or key = any(${tx.array(spans, "text")}))`;
     await tx`delete from derive_skip where span = any(${tx.array(spans, "text")})`;
+    // Forest nodes over any of its spans (text made from its summaries); a fork child's mixed nodes too.
+    await tx`delete from forest_node where spans && ${tx.array(spans, "text")}::text[]`;
+    await tx`delete from forest_access where source = ${source}`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
     // Lease rows are not touched: a commit holds its lease row before it waits for the barrier, so taking

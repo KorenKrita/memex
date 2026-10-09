@@ -79,7 +79,7 @@ function parseKey(key: string) {
 }
 
 /** Step 1 for a span and destination, in the caller's read-only repeatable-read snapshot. */
-async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> {
+export async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> {
   const [span] = await q`select s.id, s.source, s.unit, s.records, s.context, s.input_fp, src.harness from span s join source src on src.id = s.source where s.id = ${spanId}`;
   if (!span) return { ok: false, reason: "gone" };
   const closed = await q`select 1 from view v, jsonb_array_elements(v.spans) x
@@ -229,12 +229,12 @@ export function validate(s: any, span: { records: any[] }): string[] {
   return p;
 }
 
-const parseJson = (raw: string) => {
+export const parseJson = (raw: string) => {
   let t = raw.trim();
   if (t.startsWith("```")) t = (t.includes("\n") ? t.slice(t.indexOf("\n") + 1) : "").replace(/```\s*$/, "");
   return JSON.parse(t);
 };
-const env = (k: string) => {
+export const env = (k: string) => {
   const v = process.env[k];
   if (!v) throw new Error(`${k} not configured`);
   return v;
@@ -242,7 +242,7 @@ const env = (k: string) => {
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 
 /** Finish without a result, remembering a liftable reason. No barrier needed: nothing is published. */
-async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
+export async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
   await hooks.beforeSkip();
   return db.begin(async (tx: Tx) => {
     const grant = reason.startsWith("not-granted:");
@@ -262,7 +262,7 @@ async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
 }
 
 /** Publish under the shared barrier if `deps` still hold; otherwise finish and queue the job again later. */
-async function publish(db: Db, job: Job, deps: Record<string, number>, write: (tx: Tx) => Promise<unknown>) {
+export async function publish(db: Db, job: Job, deps: Record<string, number>, write: (tx: Tx) => Promise<unknown>) {
   return db.begin(async (tx: Tx) => {
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
     const fresh = await unchanged(tx, deps);
@@ -272,11 +272,15 @@ async function publish(db: Db, job: Job, deps: Record<string, number>, write: (t
       await enqueue(tx, job.kind, job.key, {}, 5_000);
       return "stale";
     }
-    if (!(await tx`select 1 from span where id = ${job.key}`).length) return fin; // re-projected away meanwhile (the version moved too)
     await write(tx);
     return fin;
   });
 }
+
+/** A published leaf summary: every source with a view over the span looks at its forest again (forest.ts). */
+const queueForests = async (tx: Tx, span: string) => {
+  for (const v of await tx`select distinct source from view where span_ids @> array[${span}]::text[]`) await enqueue(tx, "forest", v.source);
+};
 
 /** Job `summarize` for one span. */
 export async function runSummarize(db: Db, job: Job) {
@@ -294,7 +298,11 @@ export async function runSummarize(db: Db, job: Job) {
     if (!c.ok) return skip(db, job, c.reason, c.scopes);
     // The same input (records and context with their content hashes and canonical sources) was already
     // summarized: only the conservative version vector is renewed, no model call.
-    if (c.current) return publish(db, job, c.deps, (tx) => tx`update span_summary set deps = ${c.deps} where span = ${job.key} and input_fp = ${c.span.input_fp}`);
+    if (c.current)
+      return publish(db, job, c.deps, async (tx) => {
+        await tx`update span_summary set deps = ${c.deps} where span = ${job.key} and input_fp = ${c.span.input_fp}`;
+        await queueForests(tx, job.key);
+      });
     const messages = [{ role: "system", content: SYSTEM }, { role: "user", content: render(c.span) }];
     if (problems.length) messages.push({ role: "user", content: "Your previous answer was invalid: " + problems.slice(0, 4).join("; ") + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
@@ -310,12 +318,14 @@ export async function runSummarize(db: Db, job: Job) {
     problems = validate(s, c.span);
     if (problems.length) continue;
     return publish(db, job, c.deps, async (tx) => {
+      if (!(await tx`select 1 from span where id = ${job.key}`).length) return; // re-projected away meanwhile (the version moved too)
       await tx`insert into span_summary (span, unit, deps, model, prompt_v, summary, text, text_hash, input_fp)
                values (${job.key}, ${c.span.unit}, ${c.deps}, ${model}, ${PROMPT_VERSION}, ${s}, ${s.summary}, ${sha(s.summary)}, ${c.span.input_fp})
                on conflict (span) do update set unit = excluded.unit, deps = excluded.deps, model = excluded.model, prompt_v = excluded.prompt_v,
                  summary = excluded.summary, text = excluded.text, text_hash = excluded.text_hash, input_fp = excluded.input_fp,
                  embedding = null, embed_model = null, at = now()`;
       await enqueue(tx, "embed", job.key);
+      await queueForests(tx, job.key); // in parallel with the embedding, not after it
     });
   }
   throw new Error(problems.length ? `summary invalid after ${MAX_TRIES} tries` : `inputs kept changing`);

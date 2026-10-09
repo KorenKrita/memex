@@ -1,0 +1,414 @@
+// L2 summary forest (DESIGN §4.4, §5.5) over real Postgres and a fake model endpoint.
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { claimJob, connect, migrate, type Db } from "./db.ts";
+import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
+import { revokeGrant } from "./derive.ts";
+import { readForest, roots, runMerge } from "./forest.ts";
+import { forgetSource } from "./forget.ts";
+import { drain } from "./worker.ts";
+import { sourceIdOf } from "../client/records.ts";
+
+let db: Db;
+let requests: { path: string; body: any }[] = [];
+let hold: Promise<void> | null = null;
+let embedDown = false;
+let srv: ReturnType<typeof Bun.serve>;
+beforeAll(async () => {
+  db = connect();
+  await migrate(db);
+  srv = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const path = new URL(req.url).pathname;
+      const body = await req.json();
+      requests.push({ path, body });
+      if (path.endsWith("/embeddings")) {
+        if (embedDown) return new Response("down", { status: 503 });
+        return Response.json({ data: [{ embedding: Array.from({ length: 1024 }, (_, i) => (i === 0 ? 1 : 0)) }] });
+      }
+      if (body.messages[0].content.startsWith("You merge")) {
+        if (hold) await hold;
+        // A merged summary: the part texts joined, so tests can see exactly what went in.
+        const parts = [...(body.messages[1].content as string).matchAll(/<part n="\d">\n([\s\S]*?)\n<\/part>/g)].map((m) => m[1]);
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ summary: parts.join(" + ") }) } }] });
+      }
+      // A span summary: the user's words in <input> (each test exchange has a distinct token).
+      const input = (body.messages[1].content as string).split("<input>")[1] ?? "";
+      const words = [...input.matchAll(/kind="user">\s*(?:user: )?([^<]*)</g)].map((m) => m[1].trim()).join(" ");
+      const s = { summary: "S(" + words + ")", user_asked: ["q"], assistant_chose: [], verified: [], tasks: [], kind: ["chat"], anchors: [] };
+      return Response.json({ choices: [{ message: { content: JSON.stringify(s) } }] });
+    },
+  });
+  Object.assign(process.env, {
+    MEMEX_LLM_URL: `http://127.0.0.1:${srv.port}/v1`, MEMEX_LLM_MODEL: "fake-llm", MEMEX_LLM_KEY: "k-llm",
+    MEMEX_EMBED_URL: `http://127.0.0.1:${srv.port}/v1`, MEMEX_EMBED_MODEL: "fake-emb", MEMEX_EMBED_KEY: "k-emb",
+  });
+});
+afterAll(async () => {
+  srv.stop(true);
+  await db.close();
+});
+beforeEach(async () => {
+  await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
+                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access
+                   restart identity cascade`);
+  await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('personal', 'derive', 'llm'), ('personal', 'derive', 'embedding')`;
+  process.env.MEMEX_IDLE_CLOSE_MS = String(10 * 60_000);
+  requests = [];
+  hold = null;
+  embedDown = false;
+});
+
+const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+let T = new Date().toISOString(); // recent: a hot session
+const header = (id: string, parentSession?: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+const msg = (role: string, id: string, parent: string | null, text: string) =>
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
+let commitN = 0;
+async function put(native: string, lines: string[], parent: string | null = null) {
+  const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  const r = await commit(db, { leaseId: l, commitId: `f${commitN++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(r.ok).toBe(true);
+  return decl.source;
+}
+/** A linear session of n closed exchanges (one more opens the tail): exchange i says `t<i>`. */
+const linear = (native: string, n: number, from = 0) => {
+  const out = [header(native)];
+  let prev: string | null = null;
+  for (let i = 0; i <= n; i++) {
+    out.push(msg("user", `u${i}`, prev, `t${from + i}`), msg("assistant", `a${i}`, `u${i}`, `r${i}`));
+    prev = `a${i}`;
+  }
+  return out;
+};
+const merges = () => requests.filter((r) => r.body.messages?.[0].content.startsWith("You merge"));
+const nodes = async () => (await db`select id, size, text from forest_node order by size, id`) as any[];
+const tipOf = async (s: string) => (await db`select tip from view where source = ${s} order by ord limit 1`)[0].tip as string;
+const shape = (items: { size: number }[]) => items.map((i) => i.size);
+
+test("roots: binary carry, nothing below 4 leaves", () => {
+  expect(roots(13).map((r) => r[1])).toEqual([8, 4, 1]);
+  expect(roots(14).map((r) => r[1])).toEqual([8, 4, 2]);
+  expect(roots(16).map((r) => r[1])).toEqual([16]);
+  expect(roots(3).map((r) => r[1])).toEqual([1, 1, 1]);
+});
+
+test("13 → 14 → 16 leaves: roots [8,4,1] [8,4,2] [16]; nodes only added (10, 11, 15), never rewritten", async () => {
+  const s = await put("g", linear("g", 13));
+  await drain(db);
+  let f = (await readForest(db, s, await tipOf(s)))!;
+  expect(f).toMatchObject({ stale: false, complete: true });
+  expect(shape(f.items)).toEqual([8, 4, 1]);
+  expect(f.items[0].text).toBe(Array.from({ length: 8 }, (_, i) => `S(t${i})`).join(" + "));
+  const n13 = await nodes();
+  expect(n13.length).toBe(10);
+  expect(merges().length).toBe(10);
+  await put("g", linear("g", 14));
+  await drain(db);
+  f = (await readForest(db, s, await tipOf(s)))!;
+  expect(shape(f.items)).toEqual([8, 4, 2]);
+  expect((await nodes()).length).toBe(11);
+  expect(merges().length).toBe(11); // only [13–14]
+  await put("g", linear("g", 16));
+  await drain(db);
+  f = (await readForest(db, s, await tipOf(s)))!;
+  expect(shape(f.items)).toEqual([16]);
+  const n16 = await nodes();
+  expect(n16.length).toBe(15);
+  expect(merges().length).toBe(15);
+  for (const n of n13) expect(n16).toContainEqual(n); // same ids, same text
+});
+
+test("fewer than 4 leaves: no nodes, the leaves are listed", async () => {
+  const s = await put("small", linear("small", 3));
+  await drain(db);
+  const f = (await readForest(db, s, await tipOf(s)))!;
+  expect(shape(f.items)).toEqual([1, 1, 1]);
+  expect(f.items.map((i) => i.text)).toEqual(["S(t0)", "S(t1)", "S(t2)"]);
+  expect((await nodes()).length).toBe(0);
+  expect(merges().length).toBe(0);
+});
+
+test("a missing leaf summary: nothing merges across it; the read expands what is ready", async () => {
+  const s = await put("hole", linear("hole", 4));
+  // Leaf 1 (t1) is not summarized: its job is held back.
+  await drain(db, ["project"]);
+  const t1 = (await db`select id from span where source = ${s} and keys[1] like 'hole/u1:%'`)[0].id;
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize' and key = ${t1}`;
+  await drain(db);
+  const ns = await nodes();
+  expect(ns.length).toBe(1); // only [t2 t3]; [1–4] and [t0 t1] wait for t1
+  expect(ns[0].text).toBe("S(t2) + S(t3)");
+  const f = (await readForest(db, s, await tipOf(s)))!;
+  expect(f.complete).toBe(false);
+  expect(f.items.map((i) => [i.size, i.text])).toEqual([[1, "S(t0)"], [1, null], [2, "S(t2) + S(t3)"]]);
+  await db`update job set not_before = now() where key = ${t1}`;
+  await drain(db);
+  const g = (await readForest(db, s, await tipOf(s)))!;
+  expect(g.complete).toBe(true);
+  expect(g.items.map((i) => i.text)).toEqual(["S(t0) + S(t1) + S(t2) + S(t3)"]);
+});
+
+test("branches share the subtrees before the fork; each carries on its own after it", async () => {
+  // Exchanges t0..t5 closed; then a second branch from a3 with its own t6', t7'.
+  const base = linear("br", 6);
+  const s = await put("br", base);
+  await drain(db);
+  const before = new Set((await nodes()).map((n) => n.id));
+  const alt = [msg("user", "x4", "a3", "z4"), msg("assistant", "y4", "x4", "q"), msg("user", "x5", "y4", "z5"), msg("assistant", "y5", "x5", "q"),
+               msg("user", "x6", "y5", "z6"), msg("assistant", "y6", "x6", "q")];
+  await put("br", [...base, ...alt]);
+  await drain(db);
+  const views = await db`select tip from view where source = ${s} order by ord`;
+  expect(views.length).toBe(2);
+  const fa = (await readForest(db, s, "a6"))!;
+  const fb = (await readForest(db, s, "y6"))!;
+  expect(shape(fa.items)).toEqual([4, 2]);
+  expect(shape(fb.items)).toEqual([4, 2]);
+  expect(fa.items[0].node).toBe(fb.items[0].node); // [t0..t3] shared
+  expect(fa.items[1].node).not.toBe(fb.items[1].node);
+  expect(fb.items[1].text).toBe("S(z4) + S(z5)");
+  for (const id of before) expect((await nodes()).map((n) => n.id)).toContain(id);
+});
+
+test("a fork inside a span: the prefix P is a leaf of the new branch; nodes over it are its own", async () => {
+  // Exchange t1 has two assistant replies in a row on branch A; branch B forks after the first one.
+  const l = [header("pf"), msg("user", "u0", null, "t0"), msg("assistant", "a0", "u0", "r"), msg("user", "u1", "a0", "t1"), msg("assistant", "a1", "u1", "r"),
+    msg("assistant", "a1b", "a1", "more"), msg("user", "u2", "a1b", "t2"), msg("assistant", "a2", "u2", "r"), msg("user", "u3", "a2", "t3"), msg("assistant", "a3", "u3", "r"),
+    msg("user", "u4", "a3", "t4"), msg("assistant", "a4", "u4", "r")];
+  const s = await put("pf", [...l, msg("user", "v2", "a1", "w2"), msg("assistant", "b2", "v2", "r"), msg("user", "v3", "b2", "w3"), msg("assistant", "b3", "v3", "r"),
+    msg("user", "v4", "b3", "w4"), msg("assistant", "b4", "v4", "r")]);
+  await drain(db);
+  const fa = (await readForest(db, s, "a4"))!;
+  const fb = (await readForest(db, s, "b4"))!;
+  expect(fa.complete && fb.complete).toBe(true);
+  expect(fa.items[0].text).toBe("S(t0) + S(t1) + S(t2) + S(t3)");
+  expect(fb.items[0].text).toBe("S(t0) + S(t1) + S(w2) + S(w3)");
+  // [t0 t1] on A covers S, on B the prefix P: different leaves, different nodes.
+  const leafPairs = await db`select id, spans from forest_node where size = 2 and text like 'S(t0) + S(t1)'`;
+  expect(leafPairs.length).toBe(2);
+});
+
+test("an appended exchange keeps every node; a revision makes its nodes unreadable and they are rebuilt", async () => {
+  const s = await put("rv", linear("rv", 4));
+  await drain(db);
+  const n0 = merges().length;
+  expect(n0).toBe(3);
+  await put("rv", linear("rv", 5));
+  await drain(db);
+  expect(merges().length).toBe(n0); // 5 leaves: [1–4][5], nothing to merge
+  // Revise exchange t2's user text (in place, same id).
+  const rev = linear("rv", 5);
+  rev[5] = msg("user", "u2", "a1", "t2 revised");
+  await put("rv", rev);
+  // Before re-projection and re-summarizing, the old [1–4] is not readable (the projection is stale).
+  expect((await readForest(db, s, "a5"))!.stale).toBe(true);
+  await drain(db);
+  const f = (await readForest(db, s, "a5"))!;
+  expect(f.items[0].text).toBe("S(t0) + S(t1) + S(t2 revised) + S(t3)");
+  expect(merges().length).toBe(n0 + 2); // [t2' t3] and [1–4]; [t0 t1] reused
+});
+
+test("a cold session: structure only, zero merge calls; a read expands leaves and asks for the merges", async () => {
+  const old = T;
+  T = "2020-01-01T00:00:00Z"; // imported history
+  try {
+    const s = await put("cold", linear("cold", 4));
+    await drain(db);
+    expect(merges().length).toBe(0);
+    expect((await db`select count(*)::int n from forest_node where text is null`)[0].n).toBe(3);
+    const f = (await readForest(db, s, await tipOf(s)))!;
+    expect(f.complete).toBe(false);
+    expect(f.items.map((i) => i.text)).toEqual(["S(t0)", "S(t1)", "S(t2)", "S(t3)"]); // no model call in the read
+    expect(merges().length).toBe(0);
+    await drain(db); // the background work it asked for
+    expect(merges().length).toBe(3);
+    expect((await readForest(db, s, await tipOf(s)))!.items.map((i) => i.size)).toEqual([4]);
+  } finally {
+    T = old;
+  }
+});
+
+test("the embedding service down does not hold the forest back", async () => {
+  embedDown = true;
+  const s = await put("emb", linear("emb", 4));
+  await drain(db);
+  expect((await readForest(db, s, await tipOf(s)))!.complete).toBe(true);
+});
+
+/** Run the merge of the root [1–4] with the model held, doing `during` while the request is out. */
+async function holdRootMerge(s: string, during: () => Promise<void>) {
+  await coldThenStructure();
+  // Children first.
+  const pairs = (await db`select id from forest_node where size = 2`).map((r: any) => r.id);
+  for (const id of pairs) await runMerge(db, (await claimJobFor("merge", id))!);
+  const [root] = await db`select id from forest_node where size = 4`;
+  let release!: () => void;
+  hold = new Promise((r) => (release = r));
+  const job = (await claimJobFor("merge", root.id))!;
+  const n = merges().length;
+  const run = runMerge(db, job);
+  while (merges().length === n) await Bun.sleep(5);
+  await during();
+  release();
+  await run;
+  hold = null;
+  return root.id as string;
+}
+/** Structure without merges (the session counts as cold), so the test runs each merge itself. */
+async function coldThenStructure() {
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1";
+  try {
+    await drain(db);
+  } finally {
+    delete process.env.MEMEX_FOREST_HOT_DAYS;
+  }
+}
+async function claimJobFor(kind: string, key: string) {
+  await db`insert into job (kind, key) values (${kind}, ${key}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
+  await db`update job set not_before = now() + interval '1 hour' where state = 'queued' and not (kind = ${kind} and key = ${key})`;
+  const j = await claimJob(db, [kind]);
+  await db`update job set not_before = now() where state = 'queued'`;
+  expect(j?.key).toBe(key);
+  return j;
+}
+
+test("forget during the merge call: not published; the source's nodes are gone", async () => {
+  const s = await put("fg", linear("fg", 4));
+  const root = await holdRootMerge(s, async () => void (await forgetSource(db, s)));
+  expect((await db`select count(*)::int n from forest_node where id = ${root}`)[0].n).toBe(0);
+  expect((await nodes()).length).toBe(0);
+});
+
+test("a revision during the merge call: the reply is not published", async () => {
+  const s = await put("rd", linear("rd", 4));
+  const root = await holdRootMerge(s, async () => {
+    const rev = linear("rd", 4);
+    rev[3] = msg("user", "u1", "a0", "t1 changed");
+    await put("rd", rev);
+  });
+  expect((await db`select text from forest_node where id = ${root}`)[0]?.text ?? null).toBe(null);
+});
+
+test("revoke of the model destination during the merge call: not published, nothing more sent", async () => {
+  const s = await put("rk", linear("rk", 4));
+  const root = await holdRootMerge(s, () => revokeGrant(db, "personal", "derive", "llm"));
+  const n = merges().length;
+  await drain(db);
+  expect((await db`select text from forest_node where id = ${root}`)[0].text).toBe(null);
+  expect(merges().length).toBe(n);
+});
+
+test("a change between the check and the send: nothing is sent", async () => {
+  const s = await put("cs", linear("cs", 4));
+  const { hooks } = await import("./derive.ts");
+  await coldThenStructure();
+  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  hooks.afterCheck = async () => {
+    hooks.afterCheck = async () => {};
+    await db.begin(async (tx: any) => {
+      await tx`select pg_advisory_xact_lock(${BARRIER})`;
+      await tx`insert into vis_version values (${"s:" + s}, 2) on conflict (key) do update set v = vis_version.v + 1`;
+    });
+  };
+  const n = merges().length;
+  await runMerge(db, (await claimJobFor("merge", pair.id))!);
+  // The first attempt was refused before sending; the retry re-checks (the version moved, records did not).
+  expect(merges().length).toBe(n + 1);
+  expect((await db`select text from forest_node where id = ${pair.id}`)[0].text).not.toBe(null);
+});
+
+test("a fork child's mixed node: forgetting the parent removes it; the rebuild holds no parent text", async () => {
+  const pl = linear("fp", 3); // parent t0..t2 closed, t3 open
+  const P = await put("fp", pl);
+  const kid = [header("fk", "/x/fp.jsonl"), ...pl.slice(1, 7), msg("user", "k3", "a2", "c3"), msg("assistant", "k3a", "k3", "r"), msg("user", "k4", "k3a", "c4"), msg("assistant", "k4a", "k4", "r")];
+  const C = await put("fk", kid, P);
+  await drain(db);
+  const f = (await readForest(db, C, "k4a"))!;
+  expect(f.items[0].text).toBe("S(t0) + S(t1) + S(t2) + S(c3)");
+  await forgetSource(db, P);
+  await drain(db);
+  const all = (await nodes()).map((n) => n.text ?? "").join("|");
+  expect(all).not.toContain("S(t0)");
+  const g = (await readForest(db, C, "k4a"))!;
+  expect(JSON.stringify(g)).not.toContain("S(t0)");
+});
+
+test("a leaf summary replaced (same span and input): a new node; the old text is not read", async () => {
+  const s = await put("rs", linear("rs", 4));
+  await drain(db);
+  const [sp] = await db`select s.id from span s where s.source = ${s} and s.keys[1] like 'rs/u1:%'`;
+  // As a new summary of the same input would (another run of the model): new text, new hash.
+  await db`update span_summary set text = 'S(other)', text_hash = 'h-other' where span = ${sp.id}`;
+  await db`insert into job (kind, key) values ('forest', ${s})`;
+  await drain(db);
+  const f = (await readForest(db, s, await tipOf(s)))!;
+  expect(f.items[0].text).toBe("S(t0) + S(other) + S(t2) + S(t3)");
+});
+
+test("a forgotten record (tomb, before any cleanup): its leaf and every node over it are not read", async () => {
+  const s = await put("tb", linear("tb", 4));
+  await drain(db);
+  const [sp] = await db`select canons from span where source = ${s} and keys[1] like 'tb/u1:%'`;
+  await db`insert into tomb values (${"canon:" + sp.canons[0]})`;
+  const f = (await readForest(db, s, await tipOf(s)))!;
+  expect(JSON.stringify(f)).not.toContain("S(t1)");
+  expect(f.items.map((i) => i.text)).toEqual(["S(t0)", null, "S(t2) + S(t3)"]);
+});
+
+test("a node's text is written once: a second merge finishing later does not replace it", async () => {
+  const s = await put("wo", linear("wo", 4));
+  await coldThenStructure();
+  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  let release!: () => void;
+  hold = new Promise((r) => (release = r));
+  const n = merges().length;
+  const run = runMerge(db, (await claimJobFor("merge", pair.id))!);
+  while (merges().length === n) await Bun.sleep(5);
+  await db`update forest_node set text = 'first', text_hash = 'h1', deps = '{}' where id = ${pair.id}`;
+  release();
+  await run;
+  hold = null;
+  expect((await db`select text from forest_node where id = ${pair.id}`)[0].text).toBe("first");
+});
+
+test("a written node whose leaf input changed (context, same span) is not renewed while the old summary stands", async () => {
+  const s = await put("cx", linear("cx", 4));
+  await drain(db);
+  const [pair] = await db`select id, deps from forest_node where size = 2 and text like 'S(t2)%'`;
+  // Revise t1: the span [t2] keeps its records, its <context> changes.
+  const rev = linear("cx", 4);
+  rev[3] = msg("user", "u1", "a0", "t1 again");
+  await put("cx", rev);
+  await drain(db, ["project"]);
+  // Summaries not redone yet: the old [t2] summary row still has the old input.
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize'`;
+  await runMerge(db, (await claimJobFor("merge", pair.id))!);
+  expect((await db`select deps from forest_node where id = ${pair.id}`)[0].deps).toEqual(pair.deps);
+});
+
+test("summaries already current (no model call): the forest is still built from them", async () => {
+  const s = await put("up", linear("up", 4));
+  await drain(db);
+  await db`truncate forest_node`;
+  await db`delete from job where kind in ('forest', 'merge')`;
+  for (const r of await db`select span from span_summary`) await db`insert into job (kind, key) values ('summarize', ${r.span})`;
+  const n = requests.filter((r) => r.body.messages?.[0].content.startsWith("You summarize")).length;
+  await drain(db);
+  expect(requests.filter((r) => r.body.messages?.[0].content.startsWith("You summarize")).length).toBe(n);
+  expect((await readForest(db, s, await tipOf(s)))!.items.map((i) => i.size)).toEqual([4]);
+});
+
+test("a fork child made only of the parent's summarized spans reads the parent's nodes (same leaves, same ids)", async () => {
+  const pl = linear("pp", 4);
+  const P = await put("pp", pl);
+  await drain(db);
+  // The child repeats the parent's closed exchanges and opens its own tail: no new closed span.
+  const C = await put("pc", [header("pc", "/x/pp.jsonl"), ...pl.slice(1, 9), msg("user", "c1", "a3", "own tail")], P);
+  await drain(db);
+  const f = (await readForest(db, C, "c1"))!;
+  expect(f.items.map((i) => i.text)).toEqual(["S(t0) + S(t1) + S(t2) + S(t3)"]);
+});
