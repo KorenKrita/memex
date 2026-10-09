@@ -75,11 +75,11 @@ async function put(native: string, lines: string[], parent: string | null = null
   return decl.source;
 }
 /** A linear session of n closed exchanges (one more opens the tail): exchange i says `t<i>`. */
-const linear = (native: string, n: number, from = 0) => {
+const linear = (native: string, n: number, from = 0, reply = "r") => {
   const out = [header(native)];
   let prev: string | null = null;
   for (let i = 0; i <= n; i++) {
-    out.push(msg("user", `u${i}`, prev, `t${from + i}`), msg("assistant", `a${i}`, `u${i}`, `r${i}`));
+    out.push(msg("user", `u${i}`, prev, `t${from + i}`), msg("assistant", `a${i}`, `u${i}`, `${reply}${i}`));
     prev = `a${i}`;
   }
   return out;
@@ -302,23 +302,67 @@ test("revoke of the model destination during the merge call: not published, noth
   expect(merges().length).toBe(n);
 });
 
-test("a change between the check and the send: nothing is sent", async () => {
-  const s = await put("cs", linear("cs", 4));
+/** Merge `node` once, running `between` after its exact check and before its guarded send. */
+async function betweenCheckAndSend(node: string, between: () => Promise<unknown>) {
   const { hooks } = await import("./derive.ts");
-  await coldThenStructure();
-  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
   hooks.afterCheck = async () => {
     hooks.afterCheck = async () => {};
-    await db.begin(async (tx: any) => {
-      await tx`select pg_advisory_xact_lock(${BARRIER})`;
-      await tx`insert into vis_version values (${"s:" + s}, 2) on conflict (key) do update set v = vis_version.v + 1`;
-    });
+    await between();
   };
   const n = merges().length;
-  await runMerge(db, (await claimJobFor("merge", pair.id))!);
-  // The first attempt was refused before sending; the retry re-checks (the version moved, records did not).
-  expect(merges().length).toBe(n + 1);
-  expect((await db`select text from forest_node where id = ${pair.id}`)[0].text).not.toBe(null);
+  try {
+    await runMerge(db, (await claimJobFor("merge", node))!);
+  } finally {
+    hooks.afterCheck = async () => {};
+  }
+  return merges().length - n;
+}
+
+test("between the check and the send — forget, revoke, revision, canonical remap: zero merge requests", async () => {
+  // forget
+  let s = await put("cs1", linear("cs1", 4));
+  await coldThenStructure();
+  let [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  expect(await betweenCheckAndSend(pair.id, () => forgetSource(db, s))).toBe(0);
+  // revoke of the destination (other content: forget's content tombs match identical copies anywhere)
+  s = await put("cs2", linear("cs2", 4, 10, "q"));
+  await coldThenStructure();
+  [pair] = await db`select f.id from forest_node f where size = 2 and f.spans[1] in (select id from span where source = ${s} and keys[1] like 'cs2/u0:%')`;
+  expect(await betweenCheckAndSend(pair.id, () => revokeGrant(db, "personal", "derive", "llm"))).toBe(0);
+  await db`insert into grant_rule values ('personal', 'derive', 'llm') on conflict do nothing`;
+  // revision of a leaf's record
+  s = await put("cs3", linear("cs3", 4, 20, "w"));
+  await coldThenStructure();
+  [pair] = await db`select f.id from forest_node f where size = 2 and f.spans[1] in (select id from span where source = ${s} and keys[1] like 'cs3/u0:%')`;
+  const rev = linear("cs3", 4, 20, "w");
+  rev[1] = msg("user", "u0", null, "t0 changed");
+  expect(await betweenCheckAndSend(pair.id, () => put("cs3", rev))).toBe(0);
+});
+
+test("canonical remap between the check and the send: the child's mixed merge is not sent", async () => {
+  // The child holds records the parent has not synced yet (its own for now); the parent catches up.
+  const pl = linear("rm", 4);
+  const P = await put("rm", pl.slice(0, 3));
+  await drain(db);
+  const C = await put("rn", [header("rn", "/x/rm.jsonl"), ...pl.slice(1), msg("user", "k1", "a4", "kid")], P);
+  await coldThenStructure();
+  const [pair] = await db`select f.id from forest_node f where size = 2 and f.text is null order by id limit 1`;
+  expect(pair).toBeTruthy();
+  const sent = await betweenCheckAndSend(pair.id, async () => {
+    await put("rm", pl);
+    await drain(db, ["project"]);
+  });
+  expect(sent).toBe(0);
+  expect((await db`select ${"s:" + C} = any(array(select jsonb_object_keys(deps) from forest_node where id = ${pair.id} and deps is not null))`)).toBeTruthy();
+});
+
+test("forget of the parent while the child's mixed root is with the model: not published", async () => {
+  const pl = linear("mp", 3); // parent t0..t2 closed
+  const P = await put("mp", pl);
+  const C = await put("mc", [header("mc", "/x/mp.jsonl"), ...pl.slice(1, 7), msg("user", "k3", "a2", "c3"), msg("assistant", "k3a", "k3", "r"), msg("user", "k4", "k3a", "c4")], P);
+  const root = await holdRootMerge(C, async () => void (await forgetSource(db, P)));
+  expect((await db`select text from forest_node where id = ${root}`)[0]?.text ?? null).toBe(null);
+  expect(JSON.stringify(await db`select text from forest_node`)).not.toContain("S(t0)");
 });
 
 test("a fork child's mixed node: forgetting the parent removes it; the rebuild holds no parent text", async () => {
@@ -411,4 +455,93 @@ test("a fork child made only of the parent's summarized spans reads the parent's
   await drain(db);
   const f = (await readForest(db, C, "c1"))!;
   expect(f.items.map((i) => i.text)).toEqual(["S(t0) + S(t1) + S(t2) + S(t3)"]);
+});
+
+test("a parent's open tail closed on the child's view: summarized and in the child's forest without the parent moving", async () => {
+  const pl = linear("op", 2); // parent: t0, t1 closed, t2 open
+  const P = await put("op", pl);
+  const kid = [header("oc", "/x/op.jsonl"), ...pl.slice(1), msg("user", "k3", "a2", "c3"), msg("assistant", "k3a", "k3", "r"), msg("user", "k4", "k3a", "c4"), msg("assistant", "k4a", "k4", "r")];
+  const C = await put("oc", kid, P);
+  await drain(db);
+  const f = (await readForest(db, C, "k4a"))!;
+  expect(f.items.map((i) => i.text)).toEqual(["S(t0) + S(t1) + S(t2) + S(c3)"]);
+});
+
+test("a hot fork child of a cold parent, over the parent's summarized spans only: its forest is merged without a read", async () => {
+  const old = T;
+  T = "2020-01-01T00:00:00Z";
+  const pl = linear("cp", 4);
+  let P: string;
+  try {
+    P = await put("cp", pl);
+    await drain(db);
+  } finally {
+    T = old;
+  }
+  expect(merges().length).toBe(0); // the cold parent: structure only
+  await put("hc", [header("hc", "/x/cp.jsonl"), ...pl.slice(1, 9), msg("user", "c1", "a3", "own tail")], P!);
+  await drain(db);
+  expect(merges().length).toBe(3);
+  expect((await readForest(db, sourceIdOf("pi", "hc"), "c1"))!.complete).toBe(true);
+});
+
+test("a node planned under one model or prompt is not written by a merge running under another", async () => {
+  const s = await put("mm", linear("mm", 4));
+  await coldThenStructure();
+  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  process.env.MEMEX_LLM_MODEL = "fake-llm-b";
+  try {
+    const n = merges().length;
+    await runMerge(db, (await claimJobFor("merge", pair.id))!);
+    expect(merges().length).toBe(n); // nothing sent for a node whose id names another model
+    expect((await db`select text from forest_node where id = ${pair.id}`)[0].text).toBe(null);
+    await drain(db); // the structure is planned again under the current model
+  } finally {
+    process.env.MEMEX_LLM_MODEL = "fake-llm";
+  }
+  expect((await db`select model from forest_node where text is not null`).every((r: any) => r.model === "fake-llm-b")).toBe(true);
+});
+
+test("forget removes every node made from the source: through <context> only, and over spans re-cut away", async () => {
+  const pl = linear("fq", 4); // parent t0..t3 closed
+  const P = await put("fq", pl);
+  const C = await put("fr", [header("fr", "/x/fq.jsonl"), ...pl.slice(1, 9), msg("user", "c4", "a3", "c4"), msg("assistant", "d4", "c4", "r"),
+    msg("user", "c5", "d4", "c5"), msg("assistant", "d5", "c5", "r"), msg("user", "c6", "d5", "tail")], P);
+  await drain(db);
+  // [c4 c5]: both spans the child's own; c4's <context> is the parent's last exchange.
+  const [own] = await db`select id from forest_node where text = 'S(c4) + S(c5)'`;
+  expect(own).toBeTruthy();
+  // The child revises c5: [c4 c5'] is a new node, the old one stays stored (unreadable) for now.
+  const C2 = [header("fr", "/x/fq.jsonl"), ...pl.slice(1, 9), msg("user", "c4", "a3", "c4"), msg("assistant", "d4", "c4", "r"),
+    msg("user", "c5", "d4", "c5 v2"), msg("assistant", "d5", "c5", "r"), msg("user", "c6", "d5", "tail")];
+  await put("fr", C2, P);
+  await drain(db);
+  expect((await db`select 1 from forest_node where text = 'S(c4) + S(c5)'`).length).toBe(1);
+  await forgetSource(db, P);
+  expect((await db`select 1 from forest_node where id = ${own.id}`).length).toBe(0);
+  const left = await db`select text, deps from forest_node where text is not null`;
+  expect(left.filter((r: any) => ("s:" + P) in (r.deps ?? {})).length).toBe(0);
+  expect((await db`select count(*)::int n from span_summary where deps ? ${"s:" + P}`)[0].n).toBe(0);
+  await drain(db);
+  expect(JSON.stringify(await readForest(db, C, "c6"))).not.toContain("S(t");
+  await forgetSource(db, C);
+  expect((await db`select count(*)::int n from forest_node where text is not null`)[0].n).toBe(0);
+});
+
+test("a written root whose vector moved with no real change: one run re-checks down to the leaves and renews it", async () => {
+  const s = await put("rr", linear("rr", 4));
+  await drain(db);
+  const [root] = await db`select id, deps from forest_node where size = 4`;
+  const k = "s:" + s;
+  await db.begin(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(${BARRIER})`;
+    await tx`insert into vis_version values (${k}, 2) on conflict (key) do update set v = vis_version.v + 1`;
+  });
+  const n = requests.length;
+  expect(await runMerge(db, (await claimJobFor("merge", root.id))!)).toBe("done");
+  expect(requests.length).toBe(n); // no model call
+  const [now] = await db`select deps from forest_node where id = ${root.id}`;
+  expect(now.deps[k]).toBe(root.deps[k] + 1);
+  // The children were not touched: their vectors are still the old ones.
+  expect((await db`select deps from forest_node where size = 2`).every((r: any) => r.deps[k] === root.deps[k])).toBe(true);
 });

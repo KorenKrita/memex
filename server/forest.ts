@@ -104,8 +104,8 @@ export async function runForest(db: Db, job: Job) {
     const [have] = await tx`select count(*)::int n from span where id = any(${tx.array(spans, "text")})`;
     if (have.n !== spans.length) return fin; // re-projected or forgotten meanwhile; that queues this job again
     for (const n of p.nodes)
-      await tx`insert into forest_node (id, size, kids, kid_ids, spans)
-               values (${n.id}, ${n.size}, ${n.kids as any}, ${tx.array(n.kids.map(kidId), "text")}, ${tx.array(n.spans, "text")})
+      await tx`insert into forest_node (id, size, kids, kid_ids, spans, model, prompt_v)
+               values (${n.id}, ${n.size}, ${n.kids as any}, ${tx.array(n.kids.map(kidId), "text")}, ${tx.array(n.spans, "text")}, ${model}, ${FOREST_VERSION})
                on conflict (id) do nothing`;
     const ids = p.nodes.map((n) => n.id);
     const rows = await tx`select id, text is not null written, deps from forest_node where id = any(${tx.array(ids, "text")})`;
@@ -163,8 +163,13 @@ export async function runMerge(db: Db, job: Job) {
   let problem = "";
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
-      const [n] = await q`select text, text_hash, deps, kids from forest_node where id = ${job.key}`;
+      const [n] = await q`select text, text_hash, deps, kids, model, prompt_v, spans from forest_node where id = ${job.key}`;
       if (!n) return { ok: false as const, reason: "gone" };
+      // The id names the model and prompt it was planned for; another configuration plans its own nodes.
+      if (n.model !== model || n.prompt_v !== FOREST_VERSION) {
+        const srcs = await q`select distinct source from view where span_ids @> array[${n.spans[0]}]::text[]`;
+        return { ok: false as const, reason: "config-changed", replan: srcs.map((r: any) => r.source as string) };
+      }
       if (n.text !== null && (await unchanged(q, n.deps))) return { ok: false as const, reason: "current" };
       const texts: string[] = [];
       const deps: Record<string, number> = {};
@@ -178,6 +183,12 @@ export async function runMerge(db: Db, job: Job) {
     });
     // Not granted: remembered, so allowing it queues the merge again; anything else (a child not ready, a
     // withdrawn input, a node forgotten) ends here — the next summary or projection queues it again.
+    if (!c.ok && "replan" in c)
+      return db.begin(async (tx: Tx) => {
+        const fin = await finishJob(tx, job);
+        for (const s of c.replan as string[]) await enqueue(tx, "forest", s);
+        return fin;
+      });
     if (!c.ok) return skip(db, job, c.reason, (c as any).scopes ?? []);
     if (c.written)
       return publish(db, job, c.deps, (tx) => tx`update forest_node set deps = ${c.deps} where id = ${job.key} and text_hash = ${c.hash}`);

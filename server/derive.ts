@@ -82,14 +82,19 @@ function parseKey(key: string) {
 export async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> {
   const [span] = await q`select s.id, s.source, s.unit, s.records, s.context, s.input_fp, src.harness from span s join source src on src.id = s.source where s.id = ${spanId}`;
   if (!span) return { ok: false, reason: "gone" };
-  const closed = await q`select 1 from view v, jsonb_array_elements(v.spans) x
-                         where v.source = ${span.source} and x->>'id' = ${spanId} and (x->>'end')::int <= v.closed_end limit 1`;
-  if (!closed.length) return { ok: false, reason: "not-closed" };
+  // Closed on some view: its own source's, or a fork child's whose view goes on past it (a parent's open tail
+  // closes on the child). Evidence from another source counts while that source is not forgotten, and its
+  // version joins the vector (its withdrawal can take the evidence away).
+  const closers = (await q`select distinct v.source from view v, jsonb_array_elements(v.spans) x
+                           where x->>'id' = ${spanId} and (x->>'end')::int <= v.closed_end
+                             and not exists (select 1 from tomb t where t.key = 'source:' || v.source)`).map((r: any) => r.source as string);
+  if (!closers.length) return { ok: false, reason: "not-closed" };
+  const closer = closers.includes(span.source) ? null : closers.sort()[0];
   const want = [...span.records, ...span.context].map((r: any) => {
     const k = parseKey(r.key);
     return { ...k, source: sourceIdOf(span.harness, k.native) };
   });
-  const sources = [...new Set([span.source, ...want.map((w) => w.source)])];
+  const sources = [...new Set([span.source, ...want.map((w) => w.source), ...(closer ? [closer] : [])])];
   const srcs = await q`select id, scope from source where id = any(${q.array(sources, "text")})`;
   if (srcs.length !== sources.length) return { ok: false, reason: "source-missing" };
   const scopes = [...new Set<string>(srcs.map((s: any) => s.scope))];

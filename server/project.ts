@@ -247,8 +247,9 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       // An open tail closes by idling, with no new commit to wake us: look again when it would have.
       if (rows.some((r) => r.closed_end < r.keys.length)) await enqueue(tx, "project", source, {}, Math.max(0, idleCloseMs() - a.idleMs) + 1000);
       for (const id of closed)
-        if ((!wasClosed.has(id) || refresh.has(id)) && (own.has(id) || (await tx`select 1 from span where id = ${id} and source = ${source}`).length))
-          await enqueue(tx, "summarize", id);
+        // Also a parent's span that closes here first (its tail goes on in this child): idempotent if the
+        // parent already had it summarized.
+        if (!wasClosed.has(id) || refresh.has(id)) await enqueue(tx, "summarize", id);
       // Spans of this source no view uses any more and nothing else depends on: drop them.
       const gone = await tx`delete from span s where s.source = ${source} and not exists (select 1 from view v where v.span_ids @> array[s.id])
                             and not exists (select 1 from span u where u.unit = s.id and u.id <> s.id) returning id`;

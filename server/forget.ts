@@ -62,8 +62,13 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     const spans = (await tx`select id from span where source = ${source}`).map((r: any) => r.id as string);
     await tx`delete from job where state in ('queued', 'failed') and ((kind = 'project' and key = ${source}) or key = any(${tx.array(spans, "text")}))`;
     await tx`delete from derive_skip where span = any(${tx.array(spans, "text")})`;
-    // Forest nodes over any of its spans (text made from its summaries); a fork child's mixed nodes too.
-    await tx`delete from forest_node where spans && ${tx.array(spans, "text")}::text[]`;
+    // Forest nodes made from it: over any of its spans, or with it anywhere in their generation vector
+    // (a span's <context>, a fork child's inherited records, spans long since re-cut away). A node not yet
+    // written has no text; its structure over the source's spans goes too.
+    await tx`delete from forest_node where spans && ${tx.array(spans, "text")}::text[] or deps ? ${"s:" + source}`;
+    // Likewise a descendant's span summary made with it in the vector (its <context>, inherited records):
+    // the span stays, its summary is made again from what is left.
+    await tx`delete from span_summary where deps ? ${"s:" + source}`;
     await tx`delete from forest_access where source = ${source}`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
