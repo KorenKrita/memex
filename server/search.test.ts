@@ -6,7 +6,7 @@ import { connect, migrate, bump, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, Guarded, httpHooks, route, serve, transport } from "./http.ts";
-import { search, zoom, grep, GUARANTEED, searchHooks, mergeLabels } from "./search.ts";
+import { search, zoom, grep, GUARANTEED, searchHooks, mergeLabels, labelOf } from "./search.ts";
 import { forgetSource } from "./forget.ts";
 import { drain } from "./worker.ts";
 import { sourceIdOf } from "../client/records.ts";
@@ -1125,4 +1125,49 @@ test("a canonical record is stored under one source only (zoom by canonical id i
   await put("cw", [header("cw", { parentSession: "/x/cu.jsonl" }), pl[1], pl[2], msg("user", "k2", "a0", "go2")], "personal", P);
   await drain(db);
   expect((await db`select canon from lexical group by canon having count(distinct source) > 1`).length).toBe(0);
+});
+
+test("a single-view session with a reported leaf that names no record: branched, never on-path", async () => {
+  const s0 = await put("sv", linear("sv", [["alpha svtoken", "r"]]), "personal", null, "not-a-record");
+  await drain(db);
+  const r = await body(Q("svtoken", { dests: [] }));
+  expect(r.results.length).toBeGreaterThan(0);
+  for (const x of r.results.filter((x: any) => x.source === s0))
+    expect(x.path).toMatchObject({ label: "branched", view_basis: "unknown", reason: "leaf-not-projected" });
+});
+
+test("labels: one supporting record outside every view makes the evidence unlocated, not mixed", () => {
+  const t = { views: [{ ord: 0, tip: "a", keys: ["k1", "k2"] }, { ord: 1, tip: "b", keys: ["k1", "k3"] }], v: { tip: "a", keys: ["k1", "k2"] }, basis: "observed" as const, at: null };
+  expect(labelOf(t, ["k1", "k2"])).toBe("on-path");
+  expect(labelOf(t, ["k3"])).toBe("off-path");
+  expect(labelOf(t, ["k2", "k3"])).toBe("mixed");
+  expect(labelOf(t, ["k1", "gone"])).toBe("unlocated");
+  expect(labelOf(t, [])).toBe("unlocated");
+  expect(labelOf({ ...t, v: undefined, basis: "unknown" as const }, ["k1"])).toBe("branched");
+  expect(labelOf({ views: [t.views[0]], basis: "unknown" as const, at: null }, ["k1"])).toBe("branched");
+});
+
+test("a unit's representations are labelled against one reference view, the one its view_key names", async () => {
+  // Parent S = [u0 a0 a1]; a child forks after a0 (P = [u0 a0] belongs to the same unit). The parent's
+  // own observed leaf is on its branch; every representation's label must come from the view in view_key.
+  const P = sourceIdOf("pi", "rf");
+  const pl = [header("rf"), msg("user", "u0", null, "alpha rftoken fact"), msg("assistant", "a0", "u0", "first part"), msg("assistant", "a1", "a0", "later part")];
+  summaryOf = (input) => (input.includes("later part") ? "S rftoken whole" : input.includes("first part") ? "P rftoken prefix" : "other");
+  await put("rf", pl, "personal", null, "a1");
+  await drain(db);
+  await put("rk", [header("rk", { parentSession: "/x/rf.jsonl" }), pl[1], pl[2], msg("assistant", "b1", "a0", "child branch"), msg("user", "k1", "b1", "go")], "personal", P, "not-projected");
+  await drain(db);
+  // The child's own basis is unknown; the unit belongs to the parent, whose view is the reference.
+  const r = await body(Q("rftoken", { dests: [] }));
+  const u = r.results.find((x: any) => x.reps?.length >= 2);
+  expect(u).toBeTruthy();
+  const vk = u.path.view_key;
+  const views = await db`select tip, keys from view where source = ${vk.source}`;
+  const ref = views.find((v: any) => v.tip === vk.tip)!;
+  for (const p of u.reps) {
+    const [sp] = await db`select keys from span where id = ${p.span}`;
+    const want = labelOf({ views: views.map((v: any, i: number) => ({ ord: i, tip: v.tip, keys: v.keys })), v: ref, basis: vk.basis, at: null }, sp.keys);
+    expect([p.span, p.path]).toEqual([p.span, want]);
+  }
+  expect(u.path).toMatchObject({ label: "on-path", view_key: { source: P, tip: "a1", basis: "observed" } });
 });

@@ -422,9 +422,10 @@ async function targetView(q: Tx, source: string, leaf?: { tip: string; at: strin
 }
 
 /** Path label of evidence `keys` against a target view (§4.3). */
-function labelOf(t: TargetView, keys: string[]): string {
-  if (!keys.length || !t.views.some((v) => keys.every((k) => v.keys.includes(k)) || keys.some((k) => v.keys.includes(k)))) return "unlocated";
-  if (t.views.length === 1) return keys.every((k) => t.views[0].keys.includes(k)) ? "on-path" : "unlocated";
+export function labelOf(t: TargetView, keys: string[]): string {
+  // Any supporting record that no view of the target holds: the evidence cannot be placed.
+  if (!keys.length || keys.some((k) => !t.views.some((v) => v.keys.includes(k)))) return "unlocated";
+  // No usable view (unknown basis): no on/off-path conclusion, even with a single view.
   if (!t.v) return "branched";
   const on = keys.filter((k) => t.v!.keys.includes(k)).length;
   return on === keys.length ? "on-path" : on === 0 ? "off-path" : "mixed";
@@ -468,9 +469,12 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       };
       const labels = new Map<string, any>();
       for (const c of rc.chosen) {
-        const src = c.kind === "record" ? c.hit!.source : c.reps[0].source;
+        // One reference view per result: a record's source, a unit's own span's source (not whichever
+        // representation ranked first). Every representation is labelled against that same view.
+        const unitSrc = c.kind === "unit" ? (await q`select source from span where id = ${c.key.slice(5)}`)[0]?.source : undefined;
+        const src: string = c.kind === "record" ? c.hit!.source : unitSrc && b.valid.has(unitSrc) ? unitSrc : c.reps[0].source;
         const t = await viewOf(src);
-        const reps = await Promise.all(c.reps.map(async (p) => labelOf(await viewOf(p.source), p.keys)));
+        const reps = c.reps.map((p) => labelOf(t, p.keys));
         // A unit's label merges all its representations (the excerpt never upgrades it); a record's is its own.
         const label = c.kind === "record" ? labelOf(t, [c.hit!.key]) : mergeLabels(reps);
         const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: b.valid.get(src)!.deps["s:" + src] ?? null, at: t.at };
