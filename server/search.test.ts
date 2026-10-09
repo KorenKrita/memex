@@ -349,7 +349,7 @@ test("grep: exact substring with record positions; scope and forget filter it; r
   await drain(db);
   let r = (await grep(db, T0({ pattern: "/etc/memex.conf" }))).body as any;
   expect(r.hits.length).toBe(2);
-  expect(r.hits.every((h: any) => h.source === s && h.snippet.includes("/etc/memex.conf"))).toBe(true);
+  expect(r.hits.every((h: any) => h.in === s && h.snippet.includes("/etc/memex.conf"))).toBe(true);
   r = (await grep(db, T0({ pattern: "memex\\.conf a", regex: true }))).body as any;
   expect(r.hits.length).toBe(1);
   await expect(grep(db, T0({ pattern: "(", regex: true }))).rejects.toThrow("pattern invalid");
@@ -396,6 +396,11 @@ test("zoom over HTTP: another scope's span is not readable", async () => {
   const res = await fetch(`http://127.0.0.1:${api.port}/v1/zoom`, { method: "POST", headers: { authorization: `Bearer ${key}` }, body: JSON.stringify(T0({ id: "span:" + sp.id })) });
   expect(res.status).toBe(404);
   expect(await res.text()).not.toContain("work secret");
+  // Naming the other scope's source explicitly does not make its records readable either.
+  const r2 = await fetch(`http://127.0.0.1:${api.port}/v1/zoom`, { method: "POST", headers: { authorization: `Bearer ${key}` },
+    body: JSON.stringify(T0({ id: "record:" + w + ":a0", in: w })) });
+  expect(r2.status).toBe(404);
+  expect(await r2.text()).not.toContain("work secret");
 });
 
 test("zoom over HTTP: a forget committed before delivery is not answered from the old state", async () => {
@@ -725,6 +730,33 @@ test("forget a querying session that never reached L0, before delivery: not answ
   expect(await res.text()).not.toContain("history-four");
 });
 
+test("zoom and grep: forgetting the querying session before delivery is not answered (hit, no hit, never synced)", async () => {
+  const H = await put("hist5", linear("hist5", [["alpha history-five", "ANSWER-five"]]));
+  await drain(db);
+  const [sp] = await db`select id from span where source = ${H} limit 1`;
+  const asker = await put("asker5", linear("asker5", [["asking", "r"]]));
+  await drain(db);
+  const cases: [string, string, object][] = [
+    ["synced, zoom", asker, { id: "span:" + sp.id }],
+    ["synced, grep hit", asker, { pattern: "history-five" }],
+    ["synced, grep no hit", asker, { pattern: "nothing-matches-this" }],
+    ["never synced, zoom", sourceIdOf("pi", "never5"), { id: "span:" + sp.id }],
+    ["never synced, grep hit", sourceIdOf("pi", "never5b"), { pattern: "history-five" }],
+  ];
+  for (const [name, A, b] of cases) {
+    let fired = 0;
+    httpHooks.beforeGuard = async () => {
+      if (fired++) return;
+      await forgetSource(db, A);
+    };
+    const path = "id" in b ? "zoom" : "grep";
+    const res = await fetch(`http://127.0.0.1:${api.port}/v1/${path}`, { method: "POST", headers: { authorization: `Bearer ${key}` },
+      body: JSON.stringify(T0({ ...b, source: A })) });
+    expect([name, res.status]).toEqual([name, 410]);
+    expect(await res.text()).not.toContain("five");
+  }
+});
+
 // ---------- corrections reach every rerank document that needs them ----------
 
 const lastRerank = () => requests.filter((x) => x.path.endsWith("/rerank")).at(-1)!.body.documents as string[];
@@ -975,13 +1007,30 @@ test("grep finds a literal across a chunk boundary and gives its byte offset in 
 });
 
 test("grep regex: one engine (Postgres), across chunks, with the match's own position and length", async () => {
-  await put("gy", linear("gy", [["q", "x".repeat(2040) + " xport=1 port=8080;"]]));
+  // The 2,048-character cut falls inside "port=8080" (chunk 0 ends with "por").
+  await put("gy", linear("gy", [["q", "x".repeat(2036) + " xport=1 port=8080;"]]));
   await drain(db);
+  expect((await db`select text from lexical where key like 'gy/a0:%' and part = 0`)[0].text.endsWith("por")).toBe(true);
   // \m is an ARE word-start: JS would not understand it (a second engine would disagree or throw).
   const g = (await grep(db, T0({ pattern: "\\mport=[0-9]+", regex: true }))).body as any;
   expect(g.hits.length).toBe(1);
-  expect(g.hits[0]).toMatchObject({ offset: 2049, length: 9 }); // not "xport" (no word start there)
+  expect(g.hits[0]).toMatchObject({ offset: 2045, length: 9 }); // not "xport" (no word start there)
   expect(g.hits[0].snippet).toContain("port=8080");
+});
+
+test("grep → zoom: the hit's offset is where zoom of the returned record shows the match (multi-record entry)", async () => {
+  const s0 = await put("gz", [header("gz"), msg("user", "u0", null, "hi"),
+    JSON.stringify({ type: "message", id: "a0", parentId: "u0", timestamp: T, message: { role: "assistant", content: [
+      { type: "text", text: "前文中文" }, { type: "toolCall", id: "c1", name: "bash", arguments: { cmd: "ls /tmp/gz-dir" } }] } })]);
+  await drain(db);
+  for (const [pattern, regex] of [["gz-dir", false], ["bash \\{", true], ["中文", false]] as const) {
+    const g = (await grep(db, T0({ pattern, regex }))).body as any;
+    expect(g.hits.length).toBe(1);
+    const h = g.hits[0];
+    const z = (await zoom(db, T0({ id: h.record, in: h.in, offset: h.offset, limit: h.length }))).body as any;
+    expect([pattern, z.records.map((x: any) => x.text).join("")]).toEqual([pattern, pattern.replace("\\", "")]);
+  }
+  void s0;
 });
 
 test("zoom record: every record of the host entry, in order; pages cut on character boundaries", async () => {
@@ -1040,4 +1089,40 @@ test("the trace records every stage: channel tops, fused order, the cut, the ret
   const j = JSON.stringify(d);
   expect(j).not.toContain("tracetok");
   expect(j).not.toContain("alpha");
+});
+
+test("grep → zoom across fork copies: a revised parent record is not shared; `in` picks a readable copy, never another", async () => {
+  const P = sourceIdOf("pi", "rv");
+  const v1 = msg("assistant", "a0", "u0", "old revision rvtoken");
+  await put("rv", [header("rv"), msg("user", "u0", null, "q"), v1, msg("assistant", "a1", "a0", "shared rvshared")]);
+  await drain(db);
+  const C = await put("rw", [header("rw", { parentSession: "/x/rv.jsonl" }), msg("user", "u0", null, "q"), v1,
+    msg("assistant", "a1", "a0", "shared rvshared"), msg("user", "k1", "a1", "go")], "personal", P);
+  await drain(db);
+  // An inherited record is stored once, under its owner: one hit, expanded from the source the hit names;
+  // naming another (readable) source does not fall back to the owner.
+  const sh = (await grep(db, T0({ pattern: "rvshared" }))).body as any;
+  expect(sh.hits.map((h: any) => h.in)).toEqual([P]);
+  expect(((await zoom(db, T0({ id: sh.hits[0].record, in: sh.hits[0].in }))).body as any).source).toBe(P);
+  await expect(zoom(db, T0({ id: sh.hits[0].record, in: C }))).rejects.toThrow("not found");
+  // The parent's a0 is revised in place: the child's copy stops matching and becomes the child's own record.
+  await put("rv", [header("rv"), msg("user", "u0", null, "q"), msg("assistant", "a0", "u0", "new revision changed"), msg("assistant", "a1", "a0", "shared rvshared")]);
+  await drain(db);
+  const g = (await grep(db, T0({ pattern: "old revision" }))).body as any;
+  expect(g.hits.map((h: any) => [h.record, h.in])).toEqual([["record:" + C + ":a0", C]]);
+  const z = (await zoom(db, T0({ id: g.hits[0].record }))).body as any;
+  expect(z.records.map((x: any) => x.text).join("")).toBe("old revision rvtoken");
+  // A copy that is not readable is refused, not replaced by a readable one.
+  await expect(zoom(db, T0({ id: sh.hits[0].record, in: sourceIdOf("pi", "nope") }))).rejects.toThrow("not found");
+});
+
+test("a canonical record is stored under one source only (zoom by canonical id is unambiguous)", async () => {
+  const P = sourceIdOf("pi", "cu");
+  const pl = [header("cu"), msg("user", "u0", null, "q"), msg("assistant", "a0", "u0", "x")];
+  await put("cu", pl);
+  await drain(db);
+  await put("cv", [header("cv", { parentSession: "/x/cu.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "go")], "personal", P);
+  await put("cw", [header("cw", { parentSession: "/x/cu.jsonl" }), pl[1], pl[2], msg("user", "k2", "a0", "go2")], "personal", P);
+  await drain(db);
+  expect((await db`select canon from lexical group by canon having count(distinct source) > 1`).length).toBe(0);
 });

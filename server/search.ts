@@ -575,7 +575,7 @@ function toolReq(b: any): ToolReq {
   return { source: r.source, scope: r.scope, purpose: r.purpose };
 }
 const depsOf = (b: Awaited<ReturnType<typeof basis>>, sources: string[]) => {
-  const d: Record<string, number> = { "d:memex": b.dMemex };
+  const d: Record<string, number> = { ...b.qDeps }; // the querying session's own version and read grant, always
   for (const s of sources) Object.assign(d, b.valid.get(s)!.deps);
   return d;
 };
@@ -643,7 +643,11 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       if (id.startsWith("record:")) {
         const canon = id.slice(7);
         // One canonical record is one host entry; it may hold several records (#0 text, #1 a tool call ...).
-        const [row] = await q`select source from lexical l where canon = ${canon} and source = any(${q.array(valid, "text")})
+        // Fork copies hold the same canonical record and may keep different revisions: `in` (from a grep hit or
+        // a view key) picks the copy; it must be readable, never silently replaced by another one.
+        const inSrc = typeof body.in === "string" ? body.in : null;
+        if (inSrc && !b.valid.has(inSrc)) throw new HttpError(404, "not found or not readable");
+        const [row] = await q`select source from lexical l where canon = ${canon} and source = any(${q.array(inSrc ? [inSrc] : valid, "text")})
                               and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by source limit 1`;
         if (!row) throw new HttpError(404, "not found or not readable");
         const keys: string[] = (await q`select distinct key from lexical where canon = ${canon} and source = ${row.source}`).map((x: any) => x.key);
@@ -735,9 +739,19 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
         if (/regular expression|canceling statement/.test(String(e?.message))) throw new HttpError(400, "pattern invalid or too slow");
         throw e;
       });
+      // Coordinates of mem_zoom on `record:<canon>` with `in: <source>`: the host entry's records (#0, #1 …)
+      // laid end to end, in bytes. The hit's offset adds the lengths of the entry's earlier records.
+      const before = rows.length
+        ? await q`select h.key, coalesce(sum(octet_length(l.text)), 0)::bigint n
+                  from unnest(${q.array(rows.map((x: any) => x.key), "text")}, ${q.array(rows.map((x: any) => x.source), "text")}) h(key, source)
+                  left join lexical l on l.source = h.source and l.canon = (select canon from lexical where key = h.key and source = h.source limit 1)
+                   and split_part(l.key, '#', 2)::int < split_part(h.key, '#', 2)::int
+                  group by h.key`
+        : [];
+      const lead = new Map<string, number>(before.map((x: any) => [x.key, Number(x.n)]));
       const hits = rows.map((x: any) => ({
-        record: "record:" + x.canon, key: x.key, source: x.source, kind: x.kind,
-        offset: Number(x.pre), length: Number(x.len), // UTF-8 bytes in the record's text
+        record: "record:" + x.canon, in: x.source, key: x.key, kind: x.kind,
+        offset: lead.get(x.key)! + Number(x.pre), length: Number(x.len), // UTF-8 bytes, mem_zoom's record coordinates
         snippet: x.snippet,
       }));
       return { deps: depsOf(b, [...new Set<string>(rows.map((x: any) => x.source))]), body: { hits, truncated: rows.length >= GREP_MAX } };
