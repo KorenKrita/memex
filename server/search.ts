@@ -14,6 +14,7 @@
 //     scope whose text would be sent; otherwise `rerank_skipped`.
 // The response is `Guarded` (http.ts): its version vector is compared again under the shared barrier
 // before it is written, so a forget or revoke that commits first is never answered from the old state.
+import { createHash } from "node:crypto";
 import { type Db, type Tx, addMigration } from "./db.ts";
 import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
@@ -426,6 +427,17 @@ async function targetView(q: Tx, source: string, leaf?: { tip: string; at: strin
   return { views, v: views.find((x) => x.tip === t?.rec) ?? views.at(-1)!, basis: "inferred-tail", at: null };
 }
 
+/**
+ * The version a view key pins: a fingerprint of the target source's whole read basis (its own `s:` version and
+ * every fork ancestor's it was projected from). Any change to the text or partition behind the view moves it,
+ * including an in-place revision with the same tip and a revision in a parent the view inherits.
+ */
+const viewVersion = (b: { valid: Map<string, Src> }, src: string) => {
+  const d = b.valid.get(src)!.deps;
+  const flat = Object.keys(d).filter((k) => k.startsWith("s:")).sort().map((k) => `${k}=${d[k]}`).join(",");
+  return createHash("sha256").update(flat).digest("hex").slice(0, 16);
+};
+
 /** Path label of evidence `keys` against a target view (§4.3). */
 export function labelOf(t: TargetView, keys: string[]): string {
   // Any supporting record that no view of the target holds: the evidence cannot be placed.
@@ -482,7 +494,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         const reps = c.reps.map((p) => labelOf(t, p.keys));
         // A unit's label merges all its representations (the excerpt never upgrades it); a record's is its own.
         const label = c.kind === "record" ? labelOf(t, [c.hit!.key]) : mergeLabels(reps);
-        const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: b.valid.get(src)!.deps["s:" + src] ?? null, at: t.at };
+        const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: viewVersion(b, src), at: t.at };
         labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps });
       }
       // Index lag (§6.5): derived work not yet published when this search read the index.
@@ -658,14 +670,35 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
     const out = await snapshot(db, async (q) => {
       const b = await basis(q, r);
       const valid = [...b.valid.keys()];
+      // The view: the search result's `view_key` as returned, or `leaf` for the querying session's own current
+      // view. A key pins a version (viewVersion): when the source has changed since, the request is refused
+      // (409 view-stale) for spans and records alike, never answered with the current text or neighbours.
+      let vkIn: { source: string; tip: string | null; basis: ViewBasis } | null = null;
+      if (body.view_key !== undefined) {
+        const k = body.view_key;
+        if (!k || typeof k !== "object" || typeof k.source !== "string" || (typeof k.tip !== "string" && k.tip !== null)
+            || !["observed", "inferred-tail", "unknown"].includes(k.basis) || typeof k.version !== "string") throw new HttpError(400, "view_key");
+        if (!b.valid.has(k.source)) throw new HttpError(404, "not found or not readable");
+        if (k.version !== viewVersion(b, k.source)) throw new HttpError(409, "view-stale");
+        vkIn = { source: k.source, tip: k.tip, basis: k.basis };
+      } else if (typeof body.leaf === "string") {
+        if (!b.valid.has(r.source)) throw new HttpError(404, "not found or not readable");
+        vkIn = { source: r.source, tip: body.leaf, basis: "observed" };
+      }
       if (id.startsWith("record:")) {
         const canon = id.slice(7);
         // One canonical record is one host entry; it may hold several records (#0 text, #1 a tool call ...).
         // Fork copies hold the same canonical record and may keep different revisions: `in` (from a grep hit or
         // a view key) picks the copy; it must be readable, never silently replaced by another one.
+        // With a view key the record must be on one of its source's views (the text may be owned by a fork
+        // parent: the view's record keys name the version it shows).
         const inSrc = typeof body.in === "string" ? body.in : null;
         if (inSrc && !b.valid.has(inSrc)) throw new HttpError(404, "not found or not readable");
+        const onView: string[] | null = vkIn
+          ? (await q`select distinct k from view v, unnest(v.keys) k where v.source = ${vkIn.source}`).map((x: any) => x.k)
+          : null;
         const [row] = await q`select source from lexical l where canon = ${canon} and source = any(${q.array(inSrc ? [inSrc] : valid, "text")})
+                              and (${onView === null} or key = any(${q.array(onView ?? [], "text")}))
                               and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by source limit 1`;
         if (!row) throw new HttpError(404, "not found or not readable");
         const keys: string[] = (await q`select distinct key from lexical where canon = ${canon} and source = ${row.source}`).map((x: any) => x.key);
@@ -673,32 +706,21 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         const t = await texts(q, keys, [row.source]);
         const pg = page(keys.map((k) => ({ key: k, buf: Buffer.from(t.get(k)?.text ?? "") })), offset, limit);
         return {
-          deps: depsOf(b, [row.source]),
-          body: { id, source: row.source, records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
+          deps: depsOf(b, [row.source, ...(vkIn ? [vkIn.source] : [])]),
+          body: { id, source: row.source, ...(vkIn ? { view_key: { ...vkIn, version: viewVersion(b, vkIn.source) } } : {}), records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
         };
       }
       const sid = id.replace(/^(span|unit):/, "");
       const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
       if (!sp || (await q`select 1 from tomb where key = any(${q.array((sp.canons as string[]).map((c) => "canon:" + c), "text")}) limit 1`).length)
         throw new HttpError(404, "not found or not readable");
-      // The view: the search result's `view_key` as given (its source may be a fork child whose view holds this
-      // span), or `leaf` for the querying session's own view, else the target rule of search labels. A key that
-      // names no view holding this span is reported (view_basis unknown, no neighbours), never replaced; a key
-      // from an older version of its source is still followed when its tip exists (a tip fixes the path) and is
-      // marked stale with the current version.
-      const vkIn = body.view_key && typeof body.view_key === "object" ? body.view_key
-        : typeof body.leaf === "string" ? { source: r.source, tip: body.leaf, basis: "observed" } : null;
-      let vsrc: string = sp.source, v: any, vb: ViewBasis, reason: string | null = null, stale: object | null = null;
+      let vsrc: string = sp.source, v: any, vb: ViewBasis, reason: string | null = null;
       if (vkIn) {
-        if (typeof vkIn.source !== "string" || typeof vkIn.tip !== "string" && vkIn.tip !== null) throw new HttpError(400, "view_key");
-        if (!b.valid.has(vkIn.source)) throw new HttpError(404, "not found or not readable");
-        vsrc = vkIn.source;
+        vsrc = vkIn.source; // may be a fork child whose view holds this parent-owned span
         const views = await q`select ord, tip, spans from view where source = ${vsrc} and span_ids @> array[${sid}]::text[]`;
         v = vkIn.tip === null ? undefined : views.find((x: any) => x.tip === vkIn.tip);
-        vb = v && ["observed", "inferred-tail"].includes(vkIn.basis) ? vkIn.basis : "unknown";
+        vb = v && vkIn.basis !== "unknown" ? vkIn.basis : "unknown";
         if (!v) reason = vkIn.tip === null ? "view-unknown" : "view-not-found";
-        const now = b.valid.get(vsrc)!.deps["s:" + vsrc];
-        if (v && Number.isInteger(vkIn.version) && vkIn.version !== now) stale = { version: vkIn.version, version_now: now };
       } else {
         const t = await targetView(q, sp.source);
         const views = await q`select ord, tip, spans from view where source = ${sp.source} and span_ids @> array[${sid}]::text[]`;
@@ -717,8 +739,8 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       return {
         deps: depsOf(b, [sp.source, vsrc, ...[...t.values()].map((x) => x.source)]),
         body: {
-          id: "span:" + sid, source: sp.source, view_key: { source: vsrc, tip: v?.tip ?? null, basis: vb, version: b.valid.get(vsrc)!.deps["s:" + vsrc] ?? null },
-          view_basis: vb, ...(reason ? { reason } : {}), ...(stale ? { stale } : {}), summary, records, more, next_offset: pg.next,
+          id: "span:" + sid, source: sp.source, view_key: { source: vsrc, tip: v?.tip ?? null, basis: vb, version: viewVersion(b, vsrc) },
+          view_basis: vb, ...(reason ? { reason } : {}), summary, records, more, next_offset: pg.next,
           before: i > 0 ? "span:" + order[i - 1] : null, after: i >= 0 && i < order.length - 1 ? "span:" + order[i + 1] : null,
         },
       };

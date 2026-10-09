@@ -921,7 +921,7 @@ test("no reported leaf: results carry the inferred-tail view key; the other bran
   const r = await body(Q("brtoken", { dests: [] }));
   const on = rec(r, "brtoken-on"), off = rec(r, "brtoken-off");
   expect(on.path).toMatchObject({ label: "on-path", view_basis: "inferred-tail", view_key: { source: src, tip: "b2", basis: "inferred-tail" } });
-  expect(typeof on.path.view_key.version).toBe("number");
+  expect(on.path.view_key.version).toMatch(/^[0-9a-f]{16}$/);
   expect(off.path.label).toBe("off-path");
 });
 
@@ -990,26 +990,23 @@ test("zoom takes the search result's view_key as returned; a key it cannot find 
   expect(z).toMatchObject({ view_key: { source: src, tip: "b2" }, after: "span:" + B1 });
 });
 
-test("zoom view_key: an older version is followed and marked stale; an unreadable or bad key is refused", async () => {
-  const { src, P, B1 } = await branched();
+test("zoom view_key: any later change to the key's source is refused as stale; an unreadable or bad key too", async () => {
+  const { P } = await branched();
   const vk = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
   const l1 = [header("br"), msg("user", "u0", null, "alpha choose db"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis brtoken-off"),
     msg("user", "u1", "a1", "next q"), msg("assistant", "a2", "u1", "ok"), msg("assistant", "b1", "a0", "only postgres brtoken-on"), msg("user", "v1", "b1", "go on"),
     msg("assistant", "b2", "v1", "fine")];
-  // The other branch grows: a new version, b2 is still a tip and fixes the same path → followed, marked stale.
+  // Even growth on the other branch (b2 still a tip) is a new version: the key no longer pins what is stored.
   await put("br", [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure")]);
   await drain(db);
-  let z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
-  expect(z).toMatchObject({ view_key: { tip: "b2" }, after: "span:" + B1, stale: { version: vk.version } });
-  expect(z.stale.version_now).toBeGreaterThan(vk.version);
-  // This branch grows past b2: b2 is no longer a tip → reported, not replaced by the new tip.
-  await put("br", [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure"), msg("user", "v2", "b2", "more"), msg("assistant", "b3", "v2", "sure")]);
-  await drain(db);
-  z = (await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any;
-  expect(z).toMatchObject({ view_basis: "unknown", reason: "view-not-found", after: null });
-  await expect(zoom(db, T0({ id: "span:" + P, view_key: { ...vk, source: sourceIdOf("pi", "nobody") } }))).rejects.toThrow("not found");
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: vk }))).rejects.toThrow("view-stale");
+  // The fresh key from a new search works.
+  const vk2 = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
+  expect(vk2.tip).toBe("a3"); // the tail moved to the grown branch; P is not on it
+  expect(((await zoom(db, T0({ id: "span:" + P, view_key: vk2 }))).body as any)).toMatchObject({ view_basis: "unknown", reason: "view-not-found" });
+  expect(((await zoom(db, T0({ id: "span:" + P, view_key: { ...vk2, tip: "b2" } }))).body as any).view_key.tip).toBe("b2");
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: { ...vk2, source: sourceIdOf("pi", "nobody") } }))).rejects.toThrow("not found");
   await expect(zoom(db, T0({ id: "span:" + P, view_key: { tip: "b2" } }))).rejects.toThrow("view_key");
-  void src;
 });
 
 test("zoom along a fork child's view: a span stored under the parent navigates in the child's order", async () => {
@@ -1022,8 +1019,9 @@ test("zoom along a fork child's view: a span stored under the parent navigates i
   const [shared] = await db`select id from span where source = ${Pp} and keys[1] like 'fz/u0:%'`;
   const [childNext] = await db`select id from span where source = ${C} and keys[1] like 'fc/k1:%'`;
   const [parentNext] = await db`select id from span where source = ${Pp} and keys[1] like 'fz/u1:%'`;
-  const cv = (await db`select tip from view where source = ${C}`)[0];
-  let z = (await zoom(db, T0({ id: "span:" + shared.id, view_key: { source: C, tip: cv.tip, basis: "observed" } }))).body as any;
+  const vk = (await body(Q("child next", { dests: [] }))).results.find((x: any) => x.source === C).path.view_key;
+  expect(vk).toMatchObject({ source: C, tip: "k2" });
+  let z = (await zoom(db, T0({ id: "span:" + shared.id, view_key: vk }))).body as any;
   expect(z).toMatchObject({ source: Pp, view_key: { source: C, tip: "k2" }, after: "span:" + childNext.id });
   z = (await zoom(db, T0({ id: "span:" + shared.id }))).body as any;
   expect(z).toMatchObject({ view_key: { source: Pp }, after: "span:" + parentNext.id });
@@ -1226,4 +1224,49 @@ test("a unit's representations are labelled against one reference view, the one 
     expect([p.span, p.path]).toEqual([p.span, want]);
   }
   expect(u.path).toMatchObject({ label: "on-path", view_key: { source: P, tip: "a1", basis: "observed" } });
+});
+
+// ---------- a view_key pins a version: expanding it after a change is refused, not answered with new text ----------
+
+test("zoom with an old view_key after an in-place revision (same tip): refused as stale, span and record", async () => {
+  const s0 = await put("pv", linear("pv", [["alpha pvtoken original", "reply"]]));
+  await drain(db);
+  const r = await body(Q("pvtoken", { dests: [] }));
+  const hit = r.results.find((x: any) => x.key.startsWith("record:"));
+  const unit = r.results.find((x: any) => x.key.startsWith("unit:"));
+  expect(hit && unit).toBeTruthy();
+  // Revised in place: same ids, same tip (a0), different text.
+  await put("pv", [header("pv"), msg("user", "u0", null, "alpha pvtoken REVISED"), msg("assistant", "a0", "u0", "reply")]);
+  await drain(db);
+  expect((await db`select tip from view where source = ${s0}`).map((x: any) => x.tip)).toEqual([hit.path.view_key.tip]);
+  for (const x of [hit, unit]) {
+    const res = await zoom(db, T0({ id: x.key, view_key: x.path.view_key })).then((z) => z.body as any, (e) => e);
+    expect([x.key, res.status, String(res.message)]).toEqual([x.key, 409, "view-stale"]);
+  }
+  // Without a key the current text is served, as asked.
+  expect(((await zoom(db, T0({ id: hit.key }))).body as any).records[0].text).toContain("REVISED");
+});
+
+test("zoom with an old view_key after the fork parent's record was revised: refused as stale", async () => {
+  const P = sourceIdOf("pi", "pp");
+  const pl = [header("pp"), msg("user", "u0", null, "alpha pptoken inherited"), msg("assistant", "a0", "u0", "x")];
+  await put("pp", pl);
+  await drain(db);
+  const C = await put("pc", [header("pc", { parentSession: "/x/pp.jsonl" }), pl[1], pl[2], msg("user", "k1", "a0", "child pptoken own"), msg("assistant", "k2", "k1", "y")], "personal", P);
+  await drain(db);
+  const own = (await body(Q("pptoken own", { dests: [] }))).results.find((x: any) => x.source === C && x.key.startsWith("record:"));
+  expect(own.path.view_key.source).toBe(C);
+  // The parent revises a record the child inherited: the child's view changes, the child's own file does not.
+  await put("pp", [header("pp"), msg("user", "u0", null, "alpha pptoken inherited, revised"), pl[2]]);
+  await drain(db);
+  const res = await zoom(db, T0({ id: own.key, view_key: own.path.view_key })).then((z) => z.body as any, (e) => e);
+  expect([res.status, String(res.message)]).toEqual([409, "view-stale"]);
+});
+
+test("an explicit view_key must be whole: basis and version are required and typed", async () => {
+  const s0 = await put("pw", linear("pw", [["alpha pwtoken", "reply"]]));
+  await drain(db);
+  const vk = (await body(Q("pwtoken", { dests: [] }))).results[0].path.view_key;
+  for (const bad of [{ ...vk, version: undefined }, { ...vk, version: 1 }, { ...vk, basis: undefined }, { ...vk, basis: "made-up" }, { ...vk, tip: 3 }])
+    await expect(zoom(db, T0({ id: "record:" + s0 + ":u0", view_key: bad }))).rejects.toThrow("view_key");
 });
