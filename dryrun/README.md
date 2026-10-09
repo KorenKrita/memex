@@ -6,24 +6,38 @@ text by reason, exchanges, spans, `digest_text` bytes, `lexical_chunks` bytes an
 internal node count (`spans - popcount(spans)` per file). It reads only the given paths, writes nothing,
 opens no network connection and calls no model. There are no default directories.
 
-Rules implemented (each pinned by a test in `dryrun.test.ts`, all on synthetic logs):
+Rules implemented (each pinned by a test in `dryrun.test.ts`, all on synthetic logs; each rule was also
+broken on purpose and the suite went red, log `/tmp/memex-review/mutate-dryrun-111432.log`):
 
-- Pi session v3 only. The view is the inferred tail (last entry, Pi's resume rule), labelled
-  `inferred-tail`; entries off that path are counted, not mixed in. `subagent-artifacts/*_transcript.jsonl`
-  is skipped without being read. A fork (`parentSession`) inherits an entry only when the parent file is in
-  the same run and has the same id and content; otherwise the fork is reported `parent-not-given`.
+- Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
+  never followed; overlapping inputs are deduplicated. A Pi fork's parent is read only if it is itself one of
+  the inputs. A file that fails to read or parse is reported as `unreadable` and the batch continues; a cut
+  last line is `tornLines`, other bad lines `malformedLines`.
+- Pi session v3 only. **All branches are counted** (retrieval covers every branch, DESIGN §4.3): the tree is
+  cut into segments at branch points and at user messages, so a shared prefix is counted once and two
+  branches never share a span. The inferred tail (last entry) is reported only, as `offTail`.
+  `subagent-artifacts/*_transcript.jsonl` is skipped without being read, also by the fork pre-pass. A fork
+  inherits an entry only when the parent has the same id and content (key-order-independent hash); with
+  the parent not given, every entry is `unresolved` (not new evidence).
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
-  `ordinal` skips the whole file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork
-  boundary uses Codex's own rule (`forked_from_ordinal_exclusive`, else `history_base` only when it names the
-  parent or the file is the original rollout); an unknown boundary quarantines every record (`unresolved`).
-  Only `response_item` and inter-agent lines carry content (`event_msg` repeats them).
-- Out of span text: thinking / reasoning; memex's own injections (Pi `sections` / `memex-*` custom messages,
-  Codex `hooks.additional_context` starting with `<memex`); other memory systems (`<openviking-context>`,
-  `<contextdb-auto-recall>`); Codex harness context (user messages whose `content_item_kinds` are all
-  non-`user.*`, or that start with a Codex context marker); Pi compaction / branch summaries.
-- Exchange = a real user message and everything after it up to the next one. Spans cut only between units
-  (an assistant text, or a run of tool calls with their results), targeting 4–12 KB of digest; a single unit
-  over 12 KB stays whole and is counted in `oversizedSpans`.
+  `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
+  uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is
+  classified per fragment using the aligned `content_item_kinds` (`user.*` = user, e.g. `user.goal`);
+  unannotated user fragments fall back to Codex's context start markers. `event_msg` repeats response items.
+- Removed from all derived text (`excluded`, records and bytes per reason): memex's own injections (Pi
+  `sections.memex`, `memex-*` custom messages, Codex `hooks.additional_context` starting with `<memex`,
+  `<memex…>` blocks), other memory systems (`<openviking-context>`, `<contextdb-auto-recall>` blocks,
+  `memini-*` / `openviking*` / `contextdb*` custom messages), memory tool results (`mem_search/zoom/grep`,
+  `openviking_*`; Codex matched to the call by `call_id`; the call itself stays), host compaction / branch
+  summaries.
+- Kept in L0 and the lexical index but not summary input (`digestExcluded`): model thinking / reasoning,
+  harness and extension context (rest of the system prompt, developer messages, Codex context fragments,
+  other Pi custom messages, whose `customType` names are listed in `extensionTypes`). These never open an
+  exchange.
+- Exchange = a real user message and what follows on the same branch. Spans cut only between units; a unit
+  is a record, or a tool call plus everything up to the last result of the calls it opened (commentary,
+  parallel calls and out-of-order results included). `SPAN_MAX` (12 KB) wins over the 4 KB target: only a
+  single unit larger than 12 KB makes an `oversizedSpans` entry.
 - `digest_text` keeps tool output head and tail (1 KB each), up to 20 error lines and a locator;
   `lexical_chunks` count all kept text in 2 KB chunks. All sizes are UTF-8 bytes.
 
