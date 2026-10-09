@@ -32,6 +32,7 @@ beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job restart identity`);
   key = await addApiKey(db, "test");
+  await db`insert into grant_rule values ('personal', 'sync', 'memex')`;
 });
 
 const M = (id: string, parent: string | null, text: string) =>
@@ -134,4 +135,34 @@ test("API key required; a bad hash or a source id that does not match is refused
   expect((await fetch(base + "/v1/sync/lease", { method: "POST", body: "{}" })).status).toBe(401);
   const t = transport(base, key);
   await expect(t("POST", "/v1/sync/lease", { source: "x".repeat(64), harness: "pi", nativeId: "n", scope: "s", collector: "c" })).rejects.toThrow("400");
+});
+
+test("server grant: a client that skips its own policy stores nothing; revoking mid-lease refuses the commit", async () => {
+  const p = piFile(allowDir, "g", 2);
+  const open: Policy = { scopes: [{ name: "other", paths: [allowDir], allow: { sync: ["memex"] } }] };
+  const t = transport(base, key);
+  expect(await syncFile(t, open, p, "pi", { collector: "m1" })).toMatchObject({ status: "failed", reason: "403 scope not granted for sync" });
+  const decl = { source: sourceIdOf("pi", "g2"), harness: "pi" as const, nativeId: "g2", scope: "personal" };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  await db`delete from grant_rule`;
+  const raw = JSON.stringify({ type: "session", version: 3, id: "g2" });
+  const ch = [{ pos: 0, id: "header", hash: new Bun.CryptoHasher("sha256").update(raw).digest("hex"), raw }];
+  expect(await commit(db, { leaseId: l, commitId: "g", length: 1, changes: ch })).toEqual({ ok: false, reason: "not-granted" });
+  const [n] = await db`select (select count(*) from body)::int b, (select count(*) from record)::int r`;
+  expect(n).toEqual({ b: 0, r: 0 });
+});
+
+test("a record the copy no longer holds leaves the merged L0 and re-queues projection", async () => {
+  const p = piFile(allowDir, "t", 4);
+  const t = transport(base, key);
+  await syncFile(t, policy, p, "pi", { collector: "m1" });
+  const src = sourceIdOf("pi", "s-t");
+  await db`update job set state = 'done'`;
+  const lines = (await Bun.file(p).text()).split("\n");
+  writeFileSync(p, lines.slice(0, 3).join("\n") + "\n"); // header, e0, e1
+  expect(await syncFile(t, policy, p, "pi", { collector: "m1" })).toMatchObject({ status: "synced", sent: 0, length: 3 });
+  expect(await records(src)).toEqual(["header", "e0", "e1"]);
+  const [j] = await db`select count(*)::int n from job where kind = 'project' and key = ${src} and state = 'queued'`;
+  expect(j.n).toBe(1);
 });

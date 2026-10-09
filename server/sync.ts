@@ -22,7 +22,7 @@ export type Change = { pos: number; id: string; hash: string; raw: string };
 export type Commit = { leaseId: number; commitId: string; length: number; changes: Change[]; scanChunks?: number; leaf?: string | null };
 export type CommitResult =
   | { ok: true; accepted: number; refused: number; length: number }
-  | { ok: false; reason: "lease" | "forgotten" | "bad-request"; detail?: string };
+  | { ok: false; reason: "lease" | "forgotten" | "not-granted" | "bad-request"; detail?: string };
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -30,11 +30,16 @@ export class HttpError extends Error {
   }
 }
 
+export const granted = async (q: Tx, scope: string, purpose: string, dest: string) =>
+  (await q`select 1 from grant_rule where scope = ${scope} and purpose = ${purpose} and dest = ${dest}`).length > 0;
+
 /** Register the source once (identity is derived, not trusted) and queue a lease request. */
 export async function requestLease(db: Db, d: SourceDecl, collector: string): Promise<number> {
   if (d.source !== sourceIdOf(d.harness, d.nativeId)) throw new HttpError(400, "source id does not match harness and native id");
   return db.begin(async (tx: Tx) => {
     if ((await tx`select 1 from tomb where key = ${"source:" + d.source}`).length) throw new HttpError(410, "source forgotten");
+    // Server-side grant (§7): the client's policy only narrows; with no rule here nothing is stored.
+    if (!(await granted(tx, d.scope, "sync", "memex"))) throw new HttpError(403, "scope not granted for sync");
     await tx`insert into source (id, harness, native_id, scope, parent_id, meta)
              values (${d.source}, ${d.harness}, ${d.nativeId}, ${d.scope}, ${d.parent ?? null}, ${d.meta ?? {}})
              on conflict (id) do update set parent_id = coalesce(source.parent_id, excluded.parent_id)`;
@@ -142,35 +147,55 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       await tx`update lease set done = true where id = ${c.leaseId}`;
       return { ok: false, reason: "forgotten" } as const;
     }
+    const [src] = await tx`select scope from source where id = ${l.source}`;
+    if (!(await granted(tx, src.scope, "sync", "memex"))) {
+      await tx`update lease set done = true where id = ${c.leaseId}`;
+      return { ok: false, reason: "not-granted" } as const;
+    }
     // Refuse forgotten canonical records (a native record's canonical id is `source:rec`).
     const tombs = new Set<string>(
       (await tx`select key from tomb where key = any(${tx.array(c.changes.map((ch) => `canon:${l.source}:${ch.id}`), "text")})`).map((r: any) => r.key),
     );
     const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`));
     // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
-    await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}`;
+    const dropped = await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}
+                             returning rec`;
+    const touched = new Set<string>(dropped.map((r: any) => r.rec));
     if (keep.length) {
       const ids = keep.map((ch) => ch.id);
       const poss = keep.map((ch) => ch.pos);
-      await tx`delete from projection where source = ${l.source} and collector = ${l.collector}
-               and (pos = any(${tx.array(poss, "int4")}) or rec = any(${tx.array(ids, "text")}))`;
+      const moved = await tx`delete from projection where source = ${l.source} and collector = ${l.collector}
+                             and (pos = any(${tx.array(poss, "int4")}) or rec = any(${tx.array(ids, "text")})) returning rec`;
+      for (const r of moved) touched.add(r.rec);
+      for (const id of ids) touched.add(id);
       await tx`insert into body ${tx(keep.map((ch) => ({ source: l.source, rec: ch.id, hash: ch.hash, raw: ch.raw })))} on conflict do nothing`;
       await tx`insert into projection ${tx(keep.map((ch) => ({ source: l.source, collector: l.collector, pos: ch.pos, rec: ch.id, hash: ch.hash })))}`;
-      // Merge each touched record across collectors.
-      const merged = await tx`select p.rec, count(distinct p.hash)::int n, min(p.hash) h, min(p.pos) pos, r.state, r.hash old_hash
-                              from projection p left join record r on r.source = p.source and r.rec = p.rec
-                              where p.source = ${l.source} and p.rec = any(${tx.array(ids, "text")})
-                              group by p.rec, r.state, r.hash`;
+    }
+    if (touched.size) {
+      // Merge each touched record across collectors; a record no copy holds any more leaves the shared L0.
+      const ids = [...touched];
+      const merged = await tx`select r0.rec, count(distinct p.hash)::int n, min(p.hash) h, min(p.pos) pos, r.state, r.hash old_hash
+                              from unnest(${tx.array(ids, "text")}::text[]) r0(rec)
+                              left join projection p on p.source = ${l.source} and p.rec = r0.rec
+                              left join record r on r.source = ${l.source} and r.rec = r0.rec
+                              group by r0.rec, r.state, r.hash`;
       let changed = false;
       for (const m of merged) {
+        if (m.n === 0) {
+          if (m.state) changed = true;
+          await tx`delete from record where source = ${l.source} and rec = ${m.rec}`;
+          continue;
+        }
         const state = m.n === 1 ? "ok" : "conflict";
         const hash = m.n === 1 ? m.h : null;
-        if (m.state && (m.state !== state || m.old_hash !== hash)) changed = true;
+        if (!m.state || m.state !== state || m.old_hash !== hash) changed = true;
         await tx`insert into record (source, rec, state, hash, first_pos) values (${l.source}, ${m.rec}, ${state}, ${hash}, ${m.pos})
-                 on conflict (source, rec) do update set state = excluded.state, hash = excluded.hash`;
+                 on conflict (source, rec) do update set state = excluded.state, hash = excluded.hash, first_pos = excluded.first_pos`;
       }
-      if (changed) await bump(tx, "s:" + l.source);
-      await enqueue(tx, "project", l.source);
+      if (changed) {
+        await bump(tx, "s:" + l.source);
+        await enqueue(tx, "project", l.source);
+      }
     }
     if (c.scanChunks)
       await tx`insert into scan_progress values (${l.source}, ${l.collector}, ${c.scanChunks})
