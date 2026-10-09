@@ -121,7 +121,7 @@ function validate(b: any): SearchReq {
 }
 
 /** Query scope check, readable and valid sources, in one snapshot. */
-async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purpose" | "inContext">) {
+export async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purpose" | "inContext">) {
   const [src] = await q`select scope, harness from source where id = ${r.source}`;
   if (src && src.scope !== r.scope) throw new HttpError(409, "scope differs from the registered scope");
   if ((await q`select 1 from tomb where key = ${"source:" + r.source}`).length) throw new HttpError(410, "source forgotten");
@@ -416,7 +416,7 @@ export type TargetView = {
  * resume rule (Pi: the last entry written → inferred-tail). A reported leaf that names no projected view gives
  * `unknown` (it is not replaced by the tail: that would label against a path the user is not on).
  */
-async function targetView(q: Tx, source: string, leaf?: { tip: string; at: string | null }): Promise<TargetView> {
+export async function targetView(q: Tx, source: string, leaf?: { tip: string; at: string | null }): Promise<TargetView> {
   const views = (await q`select ord, tip, keys from view where source = ${source} order by ord`) as TargetView["views"];
   const [rep] = leaf ? [leaf] : await q`select leaf as tip, at from collector_view where source = ${source} and leaf is not null order by at desc limit 1`;
   if (rep) {
@@ -434,7 +434,7 @@ async function targetView(q: Tx, source: string, leaf?: { tip: string; at: strin
  * every fork ancestor's it was projected from). Any change to the text or partition behind the view moves it,
  * including an in-place revision with the same tip and a revision in a parent the view inherits.
  */
-const viewVersion = (b: { valid: Map<string, Src> }, src: string) => {
+export const viewVersion = (b: { valid: Map<string, Src> }, src: string) => {
   const d = b.valid.get(src)!.deps;
   const flat = Object.keys(d).filter((k) => k.startsWith("s:")).sort().map((k) => `${k}=${d[k]}`).join(",");
   return createHash("sha256").update(flat).digest("hex").slice(0, 16);

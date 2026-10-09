@@ -19,6 +19,7 @@ import "./project.ts";
 import "./derive.ts";
 import "./search.ts";
 import "./forest.ts";
+import "./snapshot.ts";
 
 export const copyTomb = (rec: string, raw: string) => `copy:${rec}:${contentHash(JSON.parse(raw))}`;
 
@@ -72,6 +73,10 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     for (const r of await tx`delete from span_summary where deps ? ${"s:" + source} returning span`) await enqueue(tx, "summarize", r.span);
     await tx`delete from forest_access where source = ${source}`;
     await tx`delete from session_card where source = ${source} or deps ? ${"s:" + source}`;
+    // Start snapshots: the source's own, and every block made from it in anyone else's (text and all).
+    await tx`delete from start_snapshot where source = ${source}`;
+    await tx`update start_snapshot set blocks = (select coalesce(jsonb_agg(x), '[]') from jsonb_array_elements(blocks) x where not (x->'deps' ? ${"s:" + source}))
+             where blocks @? ${'$[*].deps."s:' + source + '"'}::jsonpath`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
     // Lease rows are not touched: a commit holds its lease row before it waits for the barrier, so taking
