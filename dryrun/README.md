@@ -56,7 +56,7 @@ Rules without a listed mutation there are tested but not mutation-checked.
   identical copies are analysed once (first path) and the others are `duplicate-copy` with `copyOf`; a fork
   naming either copy resolves to the same one. Copies that differ need a projection merge this tool does
   not do, so the whole group is `conflicting-copies` and forks of it stay `unresolved`, whatever the file
-  names. A pre-pass reads every input once (same open checks) and keeps only its content hash and, for Pi, its
+  names. A pre-pass reads every input not skipped before opening (subagent transcripts, `.zst`) once (same open checks) and keeps only its content hash and, for Pi, its
   header id; the analysis must see the same hash, so a file rewritten in between (e.g. its header written
   only after the pre-pass) is `unreadable`, as is a file the pre-pass could not read (not retried). Codex files are not
   grouped by id: one thread id may legitimately span several rollout files.
