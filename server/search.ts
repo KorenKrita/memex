@@ -359,7 +359,16 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
       c.sources.add(t.source);
     }
   }
-  return { chosen, channels: { lex: lex.length, ft: new Set(ft.map((x: any) => x.unit)).size, vec: new Set((vec as any[]).map((x) => x.unit)).size } };
+  // Trace (§6.5): each channel's first 10 by key, the fused order before the cut, what the cut left out.
+  const top = (rows: any[], f: (x: any) => string) => [...new Set(rows.map(f))].slice(0, 10);
+  const fusedOrder = [...cands.values()].sort((a, b) => b.fused - a.fused || (a.key < b.key ? -1 : 1));
+  return {
+    chosen,
+    channels: { lex: lex.length, ft: new Set(ft.map((x: any) => x.unit)).size, vec: new Set((vec as any[]).map((x) => x.unit)).size },
+    top: { lex: top(lex as any[], (x) => "record:" + x.canon), ft: top(ft as any[], (x) => "unit:" + x.unit), vec: top(vec as any[], (x) => "unit:" + x.unit) },
+    fused: fusedOrder.slice(0, 10).map((c) => ({ key: c.key, fused: Number(c.fused.toFixed(5)), ranks: c.ranks })),
+    cut: fusedOrder.filter((c) => !chosen.includes(c)).slice(0, 10).map((c) => c.key),
+  };
 }
 
 /** The document a candidate sends to rerank: hit representations and excerpt first, then attachments. */
@@ -433,10 +442,13 @@ export const searchHooks = { beforeTrace: async () => {} };
 export async function search(db: Db, body: unknown): Promise<Guarded> {
   const r = validate(body);
   await snapshot(db, (q) => basis(q, r)); // the query's own authorization, before its text goes anywhere
+  const t0 = performance.now();
   const emb = await embedQuery(db, r);
+  const tEmbed = performance.now() - t0;
   let tries = 0;
   const run = async (): Promise<Guarded> => {
     if (++tries > 3) throw new HttpError(503, "state kept changing; retry");
+    const t1 = performance.now();
     const s = await snapshot(db, async (q) => {
       const b = await basis(q, r);
       const rc = await recall(q, r, b, emb.v);
@@ -464,9 +476,13 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: b.valid.get(src)!.deps["s:" + src] ?? null, at: t.at };
         labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps });
       }
-      return { b, rc, rerankSkip, dRerank: Number(dr?.v ?? 1), labels };
+      // Index lag (§6.5): derived work not yet published when this search read the index.
+      const lag = Object.fromEntries((await q`select kind, count(*)::int n from job where state in ('queued', 'running') group by kind`).map((x: any) => [x.kind, x.n]));
+      return { b, rc, rerankSkip, dRerank: Number(dr?.v ?? 1), labels, lag };
     });
     const { b, rc, labels } = s;
+    const tRecall = performance.now() - t1;
+    const t2 = performance.now();
     let rerankSkip = s.rerankSkip;
     // Every source carried by a candidate, plus the read grant's destination version.
     const deps: Record<string, number> = { ...b.qDeps };
@@ -491,6 +507,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         }
       }
     }
+    const tRerank = performance.now() - t2;
     // After rerank: off-path evidence and a session's consecutive places are down-weighted (§6.3).
     const base = rc.chosen.map((c, i) => ({ c, i, score: rerankSkip ? c.fused : scores[i]! }));
     base.sort((x, y) => y.score - x.score || x.i - y.i);
@@ -528,7 +545,12 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
       if (!(await unchanged(tx, deps))) return null;
       const [row] = await tx`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
-                             ${{ channels: rc.channels, embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null, candidates: trace }}) returning id`;
+                             ${{
+                               channels: rc.channels, top: rc.top, fused: rc.fused, cut: rc.cut,
+                               embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null, candidates: trace,
+                               returned: results.map((x) => x.key), attempt: tries, index_lag: s.lag,
+                               ms: { embed: Math.round(tEmbed), recall: Math.round(tRecall), rerank: Math.round(tRerank), total: Math.round(performance.now() - t0) },
+                             }}) returning id`;
       return row;
     });
     if (!t) return run();

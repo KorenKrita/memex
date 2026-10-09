@@ -1014,3 +1014,30 @@ test("an emoji on a chunk boundary is stored whole", async () => {
   const t = (await db`select string_agg(text, '' order by part) t from lexical where key like 'em/a0:%'`)[0].t;
   expect(t).toBe("a".repeat(2047) + "😀 after");
 });
+
+test("the trace records every stage: channel tops, fused order, the cut, the returned order and timings, no text", async () => {
+  for (let i = 0; i < 45; i++) await put("tr" + i, linear("tr" + i, [["alpha trace topic " + i, "reply tracetok " + i]]));
+  await drain(db);
+  const r = await body(Q("alpha tracetok"));
+  const [t] = await db`select data from search_trace order by id desc limit 1`;
+  const d = t.data;
+  expect(d.top.lex.length).toBe(10);
+  expect(d.top.ft.length).toBe(10);
+  expect(d.top.vec.length).toBe(10);
+  expect(d.fused.length).toBe(10);
+  expect(d.fused[0].fused).toBeGreaterThanOrEqual(d.fused[9].fused);
+  expect(d.cut.length).toBeGreaterThan(0); // more than 40 candidates: some never reached rerank
+  for (const k of d.cut) expect(d.candidates.some((c: any) => c.key === k)).toBe(false);
+  expect(d.returned).toEqual(r.results.map((x: any) => x.key));
+  for (const k of ["embed", "recall", "rerank", "total"]) expect(typeof d.ms[k]).toBe("number");
+  expect(d.attempt).toBe(1);
+  expect(d.index_lag).toEqual({});
+  // Pending derived work shows up as lag.
+  await put("tr-late", linear("tr-late", [["alpha late", "tracetok late"]]));
+  await body(Q("alpha tracetok", { dests: [] }));
+  expect((await db`select data from search_trace order by id desc limit 1`)[0].data.index_lag.project).toBe(1);
+  // Keys and numbers only: neither the query nor any evidence text.
+  const j = JSON.stringify(d);
+  expect(j).not.toContain("tracetok");
+  expect(j).not.toContain("alpha");
+});
