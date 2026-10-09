@@ -639,3 +639,92 @@ test("a large forest (128 leaves) is written in one bounded step; a held exclusi
   await coldThenStructure();
   expect((await nodes()).length).toBe(127);
 });
+
+test("the barrier held by a structure write is bounded as a whole: statements each short but long together give way to forget", async () => {
+  const s = await put("hl", linear("hl", 4));
+  await drain(db, ["project", "summarize", "embed"]);
+  const { forestHooks } = await import("./forest.ts");
+  const { runOne } = await import("./worker.ts");
+  process.env.MEMEX_FOREST_HOLD_MS = "400";
+  let inside!: () => void;
+  const isInside = new Promise<void>((r) => (inside = r));
+  forestHooks.underBarrier = async (tx: any) => {
+    inside();
+    await tx`select pg_sleep(0.25)`; // each below the deadline
+    await tx`select pg_sleep(0.25)`;
+    await tx`select pg_sleep(0.25)`;
+  };
+  try {
+    const run = runOne(db, ["forest"]);
+    await isInside;
+    const t0 = performance.now();
+    await forgetSource(db, s);
+    expect(performance.now() - t0).toBeLessThan(400 + 300);
+    await run;
+  } finally {
+    forestHooks.underBarrier = async () => {};
+    delete process.env.MEMEX_FOREST_HOLD_MS;
+  }
+  expect((await nodes()).length).toBe(0);
+  expect((await db`select 1 ok`)[0].ok).toBe(1); // the pool is usable after the server ended that session
+});
+
+test("a parent planned while its last child is being written is still merged (no lost wake-up)", async () => {
+  const s = await put("lw", linear("lw", 4));
+  await coldThenStructure();
+  // Only the pairs stored: the root will be inserted by a planner racing the last pair.
+  await db`delete from forest_node where size = 4`;
+  const pairs = (await db`select id from forest_node where size = 2 order by id`).map((r: any) => r.id);
+  await runMerge(db, (await claimJobFor("merge", pairs[0]))!);
+  await db`insert into forest_access values (${s})`;
+  // Planner: its snapshot sees pairs[1] unwritten; before it inserts the root, pairs[1] is published.
+  const { snapshotHook } = await import("./forest.ts");
+  snapshotHook.afterSnapshot = async () => {
+    snapshotHook.afterSnapshot = async () => {};
+    await runMerge(db, (await claimJobFor("merge", pairs[1]))!);
+  };
+  try {
+    await db`insert into job (kind, key) values ('forest', ${s}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
+    await runForestOnce(s);
+  } finally {
+    snapshotHook.afterSnapshot = async () => {};
+  }
+  await drain(db);
+  expect((await readForest(db, s, await tipOf(s)))!.items.map((i) => i.size)).toEqual([4]);
+});
+async function runForestOnce(s: string) {
+  const { runForest } = await import("./forest.ts");
+  await runForest(db, (await claimJobFor("forest", s))!);
+}
+
+test("an ancestor of the closing view withdraws after the check, before the views below are projected again: nothing is sent", async () => {
+  // G: g0..g1 closed, g2 open. P forks G and goes on (p3 open). C forks P and closes p3.
+  const gl = linear("ga", 2);
+  const G = await put("ga", gl);
+  const pl = [header("pa", "/x/ga.jsonl"), ...gl.slice(1), msg("user", "p3", "a2", "pp3"), msg("assistant", "p3a", "p3", "r"),
+    msg("user", "p4", "p3a", "pp4"), msg("assistant", "p4a", "p4", "r")];
+  const P = await put("pa", pl, G);
+  const C = await put("ca", [header("ca", "/x/pa.jsonl"), ...pl.slice(1), msg("user", "c5", "p4a", "cc5"), msg("assistant", "c5a", "c5", "r")], P);
+  await drain(db, ["project"]);
+  // P's own span [p4 p4a]: closed only on C's view. Its records and its <context> ([p3 p3a]) are P's: G is
+  // only behind C's projection (C ← P ← G).
+  const [p3] = await db`select id, context from span where source = ${P} and keys[1] like 'pa/p4:%'`;
+  expect(p3).toBeTruthy();
+  expect(JSON.stringify(p3.context)).not.toContain('"ga/');
+  const { hooks, runSummarize } = await import("./derive.ts");
+  hooks.afterCheck = async () => {
+    hooks.afterCheck = async () => {};
+    // G's first exchange is revised: G's version moves now; P and C are projected again only later.
+    const rev = [...gl];
+    rev[1] = msg("user", "u0", null, "t0 changed");
+    await put("ga", rev);
+  };
+  const n = requests.length;
+  try {
+    await runSummarize(db, (await claimJobFor("summarize", p3.id))!);
+  } finally {
+    hooks.afterCheck = async () => {};
+  }
+  // The first attempt is refused at the send; the retry checks again, finds C's projection stale, stops.
+  expect(requests.length).toBe(n);
+});

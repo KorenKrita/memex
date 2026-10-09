@@ -21,6 +21,10 @@ import { BARRIER } from "./sync.ts";
 import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot, unchanged } from "./derive.ts";
 
 export const FOREST_VERSION = "forest-merge-v1";
+/** Test seam: runs in runForest's transaction right after it takes the barrier. */
+export const forestHooks = { underBarrier: async (_tx: Tx) => {} };
+/** Test seam: runs in runForest between its snapshot and its write. */
+export const snapshotHook = { afterSnapshot: async () => {} };
 export const MIN_LEAVES = 4; // DESIGN §4.4 [待标定 4]
 const NODE_MAX = 1200; // UTF-8 bytes [待标定]
 const MAX_TRIES = 3;
@@ -107,15 +111,22 @@ export async function runForest(db: Db, job: Job) {
       const r = stored.get(n.id);
       if (r?.written) {
         if (!(await unchanged(q, r.deps))) merge.push(n.id);
-      } else if (h?.hot && n.kids.every((k) => !("node" in k) || stored.get(k.node)?.written)) merge.push(n.id);
+      } else if (h?.hot && (!r || n.kids.every((k) => !("node" in k) || stored.get(k.node)?.written))) merge.push(n.id);
+      // (A node this run inserts is queued even if a child looked unwritten: that child may be published
+      // between this snapshot and the insert, when its wake-up cannot find the parent yet. Not ready yet,
+      // the merge ends without a call and the child's publication queues it again.)
     }
     return { fresh, merge, spans: [...new Set(nodes.flatMap((n) => n.spans))] };
   });
+  await snapshotHook.afterSnapshot();
   // Under the barrier only set-based statements, with the whole held interval bounded (as guardedPost):
   // what is new, what is ready and what moved were read in the snapshot above.
   return db.begin(async (tx: Tx) => {
-    await tx`select set_config('lock_timeout', ${HOLD_MS() + "ms"}, true), set_config('statement_timeout', ${HOLD_MS() + "ms"}, true)`;
+    // transaction_timeout (PostgreSQL 17) bounds the whole transaction, not each statement: past it the
+    // server ends the session, which rolls back and releases the barrier (the pool reconnects).
+    await tx`select set_config('transaction_timeout', ${HOLD_MS() + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`; // against forget, which deletes nodes of its spans
+    await forestHooks.underBarrier(tx);
     const fin = await finishJob(tx, job);
     if (fin !== "done") return fin;
     const [have] = await tx`select count(*)::int n from span where id = any(${tx.array(p.spans, "text")})`;
