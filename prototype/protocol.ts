@@ -189,6 +189,7 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
   await c`begin isolation level read committed`;
   let commitAttempted = false;
   try {
+    await c.unsafe(`set local transaction_timeout = 0`);             // drop any inherited active timer (not rescheduled by a new value)
     await c.unsafe(`set local transaction_timeout = ${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}`);
     let now: Record<string, number>;
     if (opts.lockAndReadOneStatement) {                              // broken: snapshot taken before the lock wait
@@ -302,7 +303,7 @@ export type SyncResult = { ok: true } | { ok: false; reason: "lease" | "source" 
 export type SyncOpts = {
   noMergeLock?: boolean;                       // broken variant: merge without the global barrier
   afterLeaseCheck?: () => Promise<void>;       // holding the lease row lock, before the barrier wait
-  afterMergeRead?: () => Promise<void>;        // merge inputs computed, shared state not yet written
+  afterMergeRead?: (tx: Tx) => Promise<void>;  // merge inputs computed, shared state not yet written
   noLeaseDeadline?: boolean;                   // broken variant: no server-side bound after the lease check
 };
 
@@ -325,16 +326,20 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     if (!c.records.every(r => sessOf(r.rec) === l.source)) return { ok: false, reason: "source" } as const;
     await opts.afterLeaseCheck?.();
     if (!opts.noMergeLock) await tx`select pg_advisory_xact_lock(${BARRIER})`;
-    // Lease validity on the server clock, after every lock wait; the rest of the transaction is then bounded by
-    // the lease's remaining lifetime (rounded down; timer precision and the COMMIT phase are not hard-bounded —
-    // see README). Expiry mid-transaction terminates the backend and rolls back; the caller sees a closed
-    // connection and retries with the same commit id.
-    // One statement computes the remaining lifetime and arms the timer (PG17 starts it at the SET), no gap between.
+    // Lease cut-off = this check: server clock, under the lease row lock, after every lock wait.
+    // SAFETY does not rest on a timer: the successor's grant must UPDATE this lease row to reap it (tryGrant), so it
+    // waits on our FOR UPDATE lock until this transaction ends. A commit accepted here therefore always lands
+    // before the next lease is granted, even if COMMIT itself (not covered by transaction_timeout, PG17
+    // CommitTransaction disables it) finishes after expires_at.
+    // LIVENESS: transaction_timeout bounds the pre-COMMIT rest of the transaction by the remaining lifetime, so an
+    // in-flight commit cannot hold the queue far past expiry. syncCommit owns this connection's timeout: an
+    // inherited active timer is disabled first (re-setting a value does not reschedule an active timer).
+    if (!opts.noLeaseDeadline) await tx`select set_config('transaction_timeout', '0', true)`;
     const [v] = await tx`select left_ms, case when left_ms > 0 and ${!opts.noLeaseDeadline}
-                           then set_config('transaction_timeout', left_ms::text, true) end as armed
-                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::int as left_ms
+                           then set_config('transaction_timeout', least(left_ms, 2147483647)::text, true) end as armed
+                         from (select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms
                                from lease where id = ${c.leaseId} and granted_at is not null) s`;
-    if (!v || v.left_ms <= 0) return { ok: false, reason: "lease" } as const;
+    if (!v || Number(v.left_ms) <= 0) return { ok: false, reason: "lease" } as const;
     const merged: { rec: string; next: { state: string; hash: string | null }; old: any }[] = [];
     for (const r of c.records) {
       await tx`insert into body values (${r.rec}, ${r.hash}) on conflict do nothing`;   // dedupe stores body once
@@ -345,7 +350,7 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
       const [old] = await tx`select state, hash from shared where rec = ${r.rec}`;
       merged.push({ rec: r.rec, next, old });
     }
-    await opts.afterMergeRead?.();                                   // test hook: both sides computed their merge
+    await opts.afterMergeRead?.(tx);                                   // test hook: both sides computed their merge
     for (const { rec, next, old } of merged) {
       await tx`insert into shared values (${rec}, ${next.state}, ${next.hash})
                on conflict (rec) do update set state = excluded.state, hash = excluded.hash`;

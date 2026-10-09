@@ -30,29 +30,34 @@ observing `pg_locks` (backends really waiting on an advisory lock) and from the 
 Every "broken variant caught" test runs a deliberately wrong version of a rule and asserts the bug shows up,
 so the matching correct-protocol tests are known to bite: sampling versions in a separate snapshot, reusing the
 step-1 snapshot, a vector without view sessions, taking the lock and reading versions in one statement (its
-snapshot predates the lock wait), merging without the barrier, and a sync commit without the lease-lifetime
-bound. Commit-loss tests: the backend's termination is observed in `pg_stat_activity` before COMMIT is sent; the
-"committed, ack lost" case uses the test-only `afterCommit` seam (real COMMIT, then a simulated closed-connection
-error) and asserts the publication exists.
+snapshot predates the lock wait), and merging without the barrier. Commit-loss tests: the backend's termination is
+observed in `pg_stat_activity` before COMMIT is sent; the "committed, ack lost" case uses the test-only
+`afterCommit` seam (real COMMIT, then a simulated closed-connection error; a fault injection, not a real network
+failure) and asserts the publication exists.
 
-Mutation runs (delete or weaken one rule in `protocol.ts`, run the suite) turned the matching tests red for:
+Mutation runs: `bun /tmp/memex-review/mutate-final.ts` (outside the repo; literal replacements, restores the
+file on exit, full log). Deleting or weakening one rule in `protocol.ts` turned the matching tests red for:
 fresh read after the lock, each vector component (view / query / destination), remap bumping the occurrence's
 session, writer and publisher barrier locks, the locked-section deadline, merge serialization, lease expiry on the
 server clock, commit-id short-circuit, conflict bumping the version, generation-vector validity, FIFO grant, no
-grant over a valid lease, conflict in the exact check; second round: generation-vector check inside `publish`,
-`transaction_timeout` instead of `statement_timeout`, granting the queue head on any caller's poll, re-checking
-lease expiry after the barrier wait, the commit-id lock, records restricted to the lease's source, reporting a
-lease only while unexpired and not done, `uncertain` after COMMIT (both on a dead connection and on a lost ack);
-third round: exclusive (not shared) merge lock, and the lease-lifetime bound on the rest of the sync commit.
+grant over a valid lease, conflict in the exact check; later rounds (15/15 in the last run): generation-vector
+check inside `publish`, `transaction_timeout` instead of `statement_timeout`, granting the queue head on any
+poll, re-checking lease expiry after the barrier wait, the commit-id lock, records restricted to the lease's
+source, reporting a lease only while unexpired and not done, `uncertain` after COMMIT, the `commitAttempted`
+flag, exclusive (not shared) merge lock, the lease-lifetime timer, resetting an inherited timer (publish and
+sync), the 64-bit remaining-lifetime cast, and the successor's grant having to touch the expired lease row.
 
 ## Prototype choices (not performance conclusions)
 
 - One global advisory lock is both the visibility barrier and the merge serializer. It is the simplest thing
   that is correct; contention under real load has not been measured.
 - `transaction_timeout` (Postgres 17, set per locked transaction) is the server-side deadline. It bounds the
-  whole transaction including client pauses between statements; on expiry the backend is terminated, which
-  releases the lock and discards the publication. `statement_timeout` is not enough: many short statements
-  can hold the lock indefinitely. `publish()` reserves its own pool connection for this reason.
+  transaction up to COMMIT, including client pauses between statements; on expiry the backend is terminated,
+  which releases the lock and discards the publication. It does **not** cover the COMMIT phase itself (PG17
+  `CommitTransaction()` disables it before the durable commit), so a publication whose COMMIT started in time
+  can finish slightly late. `statement_timeout` is not enough: many short statements can hold the lock
+  indefinitely. `publish()` reserves its own pool connection, and first sets the timeout to 0 because setting a
+  new value does not reschedule an already-active (inherited) timer.
 - When the deadline fires during a statement, Bun receives SQLSTATE `25P04` → `timeout` (confirmed). When it fires
   while the session is idle in transaction (client pause), Bun reports only `ERR_POSTGRES_CONNECTION_CLOSED`,
   indistinguishable from any other disconnect. `publish()` therefore classifies a closed connection by position:
@@ -62,9 +67,13 @@ third round: exclusive (not shared) merge lock, and the lease-lifetime bound on 
   rejection that escapes try/catch; version reads use `= any(${sql.array(keys, "text")})` instead.
 - A lease queue advances on any caller's poll: the oldest pending request is granted even if its client is gone,
   then expires after its ttl and is reaped, so a dead head cannot block the queue. `syncCommit()` re-checks
-  lease expiry after the barrier wait, then — in the same statement — arms `transaction_timeout` with the lease's
-  remaining server-clock lifetime (rounded down). Tested: expiry during the merge terminates the transaction and
-  leaves no shared state or scan progress. Not established: a hard bound at millisecond precision, or what
-  happens if the timer fires while COMMIT itself is being processed.
+  lease expiry on the server clock after the barrier wait, under the lease row's `FOR UPDATE` lock. That check
+  is the cut-off (DESIGN §5.1 "only commit while the lease is valid"). Safety does not depend on a timer: the
+  successor's grant must update the expired lease row to reap it, so it waits for this transaction to end; a
+  commit accepted at the check always lands before the next lease exists, even if its COMMIT finishes after
+  `expires_at`. Interpretation, not yet written into DESIGN: "valid" means valid at the server-side acceptance
+  check, not at COMMIT completion. For liveness, the same statement arms `transaction_timeout` with the remaining
+  lifetime (after clearing any inherited timer), so a stalled pre-COMMIT transaction cannot hold the queue far
+  past expiry. Not a hard millisecond bound; the COMMIT phase is not covered (see above).
 - "Published" means a row in `publication`, written inside the locked section. HTTP/socket hand-off and
   cancellation at that boundary are **not** verified here.

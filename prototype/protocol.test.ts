@@ -40,13 +40,19 @@ async function waitForLockWaiter() {
   throw new Error("no lock waiter appeared");
 }
 /** Resolves once the given backend no longer exists (terminated by the server). */
-async function waitForBackendGone(pid: number) {
-  for (let i = 0; i < 500; i++) {
+async function waitForBackendGone(pid: number, maxMs = 5000) {
+  for (let i = 0; i < maxMs / 10; i++) {
     const [r] = await db`select count(*)::int n from pg_stat_activity where pid = ${pid}`;
     if (r.n === 0) return;
     await Bun.sleep(10);
   }
   throw new Error(`backend ${pid} still alive`);
+}
+/** Inside a hook: wait (bounded) until the server terminates this transaction's own backend, then return so the
+ *  caller's next statement observes the closed connection. Times out (test fails) if the deadline never fires. */
+async function waitForOwnTermination(tx: any, maxMs = 3000) {
+  const [{ pid }] = await tx`select pg_backend_pid() as pid`;
+  await waitForBackendGone(pid, maxMs);
 }
 /** Holds the global barrier exclusively on its own connection until release() is called. */
 async function holdBarrier() {
@@ -178,6 +184,24 @@ describe("publish barrier (§5.5)", () => {
     expect(await P.publicationCount(db, "R1")).toBe(1);
   });
 
+  test("the locked-section deadline holds even if the connection inherits a longer transaction_timeout", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "5000" } } as any);
+    try {
+      let writer: Promise<void> | undefined;
+      const r = await P.publish(pool, "R1", {
+        inLock: async (tx) => {
+          writer = P.forgetRecord(db, "P:r1");
+          await waitForAdvisoryWaiter();
+          await tx`select pg_sleep(2)`;           // under the inherited 5s, over the 300ms deadline
+        },
+      }, { lockDeadlineMs: 300 });
+      expect(r).toBe("timeout");
+      await writer;
+      expect(await P.publicationCount(db, "R1")).toBe(0);
+    } finally { await pool.close(); }
+  });
+
   test("a pure client pause holding the lock: the server releases it and the writer finishes before the publisher resumes", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
     let writerDone = false, doneDuringPause = false;
@@ -306,20 +330,51 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
     expect(await P.scanProgress(db, "P", "M")).toBe(0);
   });
-  test("a lease that expires after the check, during the merge, commits nothing", async () => {
+  test("liveness: a lease that expires during the merge (pre-COMMIT) is terminated and commits nothing", async () => {
     const l = await P.acquireLease(db, "P", "M", 500);
+    let reached = false;
     const commit = P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
-      { afterMergeRead: () => waitUntilExpired(l) });
-    await expect(commit).rejects.toThrow();     // server terminated the transaction at lease expiry
+      { afterMergeRead: async (tx) => { reached = true; await waitForOwnTermination(tx); } });
+    expect(await commit.then(() => "resolved", (e: any) => e?.code)).toMatch(/^ERR_POSTGRES_(CONNECTION_CLOSED|EXPECTED_REQUEST)$/);   // backend terminated by the server (not a test-helper timeout)
+    expect(reached).toBe(true);
     expect(await P.sharedState(db, "P:r1")).toEqual({ state: "absent" });
+    const [{ n }] = await db`select (select count(*) from body) + (select count(*) from projection) as n`;
+    expect(Number(n)).toBe(0);                   // rows written before the hook were rolled back too
     expect(await P.scanProgress(db, "P", "M")).toBe(0);
   });
-  test("broken variant caught: without the lease-lifetime bound an expired lease's commit succeeds", async () => {
+  test("liveness holds with an inherited longer transaction_timeout on the connection", async () => {
+    const pool = new SQL(URL, { max: 2, connection: { transaction_timeout: "5000" } } as any);
+    try {
+      const [{ t }] = await pool`select current_setting('transaction_timeout') t`;
+      expect(t).toBe("5s");                          // precondition: the inherited timer is really active
+      const l = await P.acquireLease(pool, "P", "M", 500);
+      const commit = P.syncCommit(pool, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
+        { afterMergeRead: (tx) => waitForOwnTermination(tx) });
+      expect(await commit.then(() => "resolved", (e: any) => e?.code)).toMatch(/^ERR_POSTGRES_(CONNECTION_CLOSED|EXPECTED_REQUEST)$/);   // backend terminated by the server (not a test-helper timeout)
+      expect(await P.scanProgress(db, "P", "M")).toBe(0);
+    } finally { await pool.close(); }
+  });
+  test("safety without the timer: a commit accepted before expiry blocks the successor's grant until it ends", async () => {
     const l = await P.acquireLease(db, "P", "M", 500);
-    const r = await P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 },
-      { afterMergeRead: () => waitUntilExpired(l), noLeaseDeadline: true });
-    expect(r).toEqual({ ok: true });
-    expect(await P.scanProgress(db, "P", "M")).toBe(1);
+    const next = await P.requestLease(db, "P", "M", 10_000);
+    let grant!: Promise<boolean>, pendingWhileOpen = false;
+    const r = await P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 }, {
+      noLeaseDeadline: true,                     // stall past expiry: only the row lock orders the successor
+      afterMergeRead: async () => {
+        await waitUntilExpired(l);
+        let settled = false; grant = P.tryGrant(db, next); grant.then(() => { settled = true; });
+        await waitForLockWaiter();               // the reaping UPDATE waits on our FOR UPDATE lease row
+        pendingWhileOpen = !settled;
+      },
+    });
+    expect(pendingWhileOpen).toBe(true);
+    expect(r).toEqual({ ok: true });             // accepted at the cut-off check; lands before the successor
+    expect(await grant).toBe(true);
+  });
+  test("a lease expired longer than the 32-bit millisecond range is rejected, not an error", async () => {
+    const l = await P.acquireLease(db, "P", "M", 10_000);
+    await db`update lease set expires_at = clock_timestamp() - interval '30 days' where id = ${l}`;
+    expect(await P.syncCommit(db, { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }] })).toEqual({ ok: false, reason: "lease" });
   });
   test("two overlapping retries of one commit id both get the original success", async () => {
     const l = await P.acquireLease(db, "P", "M", 10_000);
