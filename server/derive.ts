@@ -35,6 +35,9 @@ create table if not exists span_summary (span text primary key references span (
 alter table span_summary add column if not exists input_fp text not null default '';
 create index if not exists span_summary_unit on span_summary (unit);
 create index if not exists span_summary_trgm on span_summary using gin (text gin_trgm_ops);
+-- Summary full-text channel (§6.3): summary + anchors.
+alter table span_summary add column if not exists ft text generated always as (text || ' ' || coalesce(summary->>'anchors', '')) stored;
+create index if not exists span_summary_ft on span_summary using gin (ft gin_trgm_ops);
 -- Work not done for a reason that a later change can lift (a grant): requeued when it is.
 create table if not exists derive_skip (kind text not null, span text not null, scopes text[] not null, reason text not null,
                                         at timestamptz not null default now(), primary key (kind, span));
@@ -109,7 +112,7 @@ async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> 
 }
 
 /** Step 2 comparison, inside the caller's transaction that holds the barrier shared. */
-async function unchanged(tx: Tx, deps: Record<string, number>) {
+export async function unchanged(tx: Tx, deps: Record<string, number>) {
   const keys = Object.keys(deps);
   const vs = new Map<string, number>((await tx`select key, v from vis_version where key = any(${tx.array(keys, "text")})`).map((r: any) => [r.key, Number(r.v)]));
   return keys.every((k) => (vs.get(k) ?? 1) === deps[k]);
@@ -118,14 +121,14 @@ async function unchanged(tx: Tx, deps: Record<string, number>) {
 /** Test seam: runs between the exact check and the guarded send (where a concurrent change can land). */
 export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {} };
 
-const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isolation level repeatable read read only", f) as Promise<T>;
+export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isolation level repeatable read read only", f) as Promise<T>;
 
 // ---------- guarded send ----------
 
 type Reply = { status: number; json: any };
 /** POST `body` to `url` only if `deps` still hold: compare and hand to the transport under the shared barrier,
  *  wait for the reply outside it. "stale" = nothing was sent. */
-async function guardedPost(db: Db, deps: Record<string, number>, url: string, key: string, body: object): Promise<Reply | "stale"> {
+export async function guardedPost(db: Db, deps: Record<string, number>, url: string, key: string, body: object): Promise<Reply | "stale"> {
   const u = new URL(url);
   const data = Buffer.from(JSON.stringify(body));
   await hooks.afterCheck();

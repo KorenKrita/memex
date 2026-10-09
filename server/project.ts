@@ -20,6 +20,7 @@ import { type Db, type Job, type Tx, bump, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
 import { parentInfo, projectLines, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
 import { addMigration } from "./db.ts";
+import { sourceIdOf, type Harness } from "../client/records.ts";
 
 export const RULE_VERSION = "span-v1"; // part of every span id: a rule change makes new spans, never reuses old ones
 const idleCloseMs = () => Number(process.env.MEMEX_IDLE_CLOSE_MS ?? 10 * 60_000);
@@ -45,10 +46,25 @@ create table if not exists projected (source text primary key, status text not n
 create table if not exists lexical (source text not null, key text not null, part int not null, rec text not null, kind text not null,
                                     text text not null, primary key (source, key, part));
 create index if not exists lexical_trgm on lexical using gin (text gin_trgm_ops);
+-- The version vector this projection was built from (its own s:, and its fork parent's vector).
+alter table projected add column if not exists deps jsonb not null default '{}';
+-- Canonical ids (tomb key without 'canon:') of a lexical row's record and of a span's records, so search
+-- can drop forgotten evidence before it cuts a channel; key indexes for excerpts and successor lookups.
+alter table lexical add column if not exists canon text not null default '';
+alter table span add column if not exists canons text[] not null default '{}';
+create index if not exists lexical_key on lexical (key);
+create index if not exists view_keys on view using gin (keys);
 `);
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 export const spanIdOf = (recs: { key: string }[]) => "sp_" + sha(RULE_VERSION + "\u0000" + recs.map((r) => r.key).join("\u0000")).slice(0, 32);
+/** A record key `native/rec:hash#j` → canonical id `sourceId:rec` (the tomb key without 'canon:'). */
+export function canonOf(harness: string, key: string) {
+  const base = key.slice(0, key.lastIndexOf("#"));
+  const slash = base.indexOf("/");
+  const rest = base.slice(slash + 1);
+  return `${sourceIdOf(harness as Harness, base.slice(0, slash))}:${rest.slice(0, rest.lastIndexOf(":"))}`;
+}
 export const inputFpOf = (s: { records: SpanRecord[]; context: SpanRecord[] }) =>
   sha(JSON.stringify([RULE_VERSION, s.records.map((r) => [r.key, r.kind, r.digest]), s.context.map((r) => [r.key, r.kind, r.digest])]));
 
@@ -156,7 +172,7 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     if (!(await tx`select 1 from source where id = ${source}`).length) return fin;
     const a = await analyse(tx, source);
     let withdrawn = false;
-    const [before] = await tx`select status, keys from projected where source = ${source}`;
+    const [before] = await tx`select status, keys, deps from projected where source = ${source}`;
     await tx`insert into projected (source, status, keys, res) values (${source}, ${a.status}, ${a.keys}, ${{ reason: a.reason ?? null }})
              on conflict (source) do update set status = excluded.status, keys = excluded.keys, res = excluded.res, at = now()`;
     const wasClosed = new Set<string>(
@@ -190,8 +206,9 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
         const fp = inputFpOf(s);
         const [old] = await tx`select input_fp, unit from span where id = ${id}`;
         if (!old) {
-          await tx`insert into span (id, source, prefix, cut, unit, keys, records, context, input_fp)
-                   values (${id}, ${source}, ${s.prefix}, ${s.cut ?? null}, ${unit}, ${tx.array(keys, "text")}, ${s.records}, ${s.context}, ${fp})`;
+          await tx`insert into span (id, source, prefix, cut, unit, keys, records, context, input_fp, canons)
+                   values (${id}, ${source}, ${s.prefix}, ${s.cut ?? null}, ${unit}, ${tx.array(keys, "text")}, ${s.records}, ${s.context}, ${fp},
+                           ${tx.array(keys.map((k: string) => canonOf(a.harness, k)), "text")})`;
           own.add(id);
         } else if (old.input_fp !== fp || old.unit !== unit) {
           await tx`update span set records = ${s.records}, context = ${s.context}, input_fp = ${fp}, unit = ${unit} where id = ${id}`;
@@ -209,14 +226,21 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       if (gone.length) withdrawn = true;
       // Lexical index: rebuild for this source (cheap relative to summaries; keeps forget/revision exact).
       await tx`delete from lexical where source = ${source}`;
-      const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => ({ source, key: r.key, part, rec: r.rec, kind: r.kind, text })));
+      const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => ({ source, key: r.key, part, rec: r.rec, kind: r.kind, text, canon: canonOf(a.harness, r.key) })));
       for (let i = 0; i < lex.length; i += 500) await tx`insert into lexical ${tx(lex.slice(i, i + 500))}`;
     }
     // A changed canonical mapping or block state withdraws what was derived from the old one.
     const remapped = !!before && (before.status !== a.status || JSON.stringify(before.keys) !== JSON.stringify(a.keys));
     if (withdrawn || remapped) await bump(tx, "s:" + source);
-    // Children that fork from this source re-project when its projection changes.
-    if (!before || remapped)
+    // Read-side validity (search.ts): what this projection was built from. It holds while every entry is
+    // current; any later commit, forget or parent change makes it stale until the next projection.
+    const [sv] = await tx`select v from vis_version where key = ${"s:" + source}`;
+    const deps: Record<string, number> = { ["s:" + source]: Number(sv?.v ?? 1) };
+    if (a.parentId) Object.assign(deps, (await tx`select deps from projected where source = ${a.parentId}`)[0]?.deps ?? {});
+    await tx`update projected set deps = ${deps} where source = ${source}`;
+    const same = (x: any, y: any) => JSON.stringify(Object.entries(x ?? {}).sort()) === JSON.stringify(Object.entries(y ?? {}).sort());
+    // Children that fork from this source re-project when its projection or its basis changes.
+    if (!before || remapped || !same(before.deps, deps))
       for (const c of await tx`select id from source where parent_id = ${source}`) await enqueue(tx, "project", c.id);
     return fin;
   });

@@ -10,7 +10,7 @@ import { syncFile } from "../client/sync.ts";
 import { readSession, sourceIdOf } from "../client/records.ts";
 import type { Policy } from "../client/policy.ts";
 
-let db: Db, server: ReturnType<typeof serve>, key: string, base: string;
+let db: Db, server: Awaited<ReturnType<typeof serve>>, key: string, base: string;
 const dir = mkdtempSync(join(tmpdir(), "memex-sync-"));
 const allowDir = join(dir, "allowed");
 const denyDir = join(dir, "denied");
@@ -21,11 +21,11 @@ const policy: Policy = { scopes: [{ name: "personal", paths: [allowDir], allow: 
 beforeAll(async () => {
   db = connect();
   await migrate(db);
-  server = serve(db, { port: 0 });
+  server = await serve(db, { port: 0 });
   base = `http://127.0.0.1:${server.port}`;
 });
 afterAll(async () => {
-  server.stop(true);
+  await server.stop();
   await db.close();
 });
 beforeEach(async () => {
