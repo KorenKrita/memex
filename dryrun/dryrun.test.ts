@@ -435,11 +435,11 @@ describe("third review", () => {
   test("duplicate ids or a parent cycle make the file invalid; the batch goes on", () => {
     const dup = file("cycle/dup.jsonl", [piHeader(), piMsg("a", null, user("first")), piMsg("b", "a", user("second")), piMsg("a", "b", user("duplicate"))]);
     const loop = file("cycle/loop.jsonl", [piHeader(), piMsg("a", "b", user("x")), piMsg("b", "a", user("y"))]);
-    const self = file("cycle/self.jsonl", [piHeader(), piMsg("a", "a", user("self"))]);
+    file("cycle/self.jsonl", [piHeader(), piMsg("a", "a", user("self"))]); // Pi's getTree: a root
     file("cycle/ok.jsonl", [piHeader(), piMsg("u", null, user("fine"))]);
     const r = isolated(`const r = dryRun([${JSON.stringify(join(dir, "cycle"))}]); console.log(JSON.stringify({ skipped: r.skipped, evidence: r.total.evidence }));`);
     expect(r.signal).toBeNull(); // not killed by the deadline
-    expect(JSON.parse(r.out)).toEqual({ skipped: { "invalid-tree": [dup, loop, self] }, evidence: 1 });
+    expect(JSON.parse(r.out)).toEqual({ skipped: { "invalid-tree": [dup, loop] }, evidence: 2 });
   });
 
   test("a file swapped for a FIFO after discovery is refused without blocking", () => {
@@ -528,6 +528,69 @@ describe("third review", () => {
     ]);
     expect(analyzeFile(p)).toMatchObject({ branchPoints: 0, views: 1, spans: 1 });
   });
+});
+
+describe("fourth review", () => {
+  test("a fork chain that loops back is unresolved all the way, nothing reaches a span", () => {
+    const [A, B] = ["A", "B"].map((n) => join(dir, "pi/forkloop", `${n}.jsonl`));
+    file("pi/forkloop/A.jsonl", [piHeader({ id: "sA", parentSession: B }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
+    file("pi/forkloop/B.jsonl", [piHeader({ id: "sB", parentSession: A }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const r = dryRun([join(dir, "pi/forkloop")]);
+    for (const f of r.perFile) expect(f).toMatchObject({ forkStatus: "unresolved", evidence: 0, spans: 0, summaryInputBytes: 0 });
+  });
+
+  test("a fork of an unresolved fork is unresolved too", () => {
+    const missing = join(dir, "pi/chain/not-given.jsonl");
+    const B = file("pi/chain/B.jsonl", [piHeader({ id: "sB", parentSession: missing }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const C = file("pi/chain/C.jsonl", [piHeader({ id: "sC", parentSession: B }), piMsg("u", null, user("u")), piMsg("b", "u", say("b")), piMsg("c", "b", say("c"))]);
+    const r = dryRun([B, C]);
+    expect(r.perFile.find((f) => f.path === B)).toMatchObject({ forkStatus: "parent-not-given", spans: 0 });
+    expect(r.perFile.find((f) => f.path === C)).toMatchObject({ forkStatus: "unresolved", evidence: 0, spans: 0, summaryInputBytes: 0 });
+  });
+
+  test("an entry whose parent is missing is an orphan root (as in Pi's getTree), and is reported", () => {
+    const r = analyzeFile(file("pi/orphan.jsonl", [piHeader(), piMsg("a", "missing", user("a")), piMsg("b", "a", say("b"))]));
+    expect(r).toMatchObject({ status: "indexed", orphanRoots: 1, views: 1, spans: 1, evidence: 2 });
+    expect(analyzeFile(file("pi/self-root.jsonl", [piHeader(), piMsg("a", "a", user("a")), piMsg("b", "a", say("b"))]))).toMatchObject({ orphanRoots: 0, views: 1, spans: 1 });
+  });
+
+  test("nodes a short parent never built are built (and counted) by its longer fork", () => {
+    const P = file("pi/shortpar/P.jsonl", [piHeader(), piMsg("u0", null, user("q0")), piMsg("u1", "u0", user("q1"))]);
+    const rows: unknown[] = [piHeader({ id: "s2", parentSession: P }), piMsg("u0", null, user("q0")), piMsg("u1", "u0", user("q1"))];
+    for (let i = 2; i < 6; i++) rows.push(piMsg(`u${i}`, `u${i - 1}`, user(`q${i}`)));
+    const C = file("pi/shortpar/C.jsonl", rows);
+    const r = dryRun([join(dir, "pi/shortpar")]);
+    expect(r.perFile.find((f) => f.path === P)).toMatchObject({ spans: 2, forestInternalNodes: 0 });
+    expect(r.perFile.find((f) => f.path === C)).toMatchObject({ spans: 4, forestInternalNodes: 4 }); // 6 leaves: 6 - popcount(6)
+  });
+
+  test("sibling forks share one prefix span", () => {
+    const P = file("pi/sib/P.jsonl", [piHeader(), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
+    file("pi/sib/C1.jsonl", [piHeader({ id: "s1", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    file("pi/sib/C2.jsonl", [piHeader({ id: "s2", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", say("c"))]);
+    const r = dryRun([join(dir, "pi/sib")]).total;
+    // S = [u a], P = [u], [b], [c]
+    expect(r).toMatchObject({ spans: 4, prefixSpans: 1 });
+    expect(r.digestBytes).toBe(D("user", "u") + 3 * D("assistant", "a"));
+    expect(r.summaryInputBytes).toBe(r.digestBytes + D("user", "u"));
+  });
+
+  test("a long linear session is traversed in linear time", () => {
+    const timed = (n: number) => {
+      const rows: string[] = [JSON.stringify(piHeader())];
+      for (let i = 0; i < n; i++) rows.push(JSON.stringify(piMsg(`e${i}`, i ? `e${i - 1}` : null, user(`q${i}`))));
+      const p = file(`pi/long-${n}.jsonl`, rows.join("\n") + "\n");
+      let best = Infinity;
+      for (let k = 0; k < 2; k++) {
+        const t = performance.now();
+        expect(analyzeFile(p).spans).toBe(n);
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    // 4x the entries: linear work grows ~4x, quadratic path copying ~16x
+    expect(timed(40000) / timed(10000)).toBeLessThan(8);
+  }, 60000);
 });
 
 describe("input boundary", () => {

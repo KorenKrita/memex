@@ -42,6 +42,7 @@ export interface FileResult {
   evidence: number; // records contributing summary input
   offTail: number; // Pi entries not on the inferred-tail path (still counted: retrieval covers all branches)
   branchPoints: number; // Pi entries with more than one text-bearing child
+  orphanRoots: number; // Pi entries whose parentId names no entry in the file: roots, as in Pi's getTree
   views: number; // branch tips (Pi) / 1 (Codex): each is one navigation view
   prefixSpans: number; // DESIGN §4.3 prefix segments P, created where a later branch forks inside a span
   unpairedCalls: number; // tool calls with no result before the next user message or the end
@@ -71,6 +72,7 @@ function emptyResult(path: string): FileResult {
     evidence: 0,
     offTail: 0,
     branchPoints: 0,
+    orphanRoots: 0,
     views: 0,
     prefixSpans: 0,
     unpairedCalls: 0,
@@ -206,21 +208,22 @@ function unitsOf(path: Rec[], unpaired: Set<string>): Rec[][] {
 }
 
 type Span = { id: string; keys: string[]; size: number };
-// Spans and forest nodes already made, by first record key / (left,right). A resolved Pi fork starts from
-// its parent's registry, so the child reuses or cuts P out of the parent's spans like a later view would.
+// Spans and forest nodes already made, by first record key / (left,right). One registry per resolved Pi
+// fork family, shared (not copied): a span is identified by its ordered canonical record keys (id + content
+// hash), so a P one fork cut is reused by its siblings, as DESIGN §4.3's immutable spans would be.
 type Registry = { spanAt: Map<string, Span[]>; nodeId: Map<string, string> };
-const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: fewer unique leaves → no internal nodes
+const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all have fewer leaves builds no nodes
 
 // Partition every view into spans the way DESIGN §4.3 does it online, given the views in creation order:
 // a later view reuses every earlier span lying whole on its path and ending on one of its unit
 // boundaries; where it forks inside an earlier span it gets a prefix span P (cut back to whole units, so
 // a call never leaves its result) followed by its own spans. Spans never cross a user message.
 // Assumption: spans are taken as finally cut; whether a span was still open at fork time is not in the logs.
-function partition(views: Rec[][], res: FileResult, seed?: Registry): Registry {
-  const spanAt = new Map([...(seed?.spanAt ?? [])].map(([k, v]) => [k, [...v]]));
-  const nodeId = new Map(seed?.nodeId ?? []);
+function partition(views: Rec[][], res: FileResult, registry: Registry = { spanAt: new Map(), nodeId: new Map() }): Registry {
+  const { spanAt, nodeId } = registry;
   const unpaired = new Set<string>();
-  const newNodes = new Set<string>();
+  const pending = new Map<string, string>(); // this file's new nodes, published only if it is not short
+  let longest = 0;
   let n = 0;
   const register = (us: Rec[][], prefix: boolean): Span | undefined => {
     const recs = us.flat();
@@ -281,22 +284,24 @@ function partition(views: Rec[][], res: FileResult, seed?: Registry): Registry {
       ui += len;
     }
     // Forest over this view's span list: binary carries; identical subtrees are one node (DESIGN §4.4).
+    longest = Math.max(longest, order.length);
     for (let level = order; level.length > 1; ) {
       const up: string[] = [];
       for (let i = 0; i + 1 < level.length; i += 2) {
         const key = `${level[i]},${level[i + 1]}`;
-        let id = nodeId.get(key);
-        if (id === undefined) nodeId.set(key, (id = `${res.path}#n${newNodes.size}`)), newNodes.add(key);
+        let id = nodeId.get(key) ?? pending.get(key);
+        if (id === undefined) pending.set(key, (id = `${res.path}#n${pending.size}`));
         up.push(id);
       }
       level = up;
     }
   }
-  // Short sessions list span summaries directly (DESIGN §4.4). Leaves = spans of this file plus reused
-  // parent spans would be the same family; the cutoff is applied to this file's own spans.
-  res.forestInternalNodes = res.spans < SHORT_SESSION ? 0 : newNodes.size;
+  // Short sessions list span summaries directly (DESIGN §4.4): their nodes are neither counted nor
+  // published, so a longer fork builds (and counts) them itself.
+  if (longest >= SHORT_SESSION) for (const [k, v] of pending) nodeId.set(k, v);
+  res.forestInternalNodes = longest >= SHORT_SESSION ? pending.size : 0;
   res.unpairedCalls = unpaired.size;
-  return { spanAt, nodeId };
+  return registry;
 }
 
 // Unique records: evidence, digest and lexical bytes, exclusions. Independent of how views share them.
@@ -455,7 +460,11 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
 type ParentInfo = { keys: Set<string>; registry: Registry };
 type ParentLookup = (p: string) => ParentInfo | "invalid" | undefined; // undefined: parent not among the inputs
 
-// Pi's tree must be a forest: unique ids, every parent chain ends at a root. Anything else is not read on.
+// A root, as in Pi's getTree(): parentId null, pointing at itself, or at an entry not in the file (an
+// orphan, reported in `orphanRoots`).
+const piIsRoot = (e: Record<string, any>, byId: Map<string, Record<string, any>>) => e.parentId == null || e.parentId === e.id || !byId.has(e.parentId);
+
+// Pi's tree must be a forest: unique ids and no parent cycle. Anything else is not read on.
 function piTreeValid(entries: Record<string, any>[], byId: Map<string, Record<string, any>>): boolean {
   if (byId.size !== entries.length) return false;
   const state = new Map<string, 1 | 2>(); // 1 on the current chain, 2 known to reach a root
@@ -466,7 +475,7 @@ function piTreeValid(entries: Record<string, any>[], byId: Map<string, Record<st
       if (state.get(cur.id) === 1) return false;
       state.set(cur.id, 1);
       chain.push(cur.id);
-      cur = byId.get(cur.parentId);
+      cur = piIsRoot(cur, byId) ? undefined : byId.get(cur.parentId);
     }
     for (const id of chain) state.set(id, 2);
   }
@@ -484,15 +493,17 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   if (!piTreeValid(entries, byId)) return skip(res, "invalid-tree");
   const children = new Map<string, Record<string, any>[]>(); // in file (= creation) order
   for (const e of entries) {
-    if (byId.has(e.parentId)) {
-      const k = children.get(e.parentId) ?? [];
-      k.push(e);
-      children.set(e.parentId, k);
+    if (piIsRoot(e, byId)) {
+      if (e.parentId != null && e.parentId !== e.id) res.orphanRoots++;
+      continue;
     }
+    const k = children.get(e.parentId) ?? [];
+    k.push(e);
+    children.set(e.parentId, k);
   }
   // Inferred tail (Pi's resume rule) is reported only; every branch is counted.
   const onTail = new Set<string>();
-  for (let e: Record<string, any> | undefined = entries[entries.length - 1]; e; e = byId.get(e.parentId)) onTail.add(e.id);
+  for (let e: Record<string, any> | undefined = entries[entries.length - 1]; e; e = piIsRoot(e, byId) ? undefined : byId.get(e.parentId)) onTail.add(e.id);
   res.offTail = entries.length - onTail.size;
 
   res.forkStatus = "none";
@@ -532,17 +543,24 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   for (const e of entries) if (textKids(e.id).length > 1) res.branchPoints++;
   // Views: root → tip paths. A view is born at the last entry on its path that is not its parent's first
   // text child (a root counts as one): that is when the branch it follows was appended. Views are
-  // partitioned in birth order.
+  // partitioned in birth order. One mutable DFS path, cut back to the depth of each popped entry.
   const pos = new Map(entries.map((e, i) => [e.id, i]));
   const views: { birth: number; recs: Rec[] }[] = [];
-  const stack: { e: Record<string, any>; recs: Rec[]; birth: number }[] = [];
-  for (const e of entries) if (!byId.has(e.parentId) && hasText.get(e.id)) stack.push({ e, recs: [], birth: pos.get(e.id)! });
+  const path: Rec[] = [];
+  const lens: number[] = []; // path length after each depth
+  const stack: { e: Record<string, any>; depth: number; birth: number }[] = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (piIsRoot(e, byId) && hasText.get(e.id)) stack.push({ e, depth: 0, birth: i });
+  }
   while (stack.length) {
-    const { e, recs, birth } = stack.pop()!;
-    const path = [...recs, ...navOf.get(e.id)!.filter(inSpan)];
+    const { e, depth, birth } = stack.pop()!;
+    path.length = depth ? lens[depth - 1] : 0;
+    for (const r of navOf.get(e.id)!) if (inSpan(r)) path.push(r);
+    lens[depth] = path.length;
     const kids = textKids(e.id);
-    if (kids.length === 0) views.push({ birth, recs: path });
-    kids.forEach((k, i) => stack.push({ e: k, recs: path, birth: i === 0 ? birth : pos.get(k.id)! }));
+    if (kids.length === 0) views.push({ birth, recs: path.slice() });
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ e: kids[i], depth: depth + 1, birth: i === 0 ? birth : pos.get(kids[i].id)! });
   }
   views.sort((a, b) => a.birth - b.birth);
   return { recs: own, views: views.map((v) => v.recs), seed: from?.registry, keys };
@@ -732,7 +750,10 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
     if (res.status !== "indexed") return { res };
     account(parsed.recs, res);
     const registry = partition(parsed.views, res, parsed.seed);
-    return { res, parent: parsed.keys && { keys: parsed.keys, registry } };
+    // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
+    // put quarantined history back into a descendant's spans.
+    const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
+    return { res, parent: usable ? { keys: parsed.keys!, registry } : undefined };
   } catch (e) {
     const fresh = emptyResult(path);
     Object.assign(res, fresh, { status: "skipped", reason: "unreadable", error: String((e as Error).message ?? e).slice(0, 200) });
@@ -814,7 +835,7 @@ export function dryRun(inputs: string[]) {
       (skipped[r.reason!] ??= []).push(r.path);
       continue;
     }
-    for (const k of ["records", "evidence", "offTail", "branchPoints", "views", "prefixSpans", "unpairedCalls", "inherited", "unresolved", "tornLines", "malformedLines", "exchanges", "spans", "oversizedSpans", "digestBytes", "summaryInputBytes", "lexicalBytes", "lexicalChunks", "forestInternalNodes"] as const)
+    for (const k of ["records", "evidence", "offTail", "branchPoints", "orphanRoots", "views", "prefixSpans", "unpairedCalls", "inherited", "unresolved", "tornLines", "malformedLines", "exchanges", "spans", "oversizedSpans", "digestBytes", "summaryInputBytes", "lexicalBytes", "lexicalChunks", "forestInternalNodes"] as const)
       total[k] += r[k];
     for (const [k, v] of Object.entries(r.nonContent)) inc(total.nonContent, k, v);
     for (const [k, v] of Object.entries(r.extensionTypes)) inc(total.extensionTypes, k, v);

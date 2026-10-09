@@ -12,7 +12,7 @@ opens no network connection and calls no model. There are no default directories
 
 Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
 only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
-cap) and the suite is green again once restored; latest log `/tmp/memex-review/mutate-dryrun4-132111.log`.
+cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log` and `mutate-dryrun5-141336.log`.
 Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
@@ -24,8 +24,9 @@ Rules without a listed mutation there are tested but not mutation-checked.
   `discoveryErrors` and the rest still runs. A Pi fork's parent is read only if it is itself one of
   the inputs. A file that fails to read or parse is reported as `unreadable` and the batch continues; a cut
   last line is `tornLines`, other bad lines `malformedLines`.
-- Pi session v3 only. Duplicate ids or a parent chain that never reaches a root make the file
-  `invalid-tree` (not read further). **All branches are counted** (retrieval covers every branch,
+- Pi session v3 only. Duplicate ids or a parent cycle make the file `invalid-tree` (not read further). An
+  entry whose `parentId` names no entry in the file is a root, as in Pi's own `getTree()`, and is counted
+  in `orphanRoots`. **All branches are counted** (retrieval covers every branch,
   DESIGN §4.3). Each root-to-tip path is a view, born when the entry that starts its own branch was
   appended (file order); views are partitioned in birth order: a later view reuses every earlier span
   lying whole on its path and ending on one of its own unit boundaries; where it forks inside an earlier
@@ -35,12 +36,15 @@ Rules without a listed mutation there are tested but not mutation-checked.
   DESIGN's rule gives for closed spans, not a replay. Records are counted once however many views hold
   them. Children holding only labels, state or extension context do not make a branch. Forest internal
   nodes: binary carries over each view's span list, identical (left, right) pairs one node (DESIGN §4.4);
-  a file with fewer than 4 spans of its own builds none (short session). The inferred tail (last entry)
-  is reported only, as `offTail`. `subagent-artifacts/*_transcript.jsonl` is skipped without being
-  opened. A fork inherits an entry only when the parent (itself valid) has the same id and content
-  (key-order-independent hash); inherited entries are not new evidence but stay on the child's views, and
-  the child starts from the parent's spans, so a fork inside a parent span gets P. Parent not given →
-  every entry `unresolved`; parent invalid or a fork chain looping back → `unresolved` as well.
+  a file whose views all have fewer than 4 spans builds none (short session) and leaves them for a longer
+  fork to build and count. The inferred tail (last entry) is reported only, as `offTail`.
+  `subagent-artifacts/*_transcript.jsonl` is skipped without being opened. A fork inherits an entry only
+  when the parent has the same id and content (key-order-independent hash); inherited entries are not new
+  evidence but stay on the child's views. A resolved fork family shares one span registry, keyed by the
+  ordered records (id + content hash), so a P cut by one fork is reused by its siblings. Only a file
+  whose own ancestry is resolved (or that is no fork) can be a parent: parent not given → every entry
+  `unresolved`; parent invalid, itself unresolved, or a fork chain looping back → `unresolved` too.
+  Traversal is linear in entries (tested for a 4× size ratio; a cheap per-entry copy is not caught).
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
   `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
   uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is
