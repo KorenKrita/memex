@@ -80,6 +80,8 @@ beforeEach(async () => {
   key = await addApiKey(db, "t");
 });
 
+/** The trace's rerank inputs, in the order they were sent. */
+const inputs = (d: any) => d.pool.filter((c: any) => c.rerank_input).sort((a: any, b: any) => a.rerank_input_pos - b.rerank_input_pos);
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
 const header = (id: string, extra = {}) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...extra });
@@ -121,10 +123,10 @@ test("three channels; a lexical-only answer reaches rerank through its guarantee
   const [t] = await db`select data from search_trace`;
   expect(t.data.channels.lex).toBe(41); // every user message says alpha; the rare token ranks first
   expect(t.data.channels.ft).toBe(40);
-  expect(t.data.candidates.length).toBe(40);
-  const rare = t.data.candidates.find((c: any) => c.ranks.lex === 1);
+  expect(inputs(t.data).length).toBe(40);
+  const rare = inputs(t.data).find((c: any) => c.ranks.lex === 1);
   expect(rare.ranks.ft).toBeUndefined();
-  expect(rare.final).toBe(1);
+  expect(rare.final_rank).toBe(1);
   expect(GUARANTEED).toBeGreaterThan(0);
 });
 
@@ -136,9 +138,9 @@ test("guaranteed slots: the answer only the lexical channel ranks first still re
   await drain(db);
   const r = await body(Q("alpha zx-7781"));
   const [t] = await db`select data from search_trace`;
-  const rare = t.data.candidates.find((c: any) => c.ranks.lex === 1);
+  const rare = inputs(t.data).find((c: any) => c.ranks.lex === 1);
   expect(rare).toBeTruthy();
-  const rrfRank = t.data.candidates.filter((c: any) => c.fused > rare.fused).length + 1;
+  const rrfRank = inputs(t.data).filter((c: any) => c.fused > rare.fused).length + 1;
   expect(rrfRank).toBeGreaterThan(8);
   expect(r.results[0].excerpt.text).toContain("zx-7781");
 });
@@ -233,17 +235,17 @@ test("over the rerank budget: attachments are dropped and marked incomplete", as
   const sent = requests.filter((x) => x.path.endsWith("/rerank")).at(-1)!.body.documents as string[];
   expect(sent.reduce((a, d) => a + Buffer.byteLength(d), 0)).toBeLessThanOrEqual(64 * 1024);
   const [t] = await db`select data from search_trace`;
-  expect(t.data.candidates.length).toBe(40);
+  expect(inputs(t.data).length).toBe(40);
   // Attachments go from the lowest-ranked candidates up; those are marked incomplete and not injectable.
-  const dropped = t.data.candidates.filter((c: any) => c.incomplete.includes("attachments-dropped"));
+  const dropped = inputs(t.data).filter((c: any) => c.incomplete.includes("attachments-dropped"));
   expect(dropped.length).toBeGreaterThan(0);
   expect(sent.reduce((a, d) => a + Buffer.byteLength(d), 0)).toBeGreaterThan(60 * 1024); // only what was needed
   const out = r.results.filter((x: any) => x.incomplete.includes("attachments-dropped"));
   expect(out.length).toBe(dropped.length);
   // Lowest initial-recall ranks lose attachments first: every dropped one ranks below every kept one.
-  const first = t.data.candidates.findIndex((c: any) => c.incomplete.includes("attachments-dropped"));
-  expect(t.data.candidates.slice(first).every((c: any) => c.attached === 0)).toBe(true);
-  expect(t.data.candidates.slice(0, first).some((c: any) => c.attached > 0)).toBe(true);
+  const first = inputs(t.data).findIndex((c: any) => c.incomplete.includes("attachments-dropped"));
+  expect(inputs(t.data).slice(first).every((c: any) => c.attached === 0)).toBe(true);
+  expect(inputs(t.data).slice(0, first).some((c: any) => c.attached > 0)).toBe(true);
   expect(out.every((x: any) => !x.injectable && x.attachments.length === 0)).toBe(true);
   expect(r.results.filter((x: any) => !x.incomplete.length).every((x: any) => x.injectable)).toBe(true);
   expect(sent.filter((d) => d.includes("[next exchange]")).length).toBeGreaterThan(0);
@@ -1119,10 +1121,18 @@ test("the trace records every stage: channel tops, fused order, the cut, the ret
   expect(d.top.lex.length).toBe(10);
   expect(d.top.ft.length).toBe(10);
   expect(d.top.vec.length).toBe(10);
-  expect(d.fused.length).toBe(10);
-  expect(d.fused[0].fused).toBeGreaterThanOrEqual(d.fused[9].fused);
-  expect(d.cut.length).toBeGreaterThan(0); // more than 40 candidates: some never reached rerank
-  for (const k of d.cut) expect(d.candidates.some((c: any) => c.key === k)).toBe(false);
+  // Every candidate of the pool, in fused order, including those the cut left out (past the 10th of them too).
+  expect(d.pool.map((c: any) => c.fused_rank)).toEqual(d.pool.map((_: any, i: number) => i + 1));
+  for (let i = 1; i < d.pool.length; i++) expect(d.pool[i - 1].fused).toBeGreaterThanOrEqual(d.pool[i].fused);
+  const cut = d.pool.filter((c: any) => !c.rerank_input);
+  expect(cut.length).toBeGreaterThan(10);
+  expect(inputs(d).length).toBe(40);
+  for (const c of cut) expect(c.rerank_rank).toBeUndefined();
+  // Survivors carry every later stage; the returned ones match the response.
+  for (const c of inputs(d)) expect(typeof c.rerank_rank === "number" && c.final_rank >= 1).toBe(true);
+  expect(d.pool.filter((c: any) => c.returned).sort((a: any, b: any) => a.final_rank - b.final_rank).map((c: any) => c.key)).toEqual(r.results.map((x: any) => x.key));
+  // Unit candidates name the representations they were hit through.
+  expect(d.pool.some((c: any) => c.key.startsWith("unit:") && c.reps.length > 0 && /^(ft|vec):sp_/.test(c.reps[0]))).toBe(true);
   expect(d.returned).toEqual(r.results.map((x: any) => x.key));
   for (const k of ["embed", "recall", "rerank", "total"]) expect(typeof d.ms[k]).toBe("number");
   expect(d.attempt).toBe(1);

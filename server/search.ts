@@ -359,15 +359,20 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
       c.sources.add(t.source);
     }
   }
-  // Trace (§6.5): each channel's first 10 by key, the fused order before the cut, what the cut left out.
+  // Trace (§6.5): each channel's first 10 by key, and every candidate of the pool (bounded by the channel
+  // limits) with its per-channel ranks, the representations it was hit through, its fused rank and whether it
+  // reached rerank. Keys and numbers only.
   const top = (rows: any[], f: (x: any) => string) => [...new Set(rows.map(f))].slice(0, 10);
   const fusedOrder = [...cands.values()].sort((a, b) => b.fused - a.fused || (a.key < b.key ? -1 : 1));
   return {
     chosen,
     channels: { lex: lex.length, ft: new Set(ft.map((x: any) => x.unit)).size, vec: new Set((vec as any[]).map((x) => x.unit)).size },
     top: { lex: top(lex as any[], (x) => "record:" + x.canon), ft: top(ft as any[], (x) => "unit:" + x.unit), vec: top(vec as any[], (x) => "unit:" + x.unit) },
-    fused: fusedOrder.slice(0, 10).map((c) => ({ key: c.key, fused: Number(c.fused.toFixed(5)), ranks: c.ranks })),
-    cut: fusedOrder.filter((c) => !chosen.includes(c)).slice(0, 10).map((c) => c.key),
+    pool: fusedOrder.map((c, i) => ({
+      key: c.key, ranks: c.ranks, fused: Number(c.fused.toFixed(5)), fused_rank: i + 1,
+      reps: c.reps.map((p) => `${p.channel}:${p.span}`), ...(c.hit ? { hit: c.hit.key } : {}),
+      rerank_input: chosen.includes(c),
+    })),
   };
 }
 
@@ -541,7 +546,16 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         stated: true,
       };
     });
-    const trace = rc.chosen.map((c, i) => ({ key: c.key, ranks: c.ranks, fused: Number(c.fused.toFixed(5)), rerank: scores[i], final: final.findIndex((x) => x.c === c) + 1, attached: c.attach.length, incomplete: [...new Set(c.incomplete)] }));
+    // Rerank stage, merged into the pool entries: rerank rank (by score), adjusted rank, attachments.
+    const rerankRank = new Map<Cand, number>();
+    if (!rerankSkip) [...rc.chosen.keys()].sort((x, y) => scores[y]! - scores[x]! || x - y).forEach((i, n) => rerankRank.set(rc.chosen[i], n + 1));
+    const byKey = new Map(rc.chosen.map((c, i) => [c.key, { c, i }]));
+    const pool = rc.pool.map((p) => {
+      const h = byKey.get(p.key);
+      if (!h) return p;
+      return { ...p, rerank_input_pos: h.i + 1, rerank: scores[h.i], rerank_rank: rerankRank.get(h.c) ?? null, final_rank: final.findIndex((x) => x.c === h.c) + 1,
+               returned: final.findIndex((x) => x.c === h.c) < r.limit!, attached: h.c.attach.length, incomplete: [...new Set(h.c.incomplete)] };
+    });
     // The trace is published like any derived artefact: under the shared barrier, only while the query's
     // basis and every candidate's still hold (a forget of the querying session deletes its traces).
     await searchHooks.beforeTrace();
@@ -550,8 +564,8 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       if (!(await unchanged(tx, deps))) return null;
       const [row] = await tx`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
                              ${{
-                               channels: rc.channels, top: rc.top, fused: rc.fused, cut: rc.cut,
-                               embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null, candidates: trace,
+                               channels: rc.channels, top: rc.top, pool,
+                               embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null,
                                returned: results.map((x) => x.key), attempt: tries, index_lag: s.lag,
                                ms: { embed: Math.round(tEmbed), recall: Math.round(tRecall), rerank: Math.round(tRerank), total: Math.round(performance.now() - t0) },
                              }}) returning id`;

@@ -24,5 +24,10 @@ Tests: a Postgres 17 with pgvector and pg_trgm at `MEMEX_PG_URL` (default
 - `mem_zoom` above span level (session card → forest root → children), stage 3.
 - `/memex trace` and `/memex why <id>` (the trace is written; the commands come with the plugins, stage 4).
 - Trace retention (14 days [待标定]).
+- The trace does not store the query as its own object (DESIGN §6.5): the query text is not kept at all, and
+  the trace row is bound to the querying source and deleted with it on forget.
+- The trace has no artefact versions (summary / embedding version per candidate) and no injection
+  confirmation: `returned` and `pool[].returned` mean "in the response", not "injected into a context" —
+  the plugins (stage 4) report what they inject.
 - Regex `mem_grep` joins every readable record's text and relies on the 5 s statement timeout; its cost at
   real corpus size is not measured.
