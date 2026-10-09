@@ -383,7 +383,7 @@ test("zoom: a span's records with paging and neighbours on its view; a record by
   expect(p2.records[0].text).toBe("f".repeat(100));
   // A record by canonical id.
   const rec = (await zoom(db, T0({ id: "record:" + s + ":a2" }))).body as any;
-  expect(rec.text).toBe("r3");
+  expect(rec.records.map((x: any) => x.text)).toEqual(["r3"]);
   // Forgetting one of the span's records makes the span unreadable.
   await db`insert into tomb values (${"canon:" + s + ":u1"})`;
   await expect(zoom(db, T0({ id: "span:" + mid.id }))).rejects.toThrow("not found or not readable");
@@ -956,4 +956,61 @@ test("label merge: unanimous stays, disagreement is mixed, an unlocated or branc
   expect(mergeLabels(["on-path", "unlocated"])).toBe("unlocated");
   expect(mergeLabels(["on-path", "branched"])).toBe("branched");
   expect(mergeLabels([])).toBe("unlocated");
+});
+
+// ---------- grep and zoom over whole record text (§6.4) ----------
+
+test("grep finds a literal across a chunk boundary and gives its byte offset in the record", async () => {
+  const pre = "中".repeat(2040); // 2,040 characters, 6,120 bytes: the token straddles the 2,048-character chunk cut
+  await put("gx", linear("gx", [["q", pre + "straddle-token-xyz tail"]]));
+  await drain(db);
+  expect((await db`select count(*)::int n from lexical where key like 'gx/a0:%'`)[0].n).toBe(2);
+  const g = (await grep(db, T0({ pattern: "straddle-token-xyz" }))).body as any;
+  expect(g.hits.length).toBe(1);
+  expect(g.hits[0]).toMatchObject({ offset: 6120, length: 18 });
+  expect(g.hits[0].snippet).toContain("straddle-token-xyz");
+  // The offset is what zoom pages in: a page starting there begins with the token.
+  const z = (await zoom(db, T0({ id: g.hits[0].record, offset: g.hits[0].offset, limit: 18 }))).body as any;
+  expect(z.records[0].text).toBe("straddle-token-xyz");
+});
+
+test("grep regex: one engine (Postgres), across chunks, with the match's own position and length", async () => {
+  await put("gy", linear("gy", [["q", "x".repeat(2040) + " xport=1 port=8080;"]]));
+  await drain(db);
+  // \m is an ARE word-start: JS would not understand it (a second engine would disagree or throw).
+  const g = (await grep(db, T0({ pattern: "\\mport=[0-9]+", regex: true }))).body as any;
+  expect(g.hits.length).toBe(1);
+  expect(g.hits[0]).toMatchObject({ offset: 2049, length: 9 }); // not "xport" (no word start there)
+  expect(g.hits[0].snippet).toContain("port=8080");
+});
+
+test("zoom record: every record of the host entry, in order; pages cut on character boundaries", async () => {
+  const s0 = await put("zr", [header("zr"), msg("user", "u0", null, "hi"),
+    JSON.stringify({ type: "message", id: "a0", parentId: "u0", timestamp: T, message: { role: "assistant", content: [
+      { type: "text", text: "前文中文" }, { type: "toolCall", id: "c1", name: "bash", arguments: { cmd: "ls /tmp" } }] } })]);
+  await drain(db);
+  const all = (await zoom(db, T0({ id: "record:" + s0 + ":a0" }))).body as any;
+  expect(all.records.map((x: any) => x.text)).toEqual(["前文中文", 'bash {"cmd":"ls /tmp"}']);
+  expect(all.records.map((x: any) => x.kind)).toEqual(["assistant", "tool_call"]);
+  // Pages of 4 bytes over "前文中文" (3 bytes each): every page holds whole characters, none lost or repeated.
+  let off = 0, got = "";
+  for (let i = 0; i < 20; i++) {
+    const p = (await zoom(db, T0({ id: "record:" + s0 + ":a0", offset: off, limit: 4 }))).body as any;
+    for (const x of p.records) expect(x.text).not.toContain("\uFFFD");
+    got += p.records.map((x: any) => x.text).join("|");
+    if (!p.more) break;
+    expect(p.next_offset).toBeGreaterThan(off);
+    off = p.next_offset;
+  }
+  expect(got.replaceAll("|", "")).toBe("前文中文" + 'bash {"cmd":"ls /tmp"}');
+  // An offset inside a character starts at the next whole one.
+  const mid = (await zoom(db, T0({ id: "record:" + s0 + ":a0", offset: 1, limit: 6 }))).body as any;
+  expect(mid.records[0].text).toBe("文中");
+});
+
+test("an emoji on a chunk boundary is stored whole", async () => {
+  await put("em", linear("em", [["q", "a".repeat(2047) + "😀 after"]]));
+  await drain(db);
+  const t = (await db`select string_agg(text, '' order by part) t from lexical where key like 'em/a0:%'`)[0].t;
+  expect(t).toBe("a".repeat(2047) + "😀 after");
 });

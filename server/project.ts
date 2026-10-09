@@ -161,7 +161,12 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
 const chunks = (text: string) => {
   const out: string[] = [];
   const t = text.replaceAll("\u0000", "");
-  for (let i = 0; i < t.length; i += LEXICAL_CHUNK) out.push(t.slice(i, i + LEXICAL_CHUNK));
+  // Never between the two halves of a surrogate pair (a lone half is not text: it would be stored as U+FFFD).
+  for (let i = 0, j; i < t.length; i = j) {
+    j = Math.min(t.length, i + LEXICAL_CHUNK);
+    if (j < t.length && /[\uD800-\uDBFF]/.test(t[j - 1])) j--;
+    out.push(t.slice(i, j));
+  }
   return out.length ? out : [""];
 };
 

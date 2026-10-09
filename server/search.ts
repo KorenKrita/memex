@@ -566,6 +566,48 @@ async function texts(q: Tx, keys: string[], valid: string[]) {
   return new Map<string, any>(rows.map((x: any) => [x.key, x]));
 }
 
+const cont = (b: Buffer, i: number) => i < b.length && (b[i] & 0xc0) === 0x80;
+/**
+ * A page of `limit` bytes over records laid end to end, starting at byte `offset`. Cuts land on UTF-8
+ * character boundaries (an offset inside a character moves forward, an end inside one moves back); `next` is
+ * the offset actually reached, so pages never split or repeat a character.
+ */
+function page(recs: { key: string; buf: Buffer }[], offset: number, limit: number) {
+  const parts: { key: string; bytes: number; from: number; text: string }[] = [];
+  let pos = 0, left = limit, next: number | null = null;
+  for (const { key, buf } of recs) {
+    const end = pos + buf.length;
+    if (offset >= end || !buf.length) {
+      pos = end;
+      continue;
+    }
+    let from = Math.max(0, offset - pos);
+    while (cont(buf, from)) from++;
+    if (left <= 0) {
+      next = pos + from;
+      break;
+    }
+    let to = Math.min(buf.length, from + left);
+    while (to > from && cont(buf, to)) to--;
+    if (to === from && from < buf.length) {
+      // Not even one character fits: the page ends here (a limit under 4 bytes still makes progress).
+      if (!parts.length) while (to < buf.length && (to === from || cont(buf, to))) to++;
+      else {
+        next = pos + from;
+        break;
+      }
+    }
+    parts.push({ key, bytes: buf.length, from, text: buf.subarray(from, to).toString() });
+    left -= to - from;
+    if (to < buf.length) {
+      next = pos + to;
+      break;
+    }
+    pos = end;
+  }
+  return { parts, more: next !== null, next };
+}
+
 /** mem_zoom: a span (or unit, or record) with its records' text, paged, and its neighbours on a view. */
 export async function zoom(db: Db, body: any): Promise<Guarded> {
   const r = toolReq(body);
@@ -578,12 +620,18 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       const valid = [...b.valid.keys()];
       if (id.startsWith("record:")) {
         const canon = id.slice(7);
-        const [row] = await q`select key from lexical l where canon = ${canon} and source = any(${q.array(valid, "text")})
-                              and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key limit 1`;
+        // One canonical record is one host entry; it may hold several records (#0 text, #1 a tool call ...).
+        const [row] = await q`select source from lexical l where canon = ${canon} and source = any(${q.array(valid, "text")})
+                              and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by source limit 1`;
         if (!row) throw new HttpError(404, "not found or not readable");
-        const t = (await texts(q, [row.key], valid)).get(row.key);
-        const page = Buffer.from(t.text).subarray(offset, offset + limit).toString();
-        return { deps: depsOf(b, [t.source]), body: { id, source: t.source, kind: t.kind, bytes: Buffer.byteLength(t.text), offset, text: page } };
+        const keys: string[] = (await q`select distinct key from lexical where canon = ${canon} and source = ${row.source}`).map((x: any) => x.key);
+        keys.sort((x: string, y: string) => Number(x.slice(x.lastIndexOf("#") + 1)) - Number(y.slice(y.lastIndexOf("#") + 1)));
+        const t = await texts(q, keys, [row.source]);
+        const pg = page(keys.map((k) => ({ key: k, buf: Buffer.from(t.get(k)?.text ?? "") })), offset, limit);
+        return {
+          deps: depsOf(b, [row.source]),
+          body: { id, source: row.source, records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
+        };
       }
       const sid = id.replace(/^(span|unit):/, "");
       const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
@@ -608,30 +656,14 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
       const order = v ? (v.spans as any[]).filter((x) => x.id).map((x) => x.id as string) : [sid];
       const i = order.indexOf(sid);
       const t = await texts(q, sp.keys, valid);
-      let skip = offset, left = limit, more = false;
-      const records = [];
-      for (const k of sp.keys as string[]) {
-        const x = t.get(k);
-        if (!x) continue;
-        const buf = Buffer.from(x.text);
-        if (skip >= buf.length) {
-          skip -= buf.length;
-          continue;
-        }
-        const part = buf.subarray(skip, skip + left);
-        records.push({ key: k, canon: x.canon, kind: x.kind, bytes: buf.length, from: skip, text: part.toString() });
-        left -= part.length;
-        skip = 0;
-        if (left <= 0) {
-          more = true;
-          break;
-        }
-      }
+      const pg = page((sp.keys as string[]).filter((k) => t.has(k)).map((k) => ({ key: k, buf: Buffer.from(t.get(k).text) })), offset, limit);
+      const records = pg.parts.map((x) => ({ ...x, canon: t.get(x.key).canon, kind: t.get(x.key).kind }));
+      const more = pg.more;
       const summary = (await q`select text from span_summary ss join span s on s.id = ss.span where ss.span = ${sid} and ss.input_fp = s.input_fp`)[0]?.text ?? null;
       return {
         deps: depsOf(b, [sp.source, ...[...t.values()].map((x) => x.source)]),
         body: {
-          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, view_basis: vb, ...(reason ? { reason } : {}), summary, records, more, next_offset: more ? offset + limit : null,
+          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, view_basis: vb, ...(reason ? { reason } : {}), summary, records, more, next_offset: pg.next,
           before: i > 0 ? "span:" + order[i - 1] : null, after: i >= 0 && i < order.length - 1 ? "span:" + order[i + 1] : null,
         },
       };
@@ -652,28 +684,40 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
       await q`select set_config('statement_timeout', '5000ms', true)`;
       const b = await basis(q, r);
       const valid = [...b.valid.keys()];
+      // Matching runs on each record's whole text (its chunks joined), in Postgres only: one regex engine
+      // (ARE), its time bounded by the statement timeout. Positions come back as UTF-8 byte offsets in the
+      // record text, the unit mem_zoom pages in. A literal pattern is located through the chunk index first;
+      // a match across a chunk boundary is found by joining each chunk with the start of the next.
       const rows = await (regex
-        ? q`select distinct on (key) key, source, canon, kind, part, text from lexical l
-            where source = any(${q.array(valid, "text")}) and text ~ ${pattern}
-            and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key, part limit ${GREP_MAX}`
-        : q`select distinct on (key) key, source, canon, kind, part, text from lexical l
-            where source = any(${q.array(valid, "text")}) and text like ${"%" + esc(pattern) + "%"}
-            and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key, part limit ${GREP_MAX}`).catch((e: any) => {
+        ? q`with t as (select key, source, canon, kind, string_agg(text, '' order by part) text from lexical l
+                       where source = any(${q.array(valid, "text")})
+                       and not exists (select 1 from tomb tb where tb.key = 'canon:' || l.canon)
+                       group by key, source, canon, kind),
+                 m as (select distinct on (key) key, source, canon, kind, text, regexp_instr(text, ${pattern}) at from t
+                       where text ~ ${pattern} order by key, source)
+            select key, source, canon, kind, octet_length(left(text, at - 1)) pre,
+                   octet_length(coalesce(regexp_substr(text, ${pattern}), '')) len,
+                   substr(text, greatest(1, at - 60), 60 + least(char_length(coalesce(regexp_substr(text, ${pattern}), '')), 200) + 100 - greatest(0, 61 - at)) snippet
+            from m order by key limit ${GREP_MAX}`
+        : q`with c as (select l.key, l.source from lexical l
+                       left join lexical n on n.source = l.source and n.key = l.key and n.part = l.part + 1
+                       where l.source = any(${q.array(valid, "text")})
+                       and (l.text like ${"%" + esc(pattern) + "%"} or (n.text is not null and position(${pattern} in right(l.text, ${pattern.length - 1}) || left(n.text, ${pattern.length - 1})) > 0))
+                       and not exists (select 1 from tomb tb where tb.key = 'canon:' || l.canon)
+                       group by l.key, l.source),
+                 t as (select distinct on (l.key) l.key, l.source, l.canon, l.kind, string_agg(l.text, '' order by l.part) text
+                       from lexical l join c on c.key = l.key and c.source = l.source group by l.key, l.source, l.canon, l.kind order by l.key, l.source)
+            select key, source, canon, kind, octet_length(left(text, strpos(text, ${pattern}) - 1)) pre, octet_length(${pattern}) len,
+                   substr(text, greatest(1, strpos(text, ${pattern}) - 60), 60 + char_length(${pattern}) + 100 - greatest(0, 61 - strpos(text, ${pattern}))) snippet
+            from t order by key limit ${GREP_MAX}`).catch((e: any) => {
         if (/regular expression|canceling statement/.test(String(e?.message))) throw new HttpError(400, "pattern invalid or too slow");
         throw e;
       });
-      const hits = [];
-      for (const x of rows) {
-        const m = regex ? new RegExp(pattern).exec(x.text) : null;
-        const at = regex ? (m?.index ?? 0) : x.text.indexOf(pattern);
-        const pre = Buffer.byteLength(x.text.slice(0, at));
-        const buf = Buffer.from(x.text);
-        hits.push({
-          record: "record:" + x.canon, key: x.key, source: x.source, kind: x.kind,
-          offset: x.part * 2048 + at, // character offset in the record's text (chunks are 2,048 characters)
-          snippet: buf.subarray(Math.max(0, pre - 120), pre + 200).toString().replace(/^\uFFFD+|\uFFFD+$/g, ""),
-        });
-      }
+      const hits = rows.map((x: any) => ({
+        record: "record:" + x.canon, key: x.key, source: x.source, kind: x.kind,
+        offset: Number(x.pre), length: Number(x.len), // UTF-8 bytes in the record's text
+        snippet: x.snippet,
+      }));
       return { deps: depsOf(b, [...new Set<string>(rows.map((x: any) => x.source))]), body: { hits, truncated: rows.length >= GREP_MAX } };
     });
     return new Guarded(out.deps, out.body, run);
