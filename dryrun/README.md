@@ -12,7 +12,7 @@ opens no network connection and calls no model. There are no default directories
 
 Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
 only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
-cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log`, `mutate-dryrun6-144322.log` and `mutate-dryrun7-151942.log` (there `parentGeq`, a tie taking the parent's view, survives: no test tells them apart; believed equivalent (both sources should cut an equally long shared prefix the same way), not proven).
+cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log`, `mutate-dryrun6-144322.log` and `mutate-dryrun7-151942.log` (there `parentGeq`, a tie taking the parent's view, survived: it is not equivalent, the seventh review found a case; now tested) and `mutate-dryrun8-153025.log`.
 Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
@@ -30,7 +30,7 @@ Rules without a listed mutation there are tested but not mutation-checked.
   DESIGN §4.3). Each root-to-tip path is a view; views are partitioned depth first, children in file
   (= creation) order. A later view's **source** is the view sharing its longest prefix among this file's
   earlier views (first one on a tie) and, for a resolved fork, its **direct parent's** views only (a tie
-  takes this file's: both cut the shared prefix the same way); an older ancestor holding the same records
+  takes this file's: the two can cut the shared prefix differently, as unit boundaries depend on the continuation); an older ancestor holding the same records
   is never the source, since the parent's partition already holds what it took from it. It reuses the
   source's spans lying whole on that prefix and ending on one of its own unit boundaries; where it forks
   inside a source span S it gets a prefix span P (cut back to whole units) and then its own spans, and S
@@ -48,7 +48,7 @@ Rules without a listed mutation there are tested but not mutation-checked.
   to (header `id`), through any number of descendants. Records new in a file are native to it, so
   byte-identical records new in two sibling forks stay two. A span is its ordered canonical records: an
   identical span (e.g. the same P cut by two forks) is counted once in the family, whichever file meets
-  it first. Only a file whose own ancestry is resolved (or that is no fork) can be a parent: parent not
+  it first; `prefixSpans` counts a span once if any view uses it as a P, whichever role met it first. Only a file whose own ancestry is resolved (or that is no fork) can be a parent: parent not
   given → every entry `unresolved`; parent invalid, itself unresolved, or a fork chain looping back →
   `unresolved` too.
 - Pi session identity is the header `id` (DESIGN §4.1); a Pi file without one is `no-session-id` and is

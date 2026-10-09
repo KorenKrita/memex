@@ -680,8 +680,8 @@ describe("fourth review", () => {
 
   test("a fork's second view through the same cut reuses its first view's spans", () => {
     // P: [u c r0]. C has two views: [u c r1] (forks inside P's unit: [u], [c r1]) and [u c r2], which
-    // shares [u c] with P's view and with C's first view. Either source gives the same cut there (a source
-    // sharing the same prefix length partitions it the same way), so: [u] reused, then [c r2].
+    // shares [u c] with P's view and with C's first view. Here both sources cut it
+    // alike: [u] reused, then [c r2] (see the next test for a tie where they differ).
     const P = file("pi/tie/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
     const C = file("pi/tie/C.jsonl", [
       piHeader({ id: "sC", parentSession: P }),
@@ -692,6 +692,49 @@ describe("fourth review", () => {
     ]);
     const c = dryRun([join(dir, "pi/tie")]).perFile.find((f) => f.path === C)!;
     expect(c).toMatchObject({ views: 2, spans: 3, prefixSpans: 1 });
+  });
+
+  // Seventh review: on an equal shared prefix the two sources can cut it differently (unit boundaries
+  // depend on the continuation), so this file's earlier view must win.
+  test("on an equal shared prefix this file's earlier view is the source, not the parent's", () => {
+    const P = file("pi/tie2/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
+    const C = file("pi/tie2/C.jsonl", [
+      piHeader({ id: "sC", parentSession: P }),
+      piMsg("u", null, user("u")),
+      piMsg("c", "u", call("t")),
+      piMsg("r1", "c", result("t", "B")),
+      piMsg("g", "c", user("g")),
+      piMsg("h", "g", user("h")),
+    ]);
+    const r = dryRun([join(dir, "pi/tie2")]);
+    // view 1: [u] (P cut from P's [u c r0]), [c r1]; view 2 follows view 1: [u] reused, [c] cut from [c r1],
+    // [g], [h]. The parent as source would give [u c] [g] [h] and no nodes for view 2's 3 leaves.
+    const tc = D("tool_call", "bash {}");
+    expect(r.perFile.find((f) => f.path === C)).toMatchObject({
+      summaryInputBytes: D("user", "u") + tc + D("tool_result", "B") + tc + D("user", "g") + D("user", "h"),
+      forestInternalNodes: 4,
+    });
+  });
+
+  test("a span counted as a prefix span once, whichever file meets it first and in which role", () => {
+    const run = (d: string, gName: string, sName: string) => {
+      const P = file(`${d}/P.jsonl`, [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
+      const C = file(`${d}/C.jsonl`, [piHeader({ id: "sC", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r1", "c", result("t", "B"))]);
+      file(`${d}/${gName}.jsonl`, [
+        piHeader({ id: "sG", parentSession: C }),
+        piMsg("u", null, user("u")),
+        piMsg("c", "u", call("t")),
+        piMsg("g", "c", user("g")),
+        piMsg("h", "g", user("h")),
+      ]);
+      // S: u′ (same id, other content: native to S) then P's c, inherited; too big for one span → [u′] [c]
+      file(`${d}/${sName}.jsonl`, [piHeader({ id: "sS", parentSession: P }), piMsg("u", null, user("x".repeat(12280))), piMsg("c", "u", call("t"))]);
+      const t = dryRun([join(dir, d)]).total;
+      return { prefixSpans: t.prefixSpans, spans: t.spans, summaryInputBytes: t.summaryInputBytes };
+    };
+    const a = run("pi/roles-ab", "A", "B");
+    expect(run("pi/roles-ba", "B", "A")).toEqual(a);
+    expect(a.prefixSpans).toBe(2); // P's [u] for C, C's [c] for G
   });
 
   // Sixth review: copies of one native session (same header id) are one session.
@@ -753,6 +796,26 @@ describe("fourth review", () => {
     const r = dryRun([join(dir, "pi/noid")]);
     expect(r.perFile.find((f) => f.path === p)).toMatchObject({ status: "skipped", reason: "no-session-id" });
     expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "unresolved", evidence: 0 });
+  });
+
+  test("copies are found whatever lines come before the header (blank, malformed, non-object)", () => {
+    const body = (more: unknown[] = []) => jsonl([piHeader({ id: "lead" }), piMsg("u", null, user("u")), ...more]);
+    // byte-identical copies, each led by a line the analysis skips: counted once
+    for (const lead of ["null\n", "\n", "{oops\n"]) {
+      const d = `pi/lead${JSON.stringify(lead).length}`;
+      file(`${d}/a.jsonl`, lead + body());
+      const b = file(`${d}/b.jsonl`, lead + body());
+      const r = dryRun([join(dir, d)]);
+      expect(r.perFile.find((f) => f.path === b)).toMatchObject({ reason: "duplicate-copy" });
+      expect(r.total.evidence).toBe(1);
+    }
+    // differing copies, one led by a blank line: both quarantined, and a fork of either stays unresolved
+    const x = file("pi/leadconf/a.jsonl", "\n" + body());
+    file("pi/leadconf/b.jsonl", body([piMsg("a", "u", say("more"))]));
+    const k = file("pi/leadconf/k.jsonl", [piHeader({ id: "k", parentSession: x }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const r = dryRun([join(dir, "pi/leadconf")]);
+    expect(r.skipped["conflicting-copies"]?.length).toBe(2);
+    expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "unresolved" });
   });
 
   test("a file rewritten between the copy pre-pass and analysis is refused", () => {

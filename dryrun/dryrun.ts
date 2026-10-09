@@ -226,7 +226,8 @@ function unitsOf(path: Rec[], unpaired: Set<string>): Rec[][] {
 //    a tie) and, for a resolved fork, its parent file's views (only the parent's: their partition already
 //    holds what the parent took from its own ancestors). Only the source's span list decides what is
 //    reused and where P is cut, so no other file's spans change this cut. On a tie this file's view is
-//    taken; both cut the shared prefix the same way.
+//    taken: the two can cut the shared prefix differently (unit boundaries depend on the continuation), and
+//    this file's earlier view is the nearer partition.
 //  - per resolved fork family (Family), shared: span identity (ordered canonical record keys → one span,
 //    e.g. the same P cut by two sibling forks) and forest nodes (identical (left, right) → one node).
 // Canonical record keys carry the session the record is native to, so byte-identical records new in two
@@ -238,9 +239,10 @@ type FileViews = {
 };
 type Family = {
   spanId: Map<string, string>; // ordered record keys → span id
+  prefixIds: Set<string>; // spans used as a prefix span P by some view (counted once, whichever role came first)
   nodeId: Map<string, string>; // `${left},${right}` → node id
 };
-const newFamily = (): Family => ({ spanId: new Map(), nodeId: new Map() });
+const newFamily = (): Family => ({ spanId: new Map(), prefixIds: new Set(), nodeId: new Map() });
 // Longest prefix of `path` in a file's trie, and the first view holding it.
 function sharedPrefix(fv: FileViews, path: Rec[]): { shared: number; src: number; node: number } {
   let node = 0;
@@ -278,9 +280,9 @@ function partition(views: Rec[][], res: FileResult, fam: Family = newFamily(), p
       fam.spanId.set(key, (id = `${res.path}#s${n++}`));
       res.spans++;
       res.summaryInputBytes += size;
-      if (prefix) res.prefixSpans++;
       if (size > SPAN_MAX) res.oversizedSpans++; // only a lone indivisible unit gets here
     }
+    if (prefix && !fam.prefixIds.has(id)) fam.prefixIds.add(id), res.prefixSpans++;
     return { start, end, id };
   };
   for (const path of views) {
@@ -404,7 +406,11 @@ function readText(path: string, want?: string, wantHash?: string): string {
 }
 
 function readLines(path: string, res: FileResult, want?: string, wantHash?: string): Record<string, any>[] {
-  const text = readText(path, want, wantHash);
+  return parseLines(readText(path, want, wantHash), res);
+}
+
+// JSONL lines that are objects, in order; anything else is counted on `res` and skipped.
+function parseLines(text: string, res: FileResult): Record<string, any>[] {
   const lines = text.split("\n");
   const out: Record<string, any>[] = [];
   lines.forEach((line, i) => {
@@ -892,7 +898,7 @@ export function dryRun(inputs: string[]) {
     if (PI_SUBAGENT.test(f) || f.endsWith(".zst")) continue;
     try {
       const text = readText(f, identity.get(f));
-      const head = JSON.parse(text.slice(0, text.indexOf("\n") < 0 ? text.length : text.indexOf("\n")));
+      const head = parseLines(text, emptyResult(f))[0]; // the header the analysis will take
       if (head?.type !== "session" || typeof head.id !== "string" || !head.id) continue;
       copyHash.set(f, createHash("sha256").update(text).digest("hex"));
       (groups.get(head.id) ?? groups.set(head.id, []).get(head.id)!).push(f);
