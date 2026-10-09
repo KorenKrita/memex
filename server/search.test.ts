@@ -736,16 +736,21 @@ test("zoom and grep: forgetting the querying session before delivery is not answ
   const H = await put("hist5", linear("hist5", [["alpha history-five", "ANSWER-five"]]));
   await drain(db);
   const [sp] = await db`select id from span where source = ${H} limit 1`;
-  const asker = await put("asker5", linear("asker5", [["asking", "r"]]));
-  await drain(db);
-  const cases: [string, string, object][] = [
-    ["synced, zoom", asker, { id: "span:" + sp.id }],
-    ["synced, grep hit", asker, { pattern: "history-five" }],
-    ["synced, grep no hit", asker, { pattern: "nothing-matches-this" }],
-    ["never synced, zoom", sourceIdOf("pi", "never5"), { id: "span:" + sp.id }],
-    ["never synced, grep hit", sourceIdOf("pi", "never5b"), { pattern: "history-five" }],
+  // Each case its own querying session, so the race is the one exercised: the result is computed while the
+  // session is live, the forget lands between that and delivery (the hook ran), and nothing is delivered.
+  const cases: [string, boolean, object][] = [
+    ["synced, zoom", true, { id: "span:" + sp.id }],
+    ["synced, grep hit", true, { pattern: "history-five" }],
+    ["synced, grep no hit", true, { pattern: "nothing-matches-this" }],
+    ["never synced, zoom", false, { id: "span:" + sp.id }],
+    ["never synced, grep hit", false, { pattern: "history-five" }],
+    ["never synced, grep no hit", false, { pattern: "nothing-matches-this" }],
   ];
-  for (const [name, A, b] of cases) {
+  let n = 0;
+  for (const [name, synced, b] of cases) {
+    const native = "asker5-" + n++;
+    const A = synced ? await put(native, linear(native, [["asking", "r"]])) : sourceIdOf("pi", native);
+    if (synced) await drain(db);
     let fired = 0;
     httpHooks.beforeGuard = async () => {
       if (fired++) return;
@@ -754,8 +759,9 @@ test("zoom and grep: forgetting the querying session before delivery is not answ
     const path = "id" in b ? "zoom" : "grep";
     const res = await fetch(`http://127.0.0.1:${api.port}/v1/${path}`, { method: "POST", headers: { authorization: `Bearer ${key}` },
       body: JSON.stringify(T0({ ...b, source: A })) });
-    expect([name, res.status]).toEqual([name, 410]);
-    expect(await res.text()).not.toContain("five");
+    const txt = await res.text();
+    expect([name, fired > 0, res.status]).toEqual([name, true, 410]);
+    expect(txt).not.toContain("five");
   }
 });
 
@@ -1269,4 +1275,13 @@ test("an explicit view_key must be whole: basis and version are required and typ
   const vk = (await body(Q("pwtoken", { dests: [] }))).results[0].path.view_key;
   for (const bad of [{ ...vk, version: undefined }, { ...vk, version: 1 }, { ...vk, basis: undefined }, { ...vk, basis: "made-up" }, { ...vk, tip: 3 }])
     await expect(zoom(db, T0({ id: "record:" + s0 + ":u0", view_key: bad }))).rejects.toThrow("view_key");
+});
+
+test("zoom a record under a view_key of another session: refused (the key does not cover it)", async () => {
+  const A = await put("ka", linear("ka", [["alpha katoken", "r"]]));
+  const B = await put("kb", linear("kb", [["alpha kbtoken", "r"]]));
+  await drain(db);
+  const vkA = (await body(Q("katoken", { dests: [] }))).results.find((x: any) => x.source === A).path.view_key;
+  await expect(zoom(db, T0({ id: "record:" + B + ":u0", view_key: vkA }))).rejects.toThrow("not found");
+  expect(((await zoom(db, T0({ id: "record:" + A + ":u0", view_key: vkA }))).body as any).records[0].text).toContain("katoken");
 });
