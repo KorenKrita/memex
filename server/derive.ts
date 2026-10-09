@@ -14,6 +14,7 @@ import http from "node:http";
 import https from "node:https";
 import { type Db, type Job, type Tx, addMigration, bump, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
+import "./project.ts"; // its migration (span) must be registered before ours (span_summary references it)
 import { contentHash } from "../dryrun/dryrun.ts";
 import { sourceIdOf } from "../client/records.ts";
 

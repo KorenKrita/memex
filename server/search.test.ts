@@ -812,3 +812,57 @@ test("a record hit in a record that both S and its fork prefix P hold: correctio
     expect(d).toContain("换成 mysql");
   }
 });
+
+test("units follow the span's current unit, not the one stored with an older summary", async () => {
+  await put("um", linear("um", [["alpha unit-move", "r"]]));
+  await drain(db);
+  const [sp] = await db`select id from span limit 1`;
+  // The summary row still names an old unit (as after a re-projection moved the span into another unit).
+  await db`update span_summary set unit = 'stale-unit' where span = ${sp.id}`;
+  const r = await body(Q("unit-move", { dests: [] }));
+  expect(r.results.some((x: any) => x.key === "unit:" + sp.id)).toBe(true);
+  expect(r.results.some((x: any) => x.key === "unit:stale-unit")).toBe(false);
+});
+
+test("an upgraded database (columns added later, empty): migrate re-projects, search works without a new sync", async () => {
+  const s0 = await put("mg", linear("mg", [["alpha upgrade-token", "r"]]));
+  await drain(db);
+  // As written by the previous version: no read basis, no canonical ids.
+  await db`update projected set deps = '{}'`;
+  await db`update lexical set canon = ''`;
+  await db`update span set canons = '{}'`;
+  expect(((await search(db, Q("upgrade-token", { dests: [] }))).body as any).results.length).toBe(0); // hidden, not wrong
+  await migrate(db);
+  expect((await db`select count(*)::int n from job where kind = 'project' and key = ${s0} and state = 'queued'`)[0].n).toBe(1);
+  await drain(db);
+  expect((await db`select count(*)::int n from lexical where canon = ''`)[0].n).toBe(0);
+  expect((await db`select count(*)::int n from span where canons = '{}'`)[0].n).toBe(0);
+  expect(JSON.stringify(((await search(db, Q("upgrade-token", { dests: [] }))).body as any).results)).toContain("upgrade-token");
+});
+
+test("a fresh database: the entry point creates every table before serving", async () => {
+  const { start } = await import("./main.ts");
+  const name = "memex_fresh_" + Date.now();
+  await db.unsafe(`create database ${name}`);
+  const url = (process.env.MEMEX_PG_URL ?? "postgres://postgres:memex@127.0.0.1:55433/memex").replace(/\/[^/]*$/, "/" + name);
+  const prev = process.env.MEMEX_PG_URL;
+  process.env.MEMEX_PG_URL = url;
+  try {
+    await db.unsafe(`select 1`);
+    const fresh = connect(url);
+    await fresh.unsafe("create extension if not exists vector");
+    await fresh.unsafe("create extension if not exists pg_trgm");
+    await fresh.close();
+    const s = await start({ port: 0 });
+    const tables = (await s.db`select tablename from pg_tables where schemaname = 'public'`).map((r: any) => r.tablename);
+    for (const t of ["span", "span_summary", "search_trace", "lexical", "projected", "tomb"]) expect(tables).toContain(t);
+    const k = await addApiKey(s.db, "fresh");
+    const r = await fetch(`http://127.0.0.1:${s.port}/v1/grep`, { method: "POST", headers: { authorization: `Bearer ${k}` }, body: JSON.stringify(T0({ pattern: "x" })) });
+    expect(r.status).toBe(403); // no grants yet: refused, not a missing table
+    await s.close();
+  } finally {
+    if (prev === undefined) delete process.env.MEMEX_PG_URL;
+    else process.env.MEMEX_PG_URL = prev;
+    await db.unsafe(`drop database if exists ${name} with (force)`);
+  }
+});

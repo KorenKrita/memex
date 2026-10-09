@@ -205,7 +205,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   // 2. Summary full text (summary + anchors): units ranked by their best representation.
   const ft = await q`
     with reps as (
-      select ss.unit, ss.span, sp.source, ss.text, sp.keys,
+      select sp.unit, ss.span, sp.source, ss.text, sp.keys,
              (select coalesce(sum(w), 0) from unnest(${q.array(pats, "text")}::text[], ${q.array(ws, "float8")}::float8[]) p(p, w) where ss.ft ilike p.p)
                + 0.01 * similarity(ss.ft, ${r.query}) score
       from span_summary ss join span sp on sp.id = ss.span
@@ -218,7 +218,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   const vec = qv
     ? await q`
     with reps as (
-      select ss.unit, ss.span, sp.source, ss.text, sp.keys, 1 - (ss.embedding <=> ${"[" + qv.join(",") + "]"}::vector) score
+      select sp.unit, ss.span, sp.source, ss.text, sp.keys, 1 - (ss.embedding <=> ${"[" + qv.join(",") + "]"}::vector) score
       from span_summary ss join span sp on sp.id = ss.span
       where ss.embedding is not null and ss.embed_model = ${process.env.MEMEX_EMBED_MODEL ?? ""} and ${repFilter("ss")}),
     ranked as (select *, row_number() over (partition by unit order by score desc, span) rn, max(score) over (partition by unit) best from reps)

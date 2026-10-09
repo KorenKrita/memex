@@ -52,6 +52,14 @@ alter table projected add column if not exists deps jsonb not null default '{}';
 -- can drop forgotten evidence before it cuts a channel; key indexes for excerpts and successor lookups.
 alter table lexical add column if not exists canon text not null default '';
 alter table span add column if not exists canons text[] not null default '{}';
+-- Backfill after an upgrade: a projection written before these columns existed is projected again (its
+-- rows stay out of search until then: projected.deps '{}' never counts as current).
+insert into job (kind, key)
+  select 'project', p.source from projected p
+  where (p.deps = '{}'::jsonb or exists (select 1 from lexical l where l.source = p.source and l.canon = '')
+         or exists (select 1 from span s where s.source = p.source and s.canons = '{}'))
+    and not exists (select 1 from job j where j.kind = 'project' and j.key = p.source and j.state in ('queued', 'running'))
+    and not exists (select 1 from tomb t where t.key = 'source:' || p.source);
 create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
 `);
@@ -215,17 +223,22 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
         const unit = s.prefix && cutUsed ? s.cut! : id;
         const keys = s.records.map((r: SpanRecord) => r.key);
         const fp = inputFpOf(s);
-        const [old] = await tx`select input_fp, unit from span where id = ${id}`;
+        const canons = keys.map((k: string) => canonOf(a.harness, k));
+        const [old] = await tx`select input_fp, unit, canons from span where id = ${id}`;
         if (!old) {
           await tx`insert into span (id, source, prefix, cut, unit, keys, records, context, input_fp, canons)
                    values (${id}, ${source}, ${s.prefix}, ${s.cut ?? null}, ${unit}, ${tx.array(keys, "text")}, ${s.records}, ${s.context}, ${fp},
-                           ${tx.array(keys.map((k: string) => canonOf(a.harness, k)), "text")})`;
+                           ${tx.array(canons, "text")})`;
           own.add(id);
-        } else if (old.input_fp !== fp || old.unit !== unit) {
-          await tx`update span set records = ${s.records}, context = ${s.context}, input_fp = ${fp}, unit = ${unit} where id = ${id}`;
+        } else if (old.input_fp !== fp || old.unit !== unit || JSON.stringify(old.canons) !== JSON.stringify(canons)) {
+          await tx`update span set records = ${s.records}, context = ${s.context}, input_fp = ${fp}, unit = ${unit},
+                   canons = ${tx.array(canons, "text")} where id = ${id}`;
           if (old.input_fp !== fp) (withdrawn = true), refresh.add(id);
         }
       }
+      // Spans kept from an earlier partition (not re-emitted) written before `canons` existed: fill them in.
+      for (const r of await tx`select id, keys from span where source = ${source} and canons = '{}' and cardinality(keys) > 0`)
+        await tx`update span set canons = ${tx.array((r.keys as string[]).map((k) => canonOf(a.harness, k)), "text")} where id = ${r.id}`;
       // An open tail closes by idling, with no new commit to wake us: look again when it would have.
       if (rows.some((r) => r.closed_end < r.keys.length)) await enqueue(tx, "project", source, {}, Math.max(0, idleCloseMs() - a.idleMs) + 1000);
       for (const id of closed)
