@@ -207,11 +207,13 @@ describe("Pi", () => {
   test("subagent transcripts are not read, not even by the fork pre-pass", () => {
     const sub = file("pi/sub/subagent-artifacts/x_transcript.jsonl", jsonl([piHeader(), piMsg("u", null, user("child"))]));
     const child = file("pi/sub/child.jsonl", [piHeader({ parentSession: sub }), piMsg("u", null, user("child"))]);
-    const spy = spyOn(fs, "readFileSync");
+    // production opens by path and reads the descriptor, so observe openSync paths
+    const spy = spyOn(fs, "openSync");
     const report = dryRun([join(dir, "pi/sub")]);
-    const read = spy.mock.calls.map((c) => String(c[0]));
+    const opened = spy.mock.calls.map((c) => String(c[0]));
     spy.mockRestore();
-    expect(read).not.toContain(sub);
+    expect(opened).toContain(child); // the spy does see production opens
+    expect(opened).not.toContain(sub);
     expect(report.skipped["child-thread"]).toEqual([sub]);
     expect(report.perFile.find((f) => f.path === child)!.forkStatus).toBe("parent-not-given");
   });
@@ -381,11 +383,14 @@ describe("units and spans", () => {
     expect(r.digestBytes).toBe(B("user: 记忆系统\n"));
   });
 
-  test("tool output middle is cut from the digest but fully in lexical chunks", () => {
-    const out = "head\n" + "m".repeat(5000) + "\nERROR: middle failure\n" + "m".repeat(5000) + "\ntail";
+  test("tool output digest keeps head, tail, error lines and a locator; lexical keeps everything", () => {
+    const H = "H".repeat(1024);
+    const T = "T".repeat(1024);
+    const out = `${H}\n${"m".repeat(3000)}\nERROR: middle failure\n${"m".repeat(3000)}\n${T}`;
     const r = analyzeFile(file("pi/tool.jsonl", [piHeader(), piMsg("u1", null, user("q")), piMsg("c", "u1", call("t")), piMsg("r", "c", result("t", out))]));
     expect(r.lexicalBytes).toBe(B("q") + B("bash {}") + B(out));
-    expect(r.digestBytes).toBeLessThan(3000);
+    const digest = `tool_result: ${H}\n‹tool-output record=r bytes=${B(out)}›\nERROR: middle failure\n${T}`;
+    expect(r.digestBytes).toBe(D("user", "q") + D("tool_call", "bash {}") + B(digest) + 1);
     expect(r.lexicalChunks).toBe(1 + 1 + Math.ceil(B(out) / 2048));
   });
 
@@ -394,6 +399,134 @@ describe("units and spans", () => {
     for (let i = 0; i < 13; i++) rows.push(piMsg(`u${i}`, i ? `u${i - 1}` : null, user(`q${i}`)));
     const r = analyzeFile(file("pi/forest.jsonl", rows));
     expect(r).toMatchObject({ views: 1, spans: 13, forestInternalNodes: 10 });
+  });
+});
+
+// Runs code against this module in a child process with a deadline, so a hang fails the test
+// instead of the suite. `signal` is set when the deadline killed it.
+const isolated = (code: string, timeout = 5000) => {
+  const mod = JSON.stringify(join(import.meta.dir, "dryrun.ts"));
+  const p = Bun.spawnSync(["bun", "-e", `import { analyzeFile, dryRun } from ${mod};\n${code}`], { timeout, stdout: "pipe", stderr: "pipe" });
+  return { exit: p.exitCode, signal: p.signalCode ?? null, out: p.stdout.toString(), err: p.stderr.toString() };
+};
+const keptAside = () => {
+  const k = join(dir, "kept");
+  mkdirSync(k, { recursive: true });
+  return k;
+};
+
+describe("third review", () => {
+  test("a reused span must end on a unit boundary of the new view, or a later result is lost", () => {
+    const p = file("pi/reuse-boundary.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("q")),
+      piMsg("c", "u", call("t")),
+      piMsg("x", "c", say("waiting")),
+      piMsg("old", "x", user("next")), // first view: the call is unpaired here
+      piMsg("r", "x", result("t", "RESULT")), // second view: [c x r] is one unit
+    ]);
+    // [u c x], [old]; then P = [u] and [c x r]
+    expect(analyzeFile(p)).toMatchObject({ spans: 4, prefixSpans: 1, unpairedCalls: 1 });
+    expect(analyzeFile(p).summaryInputBytes).toBe(
+      D("user", "q") + D("tool_call", "bash {}") + D("assistant", "waiting") + D("user", "next") + D("user", "q") + D("tool_call", "bash {}") + D("assistant", "waiting") + D("tool_result", "RESULT"),
+    );
+  });
+
+  test("duplicate ids or a parent cycle make the file invalid; the batch goes on", () => {
+    const dup = file("cycle/dup.jsonl", [piHeader(), piMsg("a", null, user("first")), piMsg("b", "a", user("second")), piMsg("a", "b", user("duplicate"))]);
+    const loop = file("cycle/loop.jsonl", [piHeader(), piMsg("a", "b", user("x")), piMsg("b", "a", user("y"))]);
+    const self = file("cycle/self.jsonl", [piHeader(), piMsg("a", "a", user("self"))]);
+    file("cycle/ok.jsonl", [piHeader(), piMsg("u", null, user("fine"))]);
+    const r = isolated(`const r = dryRun([${JSON.stringify(join(dir, "cycle"))}]); console.log(JSON.stringify({ skipped: r.skipped, evidence: r.total.evidence }));`);
+    expect(r.signal).toBeNull(); // not killed by the deadline
+    expect(JSON.parse(r.out)).toEqual({ skipped: { "invalid-tree": [dup, loop, self] }, evidence: 1 });
+  });
+
+  test("a file swapped for a FIFO after discovery is refused without blocking", () => {
+    const p = file("fifo/a.jsonl", [piHeader(), piMsg("u", null, user("inside"))]);
+    const { identity } = collect([join(dir, "fifo")]);
+    renameSync(p, join(keptAside(), "fifo-a.jsonl"));
+    Bun.spawnSync(["mkfifo", p]);
+    const r = isolated(`const r = analyzeFile(${JSON.stringify(p)}, { identity: ${JSON.stringify(identity.get(p))} }); console.log(JSON.stringify([r.status, r.reason]));`);
+    expect(r.signal).toBeNull();
+    expect(JSON.parse(r.out)).toEqual(["skipped", "unreadable"]);
+  });
+
+  test("views are taken in creation order, also for nested forks", () => {
+    const p = file("pi/nested-order.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("u".repeat(3000))),
+      piMsg("a", "u", say("a".repeat(3000))),
+      piMsg("x", "a", say("x".repeat(3000))), // view 1: u-a-x
+      piMsg("b", "u", say("b".repeat(1000))), // view 2: u-b
+      piMsg("y", "a", say("y".repeat(1000))), // view 3: u-a-y
+    ]);
+    // [u a x]; P = [u], [b]; reuse P, then [a y]
+    const r = analyzeFile(p);
+    expect(r).toMatchObject({ views: 3, spans: 4, prefixSpans: 1 });
+    const U = D("user", "u".repeat(3000));
+    const A = D("assistant", "a".repeat(3000));
+    expect(r.summaryInputBytes).toBe(U + A + D("assistant", "x".repeat(3000)) + U + D("assistant", "b".repeat(1000)) + A + D("assistant", "y".repeat(1000)));
+  });
+
+  test("a branch that keeps growing after a later fork is still the earlier view", () => {
+    const p = file("pi/late-growth.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("u".repeat(3000))),
+      piMsg("a", "u", say("a".repeat(3000))),
+      piMsg("b", "u", say("b".repeat(1000))), // second view forks inside [u a ...]
+      piMsg("a2", "a", say("c".repeat(1000))), // first view grows on
+    ]);
+    // [u a a2]; P = [u], [b]
+    expect(analyzeFile(p)).toMatchObject({ views: 2, spans: 3, prefixSpans: 1 });
+  });
+
+  test("a resolved Pi fork keeps the inherited prefix for navigation, not as new evidence", () => {
+    const parent = file("pi/xfork/parent.jsonl", [piHeader(), piMsg("u", null, user("question")), piMsg("a", "u", say("old reply"))]);
+    const child = file("pi/xfork/child.jsonl", [piHeader({ id: "s2", parentSession: parent }), piMsg("u", null, user("question")), piMsg("b", "u", say("new reply"))]);
+    const r = dryRun([join(dir, "pi/xfork")]);
+    // parent S = [u a]; child P = [u], [b]
+    expect(r.total).toMatchObject({ spans: 3, prefixSpans: 1 });
+    expect(r.total.digestBytes).toBe(D("user", "question") + D("assistant", "old reply") + D("assistant", "new reply"));
+    expect(r.total.summaryInputBytes).toBe(r.total.digestBytes + D("user", "question"));
+    expect(r.perFile.find((f) => f.path === child)).toMatchObject({ forkStatus: "resolved", inherited: 1, evidence: 1 });
+  });
+
+  test("a fork whose parent file is invalid is not resolved against it", () => {
+    const parent = file("pi/badparent/parent.jsonl", [piHeader(), piMsg("u", null, user("q")), piMsg("u", "u", user("dup"))]);
+    const child = file("pi/badparent/child.jsonl", [piHeader({ id: "s2", parentSession: parent }), piMsg("u", null, user("q")), piMsg("b", "u", say("new"))]);
+    const r = dryRun([join(dir, "pi/badparent")]);
+    expect(r.skipped["invalid-tree"]).toEqual([parent]);
+    expect(r.perFile.find((f) => f.path === child)).toMatchObject({ forkStatus: "unresolved", evidence: 0 });
+  });
+
+  test("short sessions (< 4 leaves) build no internal nodes", () => {
+    const linear = (n: number) => {
+      const rows: unknown[] = [piHeader()];
+      for (let i = 0; i < n; i++) rows.push(piMsg(`u${i}`, i ? `u${i - 1}` : null, user(`q${i}`)));
+      return analyzeFile(file(`pi/short-${n}.jsonl`, rows));
+    };
+    expect([2, 3, 4].map((n) => [linear(n).spans, linear(n).forestInternalNodes])).toEqual([
+      [2, 0],
+      [3, 0],
+      [4, 3],
+    ]);
+  });
+
+  test("a completed memory call is paired; an unanswered call at the end of the file is not", () => {
+    const mem = analyzeFile(pi("mem-paired", [user("q"), call("m", "mem_search"), result("m", "R", "mem_search"), user("next")]));
+    expect(mem).toMatchObject({ unpairedCalls: 0, spans: 2 });
+    expect(analyzeFile(pi("eof-unpaired", [user("q"), call("A")]))).toMatchObject({ unpairedCalls: 1, spans: 1 });
+  });
+
+  test("a child holding only extension context does not make a branch", () => {
+    const p = file("pi/ctx-branch.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("q")),
+      { type: "custom_message", id: "x", parentId: "u", customType: "some-extension", content: "ctx", display: false, timestamp: "t" },
+      piMsg("a", "u", say("answer")),
+    ]);
+    expect(analyzeFile(p)).toMatchObject({ branchPoints: 0, views: 1, spans: 1 });
   });
 });
 

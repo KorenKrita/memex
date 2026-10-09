@@ -6,32 +6,41 @@ text by reason, exchanges, views, spans (prefix spans and oversized ones separat
 `digest_text` bytes, `lexical_chunks` bytes and chunks, and forest internal nodes. Two size measures:
 `digestBytes` counts each record once; `summaryInputBytes` sums every span, so a prefix span P re-reads its
 prefix. Neither includes `<context>` neighbours, internal-node summary input or retries, and spans plus
-forest nodes are not a call count (cold sessions build internal nodes on demand, DESIGN §4.4). It reads only the given paths, writes nothing,
+forest nodes are not a call count (cold sessions build internal nodes on demand, DESIGN §5.5). It reads
+only the given paths, writes nothing,
 opens no network connection and calls no model. There are no default directories.
 
-Rules implemented (each pinned by a test in `dryrun.test.ts`, all on synthetic logs; each rule was also
-broken on purpose: a mutation counts only if it compiles, changes the targeted behaviour, turns a named
-test red and the suite is green again once restored; latest log `/tmp/memex-review/mutate-dryrun3-115235.log`):
+Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
+only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
+cap) and the suite is green again once restored; latest log `/tmp/memex-review/mutate-dryrun4-132111.log`.
+Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
   never followed; overlapping inputs are deduplicated. Roots resolve to their real path; files are opened
-  with `O_NOFOLLOW` and must still be the inode `collect()` saw (passed explicitly, no module state).
-  **Not closed:** `O_NOFOLLOW` guards only the last path component; a parent directory swapped for a link
-  between its check and `readdir`/`open` can still redirect reads (Node has no openat-style traversal). Missing or unlistable paths go to
+  with `O_NOFOLLOW | O_NONBLOCK` (a FIFO swapped in cannot block) and must still be the inode `collect()`
+  saw (passed explicitly, no module state). **Not closed:** `O_NOFOLLOW` guards only the last path
+  component; a parent directory swapped for a link between its check and `readdir`/`open` can still
+  redirect reads (Node has no openat-style traversal). Missing or unlistable paths go to
   `discoveryErrors` and the rest still runs. A Pi fork's parent is read only if it is itself one of
   the inputs. A file that fails to read or parse is reported as `unreadable` and the batch continues; a cut
   last line is `tornLines`, other bad lines `malformedLines`.
-- Pi session v3 only. **All branches are counted** (retrieval covers every branch, DESIGN §4.3). Each
-  root-to-tip path is a view; views are partitioned in creation order (first child first), as DESIGN's
-  online rule would: a later view reuses every earlier span lying whole on its path; where it forks inside
-  an earlier closed span S it gets a prefix span P (cut back to whole units) and then its own spans, and S
-  stays for its view. A fork on a span boundary shares directly. Records are counted once however many
-  views hold them. Children holding only labels, state or extension context do not make a branch. Forest
-  internal nodes: binary carries over each view's span list, identical (left, right) pairs one node
-  (DESIGN §4.4). The inferred tail (last entry) is reported only, as `offTail`.
-  `subagent-artifacts/*_transcript.jsonl` is skipped without being read, also by the fork pre-pass. A fork
-  inherits an entry only when the parent has the same id and content (key-order-independent hash); with
-  the parent not given, every entry is `unresolved` (not new evidence).
+- Pi session v3 only. Duplicate ids or a parent chain that never reaches a root make the file
+  `invalid-tree` (not read further). **All branches are counted** (retrieval covers every branch,
+  DESIGN §4.3). Each root-to-tip path is a view, born when the entry that starts its own branch was
+  appended (file order); views are partitioned in birth order: a later view reuses every earlier span
+  lying whole on its path and ending on one of its own unit boundaries; where it forks inside an earlier
+  span S it gets a prefix span P (cut back to whole units) and then its own spans, and S stays for its
+  view. A fork on a span boundary shares directly. **Assumption:** spans are taken as finally cut; the logs
+  do not say whether a span was still open when a later branch forked from it, so P counts are what
+  DESIGN's rule gives for closed spans, not a replay. Records are counted once however many views hold
+  them. Children holding only labels, state or extension context do not make a branch. Forest internal
+  nodes: binary carries over each view's span list, identical (left, right) pairs one node (DESIGN §4.4);
+  a file with fewer than 4 spans of its own builds none (short session). The inferred tail (last entry)
+  is reported only, as `offTail`. `subagent-artifacts/*_transcript.jsonl` is skipped without being
+  opened. A fork inherits an entry only when the parent (itself valid) has the same id and content
+  (key-order-independent hash); inherited entries are not new evidence but stay on the child's views, and
+  the child starts from the parent's spans, so a fork inside a parent span gets P. Parent not given →
+  every entry `unresolved`; parent invalid or a fork chain looping back → `unresolved` as well.
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
   `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
   uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is
