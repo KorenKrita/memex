@@ -39,7 +39,7 @@ clock, commit-id short-circuit, conflict bumping the version, generation-vector 
 over a valid lease, conflict in the exact check, and (second round) generation-vector check inside `publish`,
 `transaction_timeout` instead of `statement_timeout`, granting the queue head on any caller's poll, re-checking
 lease expiry after the barrier wait, the commit-id lock, records restricted to the lease's source, and reporting
-a lease only while unexpired and not done.
+a lease only while unexpired and not done, and reporting a connection lost after COMMIT as `uncertain`.
 
 ## Prototype choices (not performance conclusions)
 
@@ -49,6 +49,11 @@ a lease only while unexpired and not done.
   whole transaction including client pauses between statements; on expiry the backend is terminated, which
   releases the lock and discards the publication. `statement_timeout` is not enough: many short statements
   can hold the lock indefinitely. `publish()` reserves its own pool connection for this reason.
+- Bun reports the terminated backend only as `ERR_POSTGRES_CONNECTION_CLOSED` (no `25P04` SQLSTATE reaches the
+  client). `publish()` therefore classifies by position: lost before COMMIT was sent = `timeout` (definitely not
+  committed); lost after = `uncertain` (could be "committed, ack lost"; the caller must not assume a rollback).
+- Bun 1.4.2 quirk: on a closed reserved connection the `IN ${sql(list)}` helper raises an extra unhandled
+  rejection that escapes try/catch; version reads use `= any(${sql.array(keys, "text")})` instead.
 - A lease queue advances on any caller's poll: the oldest pending request is granted even if its client is gone,
   then expires after its ttl and is reaped, so a dead head cannot block the queue. `syncCommit()` re-checks
   lease expiry after the barrier wait, so a lease that runs out while queued commits nothing.

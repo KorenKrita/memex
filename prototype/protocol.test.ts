@@ -30,6 +30,15 @@ async function waitForAdvisoryWaiter(n = 1) {
   }
   throw new Error(`fewer than ${n} advisory lock waiters appeared`);
 }
+/** Resolves once some backend is waiting on any lock (advisory, row, transaction id). */
+async function waitForLockWaiter() {
+  for (let i = 0; i < 500; i++) {
+    const [r] = await db`select count(*)::int n from pg_locks where not granted`;
+    if (r.n > 0) return;
+    await Bun.sleep(10);
+  }
+  throw new Error("no lock waiter appeared");
+}
 /** Holds the global barrier exclusively on its own connection until release() is called. */
 async function holdBarrier() {
   const h = await conn();
@@ -126,19 +135,43 @@ describe("publish barrier (§5.5)", () => {
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
 
-  test("deadline covers the whole locked transaction: many short statements and a client pause still time out", async () => {
+  test("deadline covers the whole locked transaction: many short statements each under the deadline still time out", async () => {
     await seedFork(); await P.createArtifact(db, forkRoot);
     let writer: Promise<void> | undefined;
     const r = await P.publish(db, "R1", {
       inLock: async (tx) => {
         writer = P.forgetRecord(db, "P:r1");
         await waitForAdvisoryWaiter();
-        for (let i = 0; i < 4; i++) await tx`select pg_sleep(0.1)`;   // each well under the deadline
-        await Bun.sleep(400);                                         // client-side pause holding the lock
+        for (let i = 0; i < 8; i++) await tx`select pg_sleep(0.1)`;   // 100ms each, deadline 300ms
       },
     }, { lockDeadlineMs: 300 });
     expect(r).toBe("timeout");
     await writer;
+    expect(await P.publicationCount(db, "R1")).toBe(0);
+  });
+
+  test("connection lost once COMMIT was sent is reported as uncertain, not as a definite abort", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    // The pause pushes COMMIT past the deadline; the server is already gone, so this run did not commit, but the
+    // client cannot tell that apart from "committed, ack lost" and must not claim a rollback.
+    const r = await P.publish(db, "R1", { beforeCommit: () => Bun.sleep(500) }, { lockDeadlineMs: 300 });
+    expect(r).toBe("uncertain");
+    expect(await P.publicationCount(db, "R1")).toBe(0);
+  });
+
+  test("a pure client pause holding the lock: the server releases it and the writer finishes before the publisher resumes", async () => {
+    await seedFork(); await P.createArtifact(db, forkRoot);
+    let writerDone = false, doneDuringPause = false;
+    const r = await P.publish(db, "R1", {
+      inLock: async () => {
+        P.forgetRecord(db, "P:r1").then(() => { writerDone = true; });
+        await waitForAdvisoryWaiter();
+        for (let i = 0; i < 200 && !writerDone; i++) await Bun.sleep(10);   // no SQL sent: client-side pause only
+        doneDuringPause = writerDone;
+      },
+    }, { lockDeadlineMs: 300 });
+    expect(doneDuringPause).toBe(true);
+    expect(r).toBe("timeout");
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
 
@@ -255,11 +288,15 @@ describe("sync leases and idempotency (§5.1, §5.2)", () => {
   });
   test("two overlapping retries of one commit id both get the original success", async () => {
     const l = await P.acquireLease(db, "P", "M", 10_000);
-    const h = await holdBarrier();
     const req = { leaseId: l, commitId: "c", records: [{ rec: "P:r1", hash: "B" }], scanChunks: 1 };
-    const both = Promise.all([P.syncCommit(db, req), P.syncCommit(db, req)]);
-    await waitForAdvisoryWaiter(2);     // one on the barrier, one on the commit-id lock
-    await h.release();
+    let release!: () => void; const gate = new Promise<void>(r => (release = r));
+    let paused!: () => void; const isPaused = new Promise<void>(r => (paused = r));
+    const first = P.syncCommit(db, req, { afterLeaseCheck: async () => { paused(); await gate; } });
+    await isPaused;                     // first is inside its transaction, result not yet recorded
+    const second = P.syncCommit(db, req);
+    await waitForLockWaiter();          // second is blocked on some lock held by first (whichever)
+    release();
+    const both = Promise.all([first, second]);
     expect(await both).toEqual([{ ok: true }, { ok: true }]);
     expect(await P.scanProgress(db, "P", "M")).toBe(1);
   });

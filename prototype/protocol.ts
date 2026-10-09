@@ -63,7 +63,7 @@ async function vectorKeys(q: Tx, artifactId: string, opts: PublishOpts = {}): Pr
   return [...keys].sort();
 }
 async function readVector(q: Tx, keys: string[]): Promise<Record<string, number>> {
-  const rows = await q`select key, v from vis_version where key in ${q(keys)}`;
+  const rows = await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`;
   const out: Record<string, number> = Object.fromEntries(keys.map(k => [k, 1]));   // absent key = version 1
   for (const r of rows) out[r.key] = Number(r.v);
   return out;
@@ -151,6 +151,7 @@ export type PublishHooks = {
   afterCheck?: () => Promise<void>;             // step 1 done (check + vector sampled), its txn committed
   beforeLock?: () => Promise<void>;             // about to open step 2
   inLock?: (tx: Tx) => Promise<void>;           // holding the shared lock, before compare
+  beforeCommit?: () => Promise<void>;           // publication inserted, COMMIT about to be sent
 };
 export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean; sampleLate?: boolean; lockAndReadOneStatement?: boolean; lockDeadlineMs?: number };
 
@@ -163,12 +164,12 @@ export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean;
  *         bounds the WHOLE locked transaction server-side (including client pauses between statements); on
  *         expiry Postgres terminates the backend, which releases the lock and discards the publication.
  */
-export async function publish(pool: Db, id: string, hooks: PublishHooks = {}, opts: PublishOpts = {}):
-  Promise<"published" | "rejected" | "timeout"> {
+export type PublishResult = "published" | "rejected" | "timeout" | "uncertain";
+export async function publish(pool: Db, id: string, hooks: PublishHooks = {}, opts: PublishOpts = {}): Promise<PublishResult> {
   const c = await pool.reserve();
   try { return await publishOn(c, id, hooks, opts); } finally { c.release(); }
 }
-async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOpts): Promise<"published" | "rejected" | "timeout"> {
+async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOpts): Promise<PublishResult> {
   if (opts.reuseSnapshot) return publishBrokenReuseSnapshot(c, id, hooks, opts);
   let keys: string[] = [], vec: Record<string, number> = {}, ok = false;
   await c`begin isolation level repeatable read`;
@@ -179,12 +180,13 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
     if (!opts.sampleLate) vec = await readVector(c, keys);
     await c`commit`;
     if (opts.sampleLate) vec = await readVector(c, keys);           // broken: versions from a later, separate snapshot
-  } catch (e) { await c`rollback`.catch(() => {}); throw e; }
+  } catch (e) { await safeRollback(c); throw e; }
   await hooks.afterCheck?.();
   if (!ok) return "rejected";
   await hooks.beforeLock?.();
 
   await c`begin isolation level read committed`;
+  let commitSent = false;
   try {
     await c.unsafe(`set local transaction_timeout = ${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}`);
     let now: Record<string, number>;
@@ -198,20 +200,26 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
     }
     if (!keys.every(k => now[k] === vec[k])) { await c`rollback`; return "rejected"; }
     await c`insert into publication (artifact) values (${id})`;       // "hand to transport" stand-in
+    await hooks.beforeCommit?.();
+    commitSent = true;
     await c`commit`;
     return "published";
   } catch (e: any) {
-    await c`rollback`.catch(() => {});
-    if (e?.errno === "25P04" || e?.code === "ERR_POSTGRES_CONNECTION_CLOSED") return "timeout";   // transaction_timeout
+    await safeRollback(c);
+    // transaction_timeout terminates the backend; Bun reports only "connection closed" (no 25P04 SQLSTATE).
+    // Before COMMIT was sent the server cannot have committed: a definite abort. After it, the outcome is unknown.
+    if (e?.code === "ERR_POSTGRES_CONNECTION_CLOSED" || e?.errno === "25P04") return commitSent ? "uncertain" : "timeout";
     throw e;
   }
 }
 const LOCK_DEADLINE_MS = 2000;                                       // prototype default; product value is [待标定]
+/** Best-effort rollback; on a terminated connection Bun throws synchronously, which must not mask the cause. */
+async function safeRollback(c: Db) { try { await c`rollback`; } catch {} }
 
 /** Broken variant helper: take the lock and read versions in ONE statement (its snapshot predates the wait). */
 async function readVectorWithLock(q: Tx, keys: string[]): Promise<Record<string, number>> {
   const rows = await q`select l.ok, v.key, v.v from (select pg_advisory_xact_lock_shared(${BARRIER}) is null as ok) l
-                       left join vis_version v on v.key in ${q(keys)}`;
+                       left join vis_version v on v.key = any(${q.array(keys, "text")})`;
   const out: Record<string, number> = Object.fromEntries(keys.map(k => [k, 1]));
   for (const r of rows) if (r.key) out[r.key] = Number(r.v);
   return out;
@@ -233,7 +241,7 @@ async function publishBrokenReuseSnapshot(c: Db, id: string, hooks: PublishHooks
     await c`insert into publication (artifact) values (${id})`;
     await c`commit`;
     return "published" as const;
-  } catch (e) { await c`rollback`.catch(() => {}); throw e; }
+  } catch (e) { await safeRollback(c); throw e; }
 }
 
 // ------------------------------------------------------------------------------------------------ sync leases
