@@ -6,9 +6,11 @@
 //     (case-insensitive substring), complete by construction over this corpus;
 //   - typo: chunks containing the `intended` spelling;
 //   - neg: no chunk is relevant; any result counts as a false hit.
-// Reported per class and method: hit@10 (any relevant in top 10), P@10 = relevant in top 10 / min(|rel|, 10),
-// MRR, latency p50/p95. Any query error aborts the run (exit 1): a failed query is not an empty result.
-// Tables live in schema fts_v2, created fresh; nothing else in the database is touched.
+// Reported per class and method: hit@10 (any relevant in top 10), R-cap@10 = relevant in top 10 / min(|rel|, 10)
+// (a capped recall: 100% = the top 10 are all relevant, or every relevant chunk is in them), MRR, latency
+// p50/p95; for absent strings, how many queries returned anything (not judged: a fuzzy method may return a
+// near spelling on purpose). Any query error aborts the run (exit 1): a failed query is not an empty result.
+// Tables live in a new schema (MEMEX_FTS_SCHEMA, default fts_<unix time>); an existing schema of that name aborts the run.
 //
 //   bun eval/fts-compare.ts /tmp/memex-eval/lexical.jsonl /tmp/memex-eval/fts-queries.json /tmp/memex-eval/fts-v2.json
 import { SQL } from "bun";
@@ -37,23 +39,24 @@ const queries: Q[] = JSON.parse(queryText).map((q: any) => {
 
 // ---------- database ----------
 const [ver] = await sql`select version() v, (select extversion from pg_extension where extname = 'pg_search') pg_search, (select extversion from pg_extension where extname = 'pg_trgm') pg_trgm`;
-await sql`drop schema if exists fts_v2 cascade`;
-await sql`create schema fts_v2`;
-await sql`create table fts_v2.chunks (id int primary key, body text not null)`;
-for (let i = 0; i < docs.length; i += 500) await sql`insert into fts_v2.chunks ${sql(docs.slice(i, i + 500).map((body, j) => ({ id: i + j, body })))}`;
+const schema = process.env.MEMEX_FTS_SCHEMA ?? `fts_${Math.floor(Date.now() / 1000)}`;
+if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error(`bad schema name ${schema}`);
+await sql.unsafe(`create schema ${schema}`); // fails if it exists: nothing is dropped
+await sql.unsafe(`create table ${schema}.chunks (id int primary key, body text not null)`);
+for (let i = 0; i < docs.length; i += 500) await sql`insert into ${sql(schema + ".chunks")} ${sql(docs.slice(i, i + 500).map((body, j) => ({ id: i + j, body })))}`;
 const t0 = performance.now();
-await sql`create index chunks_trgm on fts_v2.chunks using gin (body gin_trgm_ops)`;
+await sql.unsafe(`create index chunks_trgm on ${schema}.chunks using gin (body gin_trgm_ops)`);
 const trgmBuild = performance.now() - t0;
 const t1 = performance.now();
-await sql.unsafe(`create index chunks_bm25 on fts_v2.chunks using bm25 (
+await sql.unsafe(`create index chunks_bm25 on ${schema}.chunks using bm25 (
   id,
   (body::pdb.jieba),
   (body::pdb.source_code('alias=code')),
   (body::pdb.ngram(2,3,'alias=ng'))
 ) with (key_field = 'id')`);
 const bm25Build = performance.now() - t1;
-await sql`analyze fts_v2.chunks`;
-const [sizes] = await sql`select pg_relation_size('fts_v2.chunks_trgm') trgm, pg_relation_size('fts_v2.chunks_bm25') bm25, pg_relation_size('fts_v2.chunks') heap, pg_total_relation_size('fts_v2.chunks') total`;
+await sql.unsafe(`analyze ${schema}.chunks`);
+const [sizes] = await sql.unsafe(`select pg_relation_size('${schema}.chunks_trgm') trgm, pg_relation_size('${schema}.chunks_bm25') bm25, pg_relation_size('${schema}.chunks') heap, pg_total_relation_size('${schema}.chunks') total`);
 
 // ---------- methods ----------
 // Each returns the top-K chunk ids. Several terms: every term must match (AND).
@@ -67,13 +70,13 @@ const methods: Method[] = [
       const n = q.terms.length; // $1..$n escaped patterns, $n+1..$2n raw terms for ranking
       const where = q.terms.map((_, k) => `body ilike '%' || $${k + 1} || '%'`).join(" and ");
       const rank = q.terms.map((_, k) => `word_similarity($${n + k + 1}, body)`).join(" + ");
-      return [`select id from fts_v2.chunks where ${where} order by ${rank} desc, id limit ${K}`, [...q.terms.map(esc), ...q.terms]];
+      return [`select id from ${schema}.chunks where ${where} order by ${rank} desc, id limit ${K}`, [...q.terms.map(esc), ...q.terms]];
     },
   },
   {
     // fuzzy: word similarity ≥ pg_trgm.word_similarity_threshold (0.6) for every term
     name: "trgm-fuzzy",
-    sql: (q) => [`select id from fts_v2.chunks where ${q.terms.map((_, k) => `$${k + 1} <% body`).join(" and ")} order by ${q.terms.map((_, k) => `word_similarity($${k + 1}, body)`).join(" + ")} desc, id limit ${K}`, q.terms],
+    sql: (q) => [`select id from ${schema}.chunks where ${q.terms.map((_, k) => `$${k + 1} <% body`).join(" and ")} order by ${q.terms.map((_, k) => `word_similarity($${k + 1}, body)`).join(" + ")} desc, id limit ${K}`, q.terms],
   },
   ...(
     [
@@ -85,7 +88,7 @@ const methods: Method[] = [
     ] as const
   ).map(([name, field, op]) => ({
     name,
-    sql: (q: Q): [string, string[]] => [`select id from fts_v2.chunks where ${q.terms.map((_, k) => `${field} ${op} $${k + 1}`).join(" and ")} order by pdb.score(id) desc, id limit ${K}`, q.terms],
+    sql: (q: Q): [string, string[]] => [`select id from ${schema}.chunks where ${q.terms.map((_, k) => `${field} ${op} $${k + 1}`).join(" and ")} order by pdb.score(id) desc, id limit ${K}`, q.terms],
   })),
 ];
 
@@ -100,13 +103,13 @@ const run = async (m: Method, q: Q): Promise<number[]> => {
   }
 };
 for (const m of methods) for (const q of queries.slice(0, 3)) await run(m, q); // warm-up, errors abort too
-type Cell = { n: number; hit: number; p: number; mrr: number; falseHit: number; ms: number[] };
+type Cell = { n: number; hit: number; rcap: number; mrr: number; falseHit: number; ms: number[] };
 const per: Record<string, Record<string, Cell>> = {};
 const perQuery: any[] = [];
 for (const q of queries) {
   const row: any = { cls: q.cls, terms: q.terms, intended: q.intended, relevant: q.relevant.size, methods: {} };
   for (const m of methods) {
-    const c = ((per[q.cls] ??= {})[m.name] ??= { n: 0, hit: 0, p: 0, mrr: 0, falseHit: 0, ms: [] });
+    const c = ((per[q.cls] ??= {})[m.name] ??= { n: 0, hit: 0, rcap: 0, mrr: 0, falseHit: 0, ms: [] });
     const t = performance.now();
     const ids = await run(m, q);
     c.ms.push(performance.now() - t);
@@ -116,7 +119,7 @@ for (const q of queries) {
     if (q.cls === "neg") c.falseHit += ids.length ? 1 : 0;
     else {
       c.hit += first >= 0 ? 1 : 0;
-      c.p += rel / Math.min(q.relevant.size, K);
+      c.rcap += rel / Math.min(q.relevant.size, K);
       c.mrr += first >= 0 ? 1 / (first + 1) : 0;
     }
     row.methods[m.name] = { returned: ids.length, relevantInTop: rel, firstRank: first >= 0 ? first + 1 : null };
@@ -128,7 +131,7 @@ const table: Record<string, Record<string, string>> = {};
 for (const [cls, byM] of Object.entries(per))
   for (const [m, c] of Object.entries(byM))
     (table[cls] ??= {})[m] =
-      (cls === "neg" ? `falseHit ${c.falseHit}/${c.n}` : `hit@${K} ${c.hit}/${c.n} P@${K} ${((100 * c.p) / c.n).toFixed(0)}% MRR ${(c.mrr / c.n).toFixed(2)}`) +
+      (cls === "neg" ? `returnedAny ${c.falseHit}/${c.n}` : `hit@${K} ${c.hit}/${c.n} R-cap@${K} ${((100 * c.rcap) / c.n).toFixed(0)}% MRR ${(c.mrr / c.n).toFixed(2)}`) +
       ` p50 ${pct(c.ms, 0.5).toFixed(1)}ms p95 ${pct(c.ms, 0.95).toFixed(1)}ms`;
 
 // ---------- plans for the slow path ----------
