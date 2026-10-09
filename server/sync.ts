@@ -1,0 +1,186 @@
+// L0 sync (DESIGN §4.1, §5.1, §5.2): FIFO leases per (source, collector), manifest, one-transaction commit.
+// Ordering rules are the ones prototype/protocol.ts checks against real Postgres (see prototype/README.md):
+//   - a lease is granted to the oldest pending request; validity is judged on the server clock inside the
+//     commit transaction, after every lock wait; the successor's grant must update the old lease row, so an
+//     accepted commit always lands before the next lease;
+//   - a commit id is idempotent: a retry returns the stored result;
+//   - each collector's copy is a projection; the shared record is `ok` while all copies agree and `conflict`
+//     (isolated) when they differ; any change of an existing shared record bumps the session's version;
+//   - forgotten sources and canonical records are refused inside the same transaction (§7).
+import type { Db, Tx } from "./db.ts";
+import { bump, enqueue } from "./db.ts";
+import { blockHashes, CHUNK, sourceIdOf, type Harness } from "../client/records.ts";
+
+export const BARRIER = 1; // global visibility barrier and merge serializer (advisory lock, one-key form)
+const COMMIT_NS = 0x6d656d78; // two-key namespace for commit ids
+export const LEASE_TTL_MS = Number(process.env.MEMEX_LEASE_TTL_MS ?? 30_000);
+export const MAX_COMMIT_RECORDS = 2_000;
+export const MAX_COMMIT_BYTES = 8 * 1024 * 1024;
+
+export type SourceDecl = { source: string; harness: Harness; nativeId: string; scope: string; parent?: string | null; meta?: object };
+export type Change = { pos: number; id: string; hash: string; raw: string };
+export type Commit = { leaseId: number; commitId: string; length: number; changes: Change[]; scanChunks?: number; leaf?: string | null };
+export type CommitResult =
+  | { ok: true; accepted: number; refused: number; length: number }
+  | { ok: false; reason: "lease" | "forgotten" | "bad-request"; detail?: string };
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/** Register the source once (identity is derived, not trusted) and queue a lease request. */
+export async function requestLease(db: Db, d: SourceDecl, collector: string): Promise<number> {
+  if (d.source !== sourceIdOf(d.harness, d.nativeId)) throw new HttpError(400, "source id does not match harness and native id");
+  return db.begin(async (tx: Tx) => {
+    if ((await tx`select 1 from tomb where key = ${"source:" + d.source}`).length) throw new HttpError(410, "source forgotten");
+    await tx`insert into source (id, harness, native_id, scope, parent_id, meta)
+             values (${d.source}, ${d.harness}, ${d.nativeId}, ${d.scope}, ${d.parent ?? null}, ${d.meta ?? {}})
+             on conflict (id) do update set parent_id = coalesce(source.parent_id, excluded.parent_id)`;
+    const [s] = await tx`select scope from source where id = ${d.source}`;
+    if (s.scope !== d.scope) throw new HttpError(409, "scope differs from the registered scope");
+    const [r] = await tx`insert into lease (source, collector, ttl_ms) values (${d.source}, ${collector}, ${LEASE_TTL_MS}) returning id`;
+    return Number(r.id);
+  });
+}
+
+/** Advance the (source, collector) queue; report whether `id` holds a valid lease now. */
+export async function tryGrant(db: Db, id: number): Promise<{ granted: boolean; leftMs: number }> {
+  return db.begin(async (tx: Tx) => {
+    const [me] = await tx`select source, collector from lease where id = ${id}`;
+    if (!me) return { granted: false, leftMs: 0 };
+    await tx`select pg_advisory_xact_lock(hashtext(${me.source}), hashtext(${me.collector}))`;
+    await tx`update lease set done = true where source = ${me.source} and collector = ${me.collector}
+             and granted_at is not null and not done and expires_at <= clock_timestamp()`;
+    // A request nobody polls for 2 ttl is abandoned (client gone): it must not hold the queue.
+    await tx`update lease set done = true where source = ${me.source} and collector = ${me.collector}
+             and granted_at is null and not done and created_at < clock_timestamp() - make_interval(secs => 2 * ttl_ms / 1000.0)
+             and id <> ${id}`;
+    const [busy] = await tx`select count(*)::int n from lease where source = ${me.source} and collector = ${me.collector}
+                            and granted_at is not null and not done`;
+    if (busy.n === 0)
+      await tx`update lease set granted_at = clock_timestamp(), expires_at = clock_timestamp() + make_interval(secs => ttl_ms / 1000.0)
+               where id = (select id from lease where source = ${me.source} and collector = ${me.collector}
+                           and granted_at is null and not done order by id limit 1)`;
+    await tx`update lease set created_at = clock_timestamp() where id = ${id} and granted_at is null and not done`; // still polling
+    const [r] = await tx`select granted_at is not null and not done and expires_at > clock_timestamp() as mine,
+                                greatest(0, floor(extract(epoch from (expires_at - clock_timestamp())) * 1000))::bigint as left_ms
+                         from lease where id = ${id}`;
+    return { granted: !!r.mine, leftMs: r.mine ? Number(r.left_ms) : 0 };
+  });
+}
+
+export async function releaseLease(db: Db, id: number) {
+  await db`update lease set done = true where id = ${id}`;
+}
+
+async function validLease(db: Db, id: number) {
+  const [l] = await db`select source, collector from lease where id = ${id} and granted_at is not null and not done
+                       and expires_at > clock_timestamp()`;
+  return l as { source: string; collector: string } | undefined;
+}
+
+/** Manifest of one collector's copy (§5.1): block hashes in file order, plus the last block in full. */
+export async function manifest(db: Db, leaseId: number) {
+  const l = await validLease(db, leaseId);
+  if (!l) throw new HttpError(409, "lease not held");
+  const rows = await db`select rec as id, hash from projection where source = ${l.source} and collector = ${l.collector} order by pos`;
+  const blocks = blockHashes(rows);
+  const lastStart = Math.max(0, (blocks.length - 1) * CHUNK);
+  return { length: rows.length, chunk: CHUNK, blocks, last: { start: lastStart, records: rows.slice(lastStart) } };
+}
+
+/** Records of the given blocks, for the slow path (a block hash differs). */
+export async function blockRecords(db: Db, leaseId: number, blocks: number[]) {
+  const l = await validLease(db, leaseId);
+  if (!l) throw new HttpError(409, "lease not held");
+  const out: Record<number, { id: string; hash: string }[]> = {};
+  for (const b of blocks.slice(0, 64))
+    out[b] = await db`select rec as id, hash from projection where source = ${l.source} and collector = ${l.collector}
+                      and pos >= ${b * CHUNK} and pos < ${(b + 1) * CHUNK} order by pos`;
+  return out;
+}
+
+/** Re-arm transaction_timeout to the lease's remaining lifetime (or keep the inherited bound), one statement. */
+async function rearmTimeout(tx: Tx, leaseId: number | null) {
+  await tx`with cap as materialized (select current_setting('transaction_timeout')::interval as inh),
+                clr as materialized (select set_config('transaction_timeout', '0', true) as z from cap)
+           select set_config('transaction_timeout', ms::text, true)
+           from (select least((select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint
+                               from lease where id = ${leaseId}::bigint),
+                              case when cap.inh = interval '0' then null
+                                   else greatest(1, floor(extract(epoch from (cap.inh - (clock_timestamp() - now()))) * 1000)::bigint) end
+                             ) as ms
+                 from clr, cap) s
+           where ms is not null`;
+}
+
+export async function commit(db: Db, c: Commit): Promise<CommitResult> {
+  if (!Number.isInteger(c.length) || c.length < 0 || c.changes.length > MAX_COMMIT_RECORDS)
+    return { ok: false, reason: "bad-request", detail: `at most ${MAX_COMMIT_RECORDS} changes` };
+  let bytes = 0;
+  for (const ch of c.changes) {
+    bytes += ch.raw.length;
+    if (!(ch.pos >= 0 && ch.pos < c.length) || typeof ch.id !== "string" || !ch.id) return { ok: false, reason: "bad-request", detail: "change outside the copy" };
+    if (new Bun.CryptoHasher("sha256").update(ch.raw).digest("hex") !== ch.hash) return { ok: false, reason: "bad-request", detail: `hash of ${ch.id}` };
+  }
+  if (bytes > MAX_COMMIT_BYTES) return { ok: false, reason: "bad-request", detail: "commit too large" };
+  return db.begin(async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock(${COMMIT_NS}, hashtext(${c.commitId}))`;
+    const [prev] = await tx`select result from commit_result where commit_id = ${c.commitId}`;
+    if (prev) return prev.result as CommitResult;
+    const [l] = await tx`select source, collector, done from lease where id = ${c.leaseId} for update`;
+    if (!l || l.done) return { ok: false, reason: "lease" } as const;
+    await tx`select pg_advisory_xact_lock(${BARRIER})`;
+    const [v] = await tx`select floor(extract(epoch from (expires_at - clock_timestamp())) * 1000)::bigint as left_ms
+                         from lease where id = ${c.leaseId} and granted_at is not null`;
+    const accepted = !!v && Number(v.left_ms) > 0;
+    await rearmTimeout(tx, accepted ? c.leaseId : null);
+    if (!accepted) return { ok: false, reason: "lease" } as const;
+    if ((await tx`select 1 from tomb where key = ${"source:" + l.source}`).length) {
+      await tx`update lease set done = true where id = ${c.leaseId}`;
+      return { ok: false, reason: "forgotten" } as const;
+    }
+    // Refuse forgotten canonical records (a native record's canonical id is `source:rec`).
+    const tombs = new Set<string>(
+      (await tx`select key from tomb where key = any(${tx.array(c.changes.map((ch) => `canon:${l.source}:${ch.id}`), "text")})`).map((r: any) => r.key),
+    );
+    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`));
+    // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
+    await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}`;
+    if (keep.length) {
+      const ids = keep.map((ch) => ch.id);
+      const poss = keep.map((ch) => ch.pos);
+      await tx`delete from projection where source = ${l.source} and collector = ${l.collector}
+               and (pos = any(${tx.array(poss, "int4")}) or rec = any(${tx.array(ids, "text")}))`;
+      await tx`insert into body ${tx(keep.map((ch) => ({ source: l.source, rec: ch.id, hash: ch.hash, raw: ch.raw })))} on conflict do nothing`;
+      await tx`insert into projection ${tx(keep.map((ch) => ({ source: l.source, collector: l.collector, pos: ch.pos, rec: ch.id, hash: ch.hash })))}`;
+      // Merge each touched record across collectors.
+      const merged = await tx`select p.rec, count(distinct p.hash)::int n, min(p.hash) h, min(p.pos) pos, r.state, r.hash old_hash
+                              from projection p left join record r on r.source = p.source and r.rec = p.rec
+                              where p.source = ${l.source} and p.rec = any(${tx.array(ids, "text")})
+                              group by p.rec, r.state, r.hash`;
+      let changed = false;
+      for (const m of merged) {
+        const state = m.n === 1 ? "ok" : "conflict";
+        const hash = m.n === 1 ? m.h : null;
+        if (m.state && (m.state !== state || m.old_hash !== hash)) changed = true;
+        await tx`insert into record (source, rec, state, hash, first_pos) values (${l.source}, ${m.rec}, ${state}, ${hash}, ${m.pos})
+                 on conflict (source, rec) do update set state = excluded.state, hash = excluded.hash`;
+      }
+      if (changed) await bump(tx, "s:" + l.source);
+      await enqueue(tx, "project", l.source);
+    }
+    if (c.scanChunks)
+      await tx`insert into scan_progress values (${l.source}, ${l.collector}, ${c.scanChunks})
+               on conflict (source, collector) do update set chunks = scan_progress.chunks + excluded.chunks`;
+    if (c.leaf !== undefined)
+      await tx`insert into collector_view values (${l.source}, ${l.collector}, ${c.leaf}, now())
+               on conflict (source, collector) do update set leaf = excluded.leaf, at = excluded.at`;
+    const result = { ok: true, accepted: keep.length, refused: c.changes.length - keep.length, length: c.length } as const;
+    await tx`insert into commit_result (commit_id, result) values (${c.commitId}, ${result})`;
+    await tx`update lease set done = true where id = ${c.leaseId}`;
+    return result;
+  });
+}

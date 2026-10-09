@@ -1,0 +1,10 @@
+{
+  "name": "memex",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:up": "docker run -d --name memex-pg-dev -e POSTGRES_PASSWORD=memex -e POSTGRES_DB=memex -p 127.0.0.1:55433:5432 --tmpfs /var/lib/postgresql/data pgvector/pgvector:pg17",
+    "db:down": "docker rm -f memex-pg-dev",
+    "test": "bun test server client plugins --timeout 60000"
+  }
+}
