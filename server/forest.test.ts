@@ -1051,3 +1051,44 @@ test("card: a written card's input text withdrawn after the check (a leaf's reco
   await runCard(db, (await claimJobFor("card", JSON.stringify([s, await tipOf(s)])))!);
   expect(cardCalls().length).toBe(n);
 });
+
+test("a forest job and a merge job finishing at once do not deadlock (each holds its own job row)", async () => {
+  const s = await put("dl", linear("dl", 4));
+  await coldThenStructure();
+  await db`insert into forest_access values (${s})`;
+  const [pair] = await db`select id from forest_node where size = 2 order by id limit 1`;
+  // Both claimed; the forest job will want the merge row (queue merges), the merge job the forest row.
+  await db`insert into job (kind, key) values ('forest', ${s}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
+  const fj = (await claimJobFor("forest", s))!;
+  const mj = (await claimJobFor("merge", pair.id))!;
+  const { forestHooks, runForest } = await import("./forest.ts");
+  const { hooks } = await import("./derive.ts");
+  let forestIn!: () => void, mergeIn!: () => void;
+  const fIn = new Promise<void>((r) => (forestIn = r)), mIn = new Promise<void>((r) => (mergeIn = r));
+  // The forest transaction: after its own job row (finishJob runs right after the barrier) wait for the merge's.
+  forestHooks.underBarrier = async (tx: any) => {
+    forestHooks.underBarrier = async () => {};
+    await tx`select 1 from job where id = ${fj.id} for update`;
+    forestIn();
+    await mIn;
+  };
+  hooks.inPublish = async (tx: any) => {
+    hooks.inPublish = async () => {};
+    await tx`select 1 from job where id = ${mj.id} for update`;
+    mergeIn();
+    await fIn;
+  };
+  process.env.MEMEX_PUBLISH_HOLD_MS = "3000";
+  process.env.MEMEX_FOREST_HOLD_MS = "3000";
+  const t0 = performance.now();
+  try {
+    const out = await Promise.allSettled([runForest(db, fj), runMerge(db, mj)]);
+    expect(out.map((o) => o.status)).toEqual(["fulfilled", "fulfilled"]);
+  } finally {
+    forestHooks.underBarrier = async () => {};
+    hooks.inPublish = async () => {};
+    delete process.env.MEMEX_PUBLISH_HOLD_MS;
+    delete process.env.MEMEX_FOREST_HOLD_MS;
+  }
+  expect(performance.now() - t0).toBeLessThan(2000);
+});

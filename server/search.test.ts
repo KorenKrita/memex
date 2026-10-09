@@ -1488,12 +1488,17 @@ test("zoom forest: a forgotten parent's text is not served through the child's f
   expect(r).toContain("kid3");
 });
 
-test("zoom forest: a revoke between the read and its delivery is refused (the reply carries the read grant)", async () => {
-  const s = await put("rv", lin("rv", ["w0", "w1", "w2", "w3"]));
+test("zoom forest over HTTP: the session's read grant revoked between the read and its delivery → no forest or card text", async () => {
+  const s = await put("rv", lin("rv", ["rvsecret0", "rvsecret1", "rvsecret2", "rvsecret3"]));
   await drain(db);
-  const g = await zoom(db, T0({ id: "session:" + s }));
-  expect(Object.keys(g.deps)).toContain("d:memex");
-  expect(Object.keys(g.deps)).toContain("s:" + s);
+  let fired = 0;
+  httpHooks.beforeGuard = async () => {
+    if (fired++) return;
+    await revokeGrant(db, "personal", "tool", "memex");
+  };
+  const r = await http()("POST", "/v1/zoom", T0({ id: "session:" + s })).then((x) => JSON.stringify(x), (e) => String(e));
+  expect(fired).toBeGreaterThan(0);
+  expect(r).not.toContain("rvsecret");
 });
 
 test("zoom session: carries its card (the stored one when current, else degraded), no model call in the read", async () => {
@@ -1507,4 +1512,27 @@ test("zoom session: carries its card (the stored one when current, else degraded
   const d = await zb({ id: "session:" + s });
   expect(d.card_degraded).toBe(true);
   expect(d.card.overview).toContain("user: w0");
+});
+
+test("zoom session: a complete forest with a degraded card asks for the card in the background (cold, 3 leaves)", async () => {
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1";
+  let s: string;
+  try {
+    s = await put("dc", lin("dc", ["w0", "w1", "w2"]));
+    await drain(db);
+  } finally {
+    process.env.MEMEX_FOREST_HOT_DAYS = "100000";
+  }
+  expect((await db`select count(*)::int n from session_card`)[0].n).toBe(0);
+  const n = requests.length;
+  const top = await zb({ id: "session:" + s! });
+  expect(requests.length).toBe(n);
+  expect(top).toMatchObject({ complete: true, card_degraded: true });
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1"; // still cold by its records: the read is what makes it wanted
+  try {
+    await drain(db);
+  } finally {
+    process.env.MEMEX_FOREST_HOT_DAYS = "100000";
+  }
+  expect((await zb({ id: "session:" + s! })).card_degraded).toBe(false);
 });

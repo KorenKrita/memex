@@ -253,9 +253,11 @@ export async function runMerge(db: Db, job: Job) {
       // Written once; the parents that were waiting for it can merge now.
       if (done.length) {
         for (const p of await tx`select id from forest_node where kid_ids @> array[${job.key}]::text[] and text is null`) await enqueue(tx, "merge", p.id);
-        // The views holding it may be complete now: their forest job queues their session cards.
+        // The views holding it may be complete now: their cards (the card job finds out whether they are).
+        // Not the forest job: a forest job queues merges, and a merge queuing forest jobs would take job rows
+        // in the opposite order (two such transactions deadlock). Notifications go forest → merge → card.
         const [n] = await tx`select spans from forest_node where id = ${job.key}`;
-        for (const v of await tx`select distinct source from view where span_ids @> array[${n.spans[0]}]::text[]`) await enqueue(tx, "forest", v.source);
+        for (const v of await tx`select source, tip from view where span_ids @> array[${n.spans[0]}]::text[]`) await enqueue(tx, "card", JSON.stringify([v.source, v.tip]));
       }
       await snapshotHook.beforeMergeCommit(job.key);
     });

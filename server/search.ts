@@ -771,7 +771,7 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
             ...(card ? { card: card.card, card_degraded: card.degraded } : {}),
             items: f.items.map((x) => ({ id: x.node ? "node:" + x.node : "span:" + x.span, leaves: [x.start, x.start + x.size], summary: x.text })),
           },
-          want: f.complete ? null : src,
+          want: f.complete && !card?.degraded ? null : src, // merges or the card not ready: asked for after the read
         };
       }
       const sid = id.replace(/^(span|unit):/, "");
