@@ -444,7 +444,7 @@ export function labelOf(t: TargetView, keys: string[]): string {
   // Any supporting record that no view of the target holds: the evidence cannot be placed.
   if (!keys.length || keys.some((k) => !t.views.some((v) => v.keys.includes(k)))) return "unlocated";
   // No usable view (unknown basis): no on/off-path conclusion, even with a single view.
-  if (!t.v) return "branched";
+  if (t.basis === "unknown" || !t.v) return "branched";
   const on = keys.filter((k) => t.v!.keys.includes(k)).length;
   return on === keys.length ? "on-path" : on === 0 ? "off-path" : "mixed";
 }

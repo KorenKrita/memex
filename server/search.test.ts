@@ -1334,6 +1334,10 @@ test("zoom a record with a real key whose tip names no view: reported unknown, n
   // With the real tip: the off-path record expands, along the key's view.
   const z2 = (await zoom(db, T0({ id: off.key, view_key: off.path.view_key }))).body as any;
   expect(z2).toMatchObject({ view_key: { tip: off.path.view_key.tip, basis: off.path.view_key.basis }, view_basis: off.path.view_key.basis });
+  // A current key whose basis says unknown: the record still expands, with no on/off-path conclusion.
+  const z3 = (await zoom(db, T0({ id: off.key, view_key: { ...off.path.view_key, basis: "unknown" } }))).body as any;
+  expect(z3).toMatchObject({ view_basis: "unknown", path: "branched" });
+  expect(z3.records[0].text).toContain("brtoken-off");
 });
 
 test("a unit result's source and scope are its reference source; representations keep their own", async () => {
