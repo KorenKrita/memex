@@ -66,7 +66,8 @@ def parse(key, data):
     """-> (line timestamps, {entry: (line, timestamp, role, text)})"""
     codex = key.startswith(("codex/", "codex-archived/"))
     stamps, es = [], {}
-    for n, line in enumerate(data.decode("utf-8").split("\n")):
+    # Tolerant like the reference indexer: a torn multibyte write (e.g. after the cutoff) must not abort.
+    for n, line in enumerate(data.decode("utf-8", "replace").split("\n")):
         try:
             d = json.loads(line)
         except Exception:
@@ -150,6 +151,7 @@ VIS = {}  # cutoff -> {key: (sha256 of the whole frozen file, visible lines)}
 for c in cutoffs:
     root = f"{outdir}/public/views/{vis_name[c][:-5]}"
     cut = {}
+    os.makedirs(root)  # even when nothing is visible yet
     whole = {}  # target dir -> whole files to clone there (one cp per directory)
     for key in MANIFEST:
         sha, data, stamps, _ = load(key)
@@ -175,7 +177,7 @@ for q in drafts:
             fail(f"{q['id']}: no entry {ev['entry']} in {key}")
         n, t, role, text = es[ev["entry"]]
         if ev["quote"] not in text:
-            fail(f"{q['id']}: quote not in {ev['entry']}: {ev['quote']!r}")
+            fail(f"{q['id']}: quote not in {ev['entry']} of {key}")  # no session text in errors
         ev.update(sha256=sha, line=n, timestamp=t, role=role)
         if q["needs_history"] and n >= prefix(stamps, q["cutoff"]):
             fail(f"{q['id']}: evidence {ev['entry']} (line {n}, {t}) is outside the visible prefix")

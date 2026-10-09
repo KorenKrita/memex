@@ -35,6 +35,20 @@ cp_head = [{"type": "session", "version": 3, "id": "s2", "timestamp": "2026-01-0
     M("c1", None, "2026-01-01T00:00:01Z", "user", "copy says TEAL")]
 w("pi/q/s2.jsonl", cp_head + [M("c2", "c1", "2026-01-01T00:00:20Z", "assistant", "later in copy A")])
 w("pi/r/s2.jsonl", cp_head + [M("c2", "c1", "2026-01-01T00:00:20Z", "assistant", "later in copy B")])
+# Correction distances on one linear Pi path (spans per the reference indexer: [d1 d2] [d3, oversized] [d4]
+# [d5 d6] [d7 d8]), a Codex user message that starts with "<", and a torn multibyte write after the cutoff.
+d = lambda i, par, t, role, text: M(i, par, f"2026-01-01T00:00:0{t}Z", role, text)
+w("pi/d/dist.jsonl", [{"type": "session", "version": 3, "id": "d", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"},
+    d("d1", None, 1, "user", "start OLD0"), d("d2", "d1", 2, "assistant", "OLD1 claim"),
+    d("d3", "d2", 3, "assistant", "x" * 12288 + " FIXADJ"), d("d4", "d3", 4, "assistant", "FIXFAR"),
+    d("d5", "d4", 5, "user", "one user turn"), d("d6", "d5", 6, "assistant", "FIXNEXT"),
+    d("d7", "d6", 7, "user", "second user turn"), d("d8", "d7", 8, "assistant", "FIXLATER"),
+    M("d9", "d8", "2026-01-01T00:00:20Z", "assistant", "after the cutoff")])
+open(f"{C}/pi/d/dist.jsonl", "ab").write(b'{"type": "message", "id": "d10", "parentId": "d9", "timestamp": "2026-01-01T00:00:20Z", "partial": "\xe2\x82')
+w("codex/2026/01/01/rollout-dist.jsonl", [X(0, "2026-01-01T00:00:00Z", "session_meta", meta(source="cli", thread_source="user")),
+    X(1, "2026-01-01T00:00:02Z", "response_item", msg("assistant", "codex OLD2")),
+    X(2, "2026-01-01T00:00:03Z", "response_item", msg("user", "<svg> should be <canvas>; fix it")),
+    X(3, "2026-01-01T00:00:04Z", "response_item", msg("assistant", "codex FIX2"))])
 files = {}
 for dp, _, fs in os.walk(C):
     for fn in fs:
@@ -43,13 +57,21 @@ for dp, _, fs in os.walk(C):
             files[os.path.relpath(p, C)] = hashlib.sha256(open(p, "rb").read()).hexdigest()
 json.dump({"files": dict(sorted(files.items()))}, open(f"{C}/manifest.json", "w"), indent=0)
 
-Q = lambda i, ev, split="test", cl="k", fg=None, typ="t", cut="2026-01-01T00:00:10Z": dict(id=i, task_cluster=cl, split=split, type=typ,
-    needs_history=True, origin="synthetic", question="Q?", current_context="ctx", cutoff=cut, answer_points=["SECRET-ANSWER"],
+Q = lambda i, ev, split="test", cl="k", fg=None, typ="t", cut="2026-01-01T00:00:10Z", hist=True: dict(id=i, task_cluster=cl, split=split, type=typ,
+    needs_history=hist, origin="synthetic", question="Q?", current_context="ctx", cutoff=cut, answer_points=["SECRET-ANSWER"],
     forbidden=["SECRET-FORBIDDEN"], evidence=ev, check_status="checked", notes="SECRET-NOTE", **({"fact_group": fg} if fg else {}))
 E = lambda f, e, q, u="answer": {"file": f, "entry": e, "quote": q, "use": u}
 S1, MAIN = "p/s1.jsonl", "codex/2026/01/01/rollout-main.jsonl"
+DI, CD = "d/dist.jsonl", "codex/2026/01/01/rollout-dist.jsonl"
 cases = {
-    "ok": [Q("ok1", [E(S1, "a1", "RED", "old-claim"), E(S1, "b2", "BLUE", "correction"), E(MAIN, "2", "SAME2")], typ="correction-next-exchange")],
+    "ok": [Q("ok1", [E(S1, "a1", "RED", "old-claim"), E(S1, "b2", "BLUE", "correction"), E(MAIN, "2", "SAME2")], typ="correction-self-adjacent-span")],
+    "dist": [Q("ds", [E(DI, "d1", "OLD0", "old-claim"), E(DI, "d2", "OLD1", "correction")], typ="correction-same-span"),
+             Q("da", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d3", "FIXADJ", "correction")], typ="correction-self-adjacent-span"),
+             Q("dn", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d6", "FIXNEXT", "correction")], typ="correction-next-exchange"),
+             Q("dl", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d8", "FIXLATER", "correction")], typ="correction-later-turn"),
+             Q("dc", [E(CD, "1", "OLD2", "old-claim"), E(CD, "3", "FIX2", "correction")], typ="correction-next-exchange"),
+             Q("de", [], hist=False, cut="2026-01-01T00:00:00Z")],
+    "distfar": [Q("df", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d4", "FIXFAR", "correction")], typ="correction-self-adjacent-span")],
     "tie": [Q("t", [E(S1, "a3", "tie")])],
     "clockback": [Q("c", [E(S1, "a4", "clock")])],
     "codexlate": [Q("l", [E(MAIN, "3", "LATE")])],
