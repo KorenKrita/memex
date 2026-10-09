@@ -1,0 +1,4 @@
+{"timestamp": "2026-01-01T00:00:00Z", "ordinal": 0, "type": "session_meta", "payload": {"source": "cli"}}
+{"timestamp": "2026-01-01T00:00:03Z", "ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "codex SAME1"}]}}
+{"timestamp": "2026-01-01T00:00:03Z", "ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex SAME2"}]}}
+{"timestamp": "2026-01-01T00:00:10Z", "ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex LATE"}]}}

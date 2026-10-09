@@ -95,3 +95,60 @@ R-cap@10 = relevant in top 10 / min(relevant, 10), a capped recall (not standard
   misses identifier fragments.
 - Limits: one laptop, one 54 MB sample (the whole local lexical text is 782 MB), queries chosen by one
   person from the corpus itself, no ranking judgement beyond "contains the string", no concurrent load.
+
+## Question bank (DESIGN §8; `qbank/`)
+
+The bank itself is real session text and stays local (`/tmp/memex-eval/qb/`, mode 0700). The repo holds
+the tools, the format and a synthetic fixture.
+
+- `qbank/freeze.py OUTDIR [--exclude-file LIST]` — APFS-clones `~/.pi/agent/sessions` and
+  `~/.codex/{sessions,archived_sessions}` file by file into one frozen corpus and hashes every file into
+  `manifest.json`. Files listed in `LIST` (sessions that contain the bank itself) are skipped before
+  copying; nothing is deleted.
+- `qbank/build.py OUTDIR drafts.jsonl...` — validates hand-written drafts against the frozen corpus and
+  writes the two views. Refuses an existing `OUTDIR`.
+- `qbank/selftest.sh` — runs `build.py` on `qbank/fixture/` (synthetic): one accepted case, eight that must
+  be rejected for the stated reason, and a check that `public/` carries no answer text.
+
+**Draft fields** (one JSON object per line): `id`, `task_cluster`, `split` (`tune`/`test`), `type`,
+`needs_history`, `origin` (`derived` from a real session or `synthetic`), `question`, `current_context`
+(what the user's current turn shows; for no-history questions this holds everything needed),
+`cutoff` (ISO time), `answer_points`, `forbidden`, `evidence` (`file`, `entry`, `quote`, `use` =
+`answer`/`old-claim`/`correction`/`source-only`), `check_status` (`checked` or `checked-with-caveats`),
+optional `fact_group` (list) and `notes`. Pi `entry` = record id; Codex `entry` = `str(ordinal)` of a
+`response_item` (message, tool call or tool output).
+
+**Visible set of a question** (what the system under test may index for it): indexable files only — Pi
+top-level session files (not `<session>/<id>/run-N/` subagent runs) and Codex rollouts whose
+`session_meta.source` is not an object (subagent/guardian threads; DESIGN keeps only the parent link);
+per file the line prefix before the first record with `timestamp >= cutoff`. File order decides ties and
+clocks that go backwards. A Pi prefix holds every branch written before the cutoff.
+
+**Checks**: unique ids; each `quote` is a substring of the cited record; history evidence is inside the
+visible prefix (by line, not only by time) and not in a non-indexed file; no `task_cluster` and no
+`fact_group` spans both splits (questions that share an answer fact share a `fact_group`).
+
+**Outputs** (directories 0700, files 0600):
+- `public/questions.jsonl` — `id`, `question`, `current_context`, `cutoff`, `visible`;
+  `public/visible/<cutoff>.json` — corpus path, manifest hash and `{path: [sha256, visible_lines]}`. No
+  answers, no evidence list.
+- `grader/grading.jsonl` — everything else; each evidence item gets `sha256`, `line`, `timestamp`, `role`.
+  `grader/evidence/<sha256>.jsonl` — copies of the cited files.
+
+**Correction distance** is checked against `dryRun()` spans, not message counts: the old claim and the
+first correction are mapped to their span ids; `correction-next-exchange` = the correction is in the next
+span (one user turn between, or an agent self-correction in the adjacent span), `correction-later-turn` =
+two or more user turns between, `correction-other-session` / `state-update-other-session` = a different
+session file. No correction in this bank falls inside the old claim's own span.
+
+**Current local bank** (2026-10-09, `bank-v6`, questions sha256 `a4aed050…`, grading `fdbc1288…`): 82
+questions, 33 task clusters, 37 evidence files, 36 cutoffs. 57 need history, 25 do not (30%); 62 test /
+20 tune; 12 cite Codex rollouts; 79 derived, 3 synthetic; 78 `checked`, 4 `checked-with-caveats`.
+Types: no-history 25, rare-detail 12, plan-vs-done 10, correction-next-exchange 10, cross-session-continue
+6, abstain 4, same-name 3, stale-state 3, referential-short 3, state-update-other-session 2,
+correction-later-turn 2, tool-output-detail 1, correction-other-session 1. Evidence roles: assistant 104,
+tool result 67, user 34, tool call 1.
+
+Not yet covered: a correction inside the old claim's own span, and the "unique raw hit + both summary
+channels mis-recall" regression (DESIGN §6.3), which needs built summaries first. Every answer was written
+and checked by one model against the cited records; the user has not reviewed the bank yet.
