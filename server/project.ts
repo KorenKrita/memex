@@ -16,7 +16,8 @@
 //  - Retrieval unit (§4.3): a prefix span P cut from a span S that some view still uses is an additional
 //    representation of S; anything else is its own unit.
 import { createHash } from "node:crypto";
-import { type Db, type Job, type Tx, enqueue, finishJob } from "./db.ts";
+import { type Db, type Job, type Tx, bump, enqueue, finishJob } from "./db.ts";
+import { BARRIER } from "./sync.ts";
 import { parentInfo, projectLines, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
 import { addMigration } from "./db.ts";
 
@@ -28,6 +29,8 @@ addMigration(`
 create table if not exists span (id text primary key, source text not null, prefix bool not null, cut text, unit text not null,
                                  keys text[] not null, records jsonb not null, context jsonb not null,
                                  created_at timestamptz not null default now());
+-- Fingerprint of everything a summary of this span reads (record and context keys carry content hashes).
+alter table span add column if not exists input_fp text not null default '';
 create index if not exists span_source on span (source);
 create index if not exists span_unit on span (unit);
 -- One row per navigation view of a source, in creation order; closed_end = record offset up to which the
@@ -46,6 +49,8 @@ create index if not exists lexical_trgm on lexical using gin (text gin_trgm_ops)
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 export const spanIdOf = (recs: { key: string }[]) => "sp_" + sha(RULE_VERSION + "\u0000" + recs.map((r) => r.key).join("\u0000")).slice(0, 32);
+export const inputFpOf = (s: { records: SpanRecord[]; context: SpanRecord[] }) =>
+  sha(JSON.stringify([RULE_VERSION, s.records.map((r) => [r.key, r.kind, r.digest]), s.context.map((r) => [r.key, r.kind, r.digest])]));
 
 type Loaded = { lines: Record<string, any>[]; blocked?: string; idle: boolean; idleMs: number };
 
@@ -136,17 +141,21 @@ function closedEnd(v: ProjectedView, idle: boolean): number {
   return end;
 }
 
-/** Job `project` for one source, in one read-committed transaction that first locks its job row. Every
- *  change to this source's inputs (sync commit, forget, the parent's projection) enqueues this job in its
- *  own transaction, so it waits on that row lock and cannot commit while this run reads: the reads are
- *  consistent, and a change committed before the lock shows up as req > claimed_req ("rerun"). */
+/** Job `project` for one source, in one read-committed transaction holding the barrier exclusively, then
+ *  its job row (the same order as sync.commit). Every change to this source's inputs (sync commit, forget,
+ *  the parent's projection) also takes the barrier, so the reads are consistent, and a change committed
+ *  before shows up as req > claimed_req ("rerun"). A projection that withdraws anything already published
+ *  as input (a span, a canonical mapping, a context) moves the source's version (§5.5 write-side rule), so
+ *  model requests and results built from the old projection are refused at their barrier check. */
 export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "lost"> {
   const source = job.key;
   return db.begin(async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock(${BARRIER})`;
     const fin = await finishJob(tx, job);
     if (fin !== "done") return fin;
     if (!(await tx`select 1 from source where id = ${source}`).length) return fin;
     const a = await analyse(tx, source);
+    let withdrawn = false;
     const [before] = await tx`select status, keys from projected where source = ${source}`;
     await tx`insert into projected (source, status, keys, res) values (${source}, ${a.status}, ${a.keys}, ${{ reason: a.reason ?? null }})
              on conflict (source) do update set status = excluded.status, keys = excluded.keys, res = excluded.res, at = now()`;
@@ -172,27 +181,42 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       const closed = new Set(rows.flatMap((r) => r.spans.filter((s) => s.id && s.end <= r.closed_end).map((s) => s.id!)));
       // Summaries are queued once a span is closed on some view (inherited parent spans are the parent's).
       const own = new Set<string>();
+      const refresh = new Set<string>(); // closed spans whose summary input changed
       for (const [id, s] of a.spans) {
-        const unit = s.prefix && s.cut && used.has(s.cut) ? s.cut : id;
+        // The unit is global: S may still be used by a view of another source (a fork parent).
+        const cutUsed = !!s.cut && (used.has(s.cut) || (await tx`select 1 from view where span_ids @> array[${s.cut}]::text[] limit 1`).length > 0);
+        const unit = s.prefix && cutUsed ? s.cut! : id;
         const keys = s.records.map((r: SpanRecord) => r.key);
-        const ins = await tx`insert into span (id, source, prefix, cut, unit, keys, records, context)
-                             values (${id}, ${source}, ${s.prefix}, ${s.cut ?? null}, ${unit}, ${tx.array(keys, "text")}, ${s.records}, ${s.context})
-                             on conflict (id) do nothing returning id`;
-        if (ins.length) own.add(id);
+        const fp = inputFpOf(s);
+        const [old] = await tx`select input_fp, unit from span where id = ${id}`;
+        if (!old) {
+          await tx`insert into span (id, source, prefix, cut, unit, keys, records, context, input_fp)
+                   values (${id}, ${source}, ${s.prefix}, ${s.cut ?? null}, ${unit}, ${tx.array(keys, "text")}, ${s.records}, ${s.context}, ${fp})`;
+          own.add(id);
+        } else if (old.input_fp !== fp || old.unit !== unit) {
+          await tx`update span set records = ${s.records}, context = ${s.context}, input_fp = ${fp}, unit = ${unit} where id = ${id}`;
+          if (old.input_fp !== fp) (withdrawn = true), refresh.add(id);
+        }
       }
       // An open tail closes by idling, with no new commit to wake us: look again when it would have.
       if (rows.some((r) => r.closed_end < r.keys.length)) await enqueue(tx, "project", source, {}, Math.max(0, idleCloseMs() - a.idleMs) + 1000);
-      for (const id of closed) if (!wasClosed.has(id) && (own.has(id) || (await tx`select 1 from span where id = ${id} and source = ${source}`).length)) await enqueue(tx, "summarize", id);
+      for (const id of closed)
+        if ((!wasClosed.has(id) || refresh.has(id)) && (own.has(id) || (await tx`select 1 from span where id = ${id} and source = ${source}`).length))
+          await enqueue(tx, "summarize", id);
       // Spans of this source no view uses any more and nothing else depends on: drop them.
-      await tx`delete from span s where s.source = ${source} and not exists (select 1 from view v where v.span_ids @> array[s.id])
-               and not exists (select 1 from span u where u.unit = s.id and u.id <> s.id)`;
+      const gone = await tx`delete from span s where s.source = ${source} and not exists (select 1 from view v where v.span_ids @> array[s.id])
+                            and not exists (select 1 from span u where u.unit = s.id and u.id <> s.id) returning id`;
+      if (gone.length) withdrawn = true;
       // Lexical index: rebuild for this source (cheap relative to summaries; keeps forget/revision exact).
       await tx`delete from lexical where source = ${source}`;
       const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => ({ source, key: r.key, part, rec: r.rec, kind: r.kind, text })));
       for (let i = 0; i < lex.length; i += 500) await tx`insert into lexical ${tx(lex.slice(i, i + 500))}`;
     }
+    // A changed canonical mapping or block state withdraws what was derived from the old one.
+    const remapped = !!before && (before.status !== a.status || JSON.stringify(before.keys) !== JSON.stringify(a.keys));
+    if (withdrawn || remapped) await bump(tx, "s:" + source);
     // Children that fork from this source re-project when its projection changes.
-    if (!before || before.status !== a.status || JSON.stringify(before.keys) !== JSON.stringify(a.keys))
+    if (!before || remapped)
       for (const c of await tx`select id from source where parent_id = ${source}`) await enqueue(tx, "project", c.id);
     return fin;
   });

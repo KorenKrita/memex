@@ -220,3 +220,96 @@ test("an open span is never sent, even if a summarize job names it", async () =>
   await drain(db);
   expect(requests.length).toBe(0);
 });
+
+// ---- regressions from the 2a review ----
+
+test("a canonical remap after the check: the request built from the old mapping is not sent", async () => {
+  const { hooks } = await import("./derive.ts");
+  const P = sourceIdOf("pi", "rp");
+  const pl = [header("rp"), msg("user", "x0", null, "q0"), msg("assistant", "y0", "x0", "r0"), msg("user", "u1", "y0", "q1"), msg("assistant", "a1", "u1", "r1"),
+              msg("user", "u2", "a1", "q2 child-native-for-now"), msg("assistant", "a2", "u2", "r2")];
+  await put("rp", pl.slice(0, 3)); // the parent has synced only its first exchange so far
+  const kid = [JSON.stringify({ ...JSON.parse(header("rk")), parentSession: "/x/rp.jsonl" }), ...pl.slice(1), msg("user", "k1", "a2", "child turn")];
+  const decl = { source: sourceIdOf("pi", "rk"), harness: "pi" as const, nativeId: "rk", scope: "personal", parent: P };
+  const l = await requestLease(db, decl, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "rk0", length: kid.length, changes: kid.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db, ["project"]);
+  // [u2 a2]: records and <context> (u1, a1) all native to the child for now, so its vector has no parent entry.
+  const [target] = (await db`select id from span where keys[1] like 'rk/u2:%'`).map((r: any) => r.id);
+  expect(target).toBeTruthy();
+  hooks.afterCheck = async () => {
+    hooks.afterCheck = async () => {};
+    await put("rp", pl); // the parent catches up: u1..a2 are the parent's records
+    await drain(db, ["project"]);
+  };
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize' and key <> ${target}`;
+  const j = (await claimJob(db, ["summarize"]))!;
+  expect(j.key).toBe(target);
+  await runSummarize(db, j);
+  expect(chats().filter((r) => JSON.stringify(r.body).includes("child-native-for-now")).length).toBe(0);
+});
+
+test("an unchanged input is not summarized again", async () => {
+  await put("same", session("same"));
+  await drain(db);
+  expect(chats().length).toBe(1);
+  const [sp] = await db`select span from span_summary`;
+  await db.begin(async (tx: any) => {
+    await tx`insert into vis_version values (${"s:" + sourceIdOf("pi", "same")}, 2) on conflict (key) do update set v = vis_version.v + 1`;
+    await tx`insert into job (kind, key) values ('summarize', ${sp.span})`;
+  });
+  await drain(db);
+  expect(chats().length).toBe(1);
+  const [row] = await db`select deps from span_summary`;
+  expect(Object.values(row.deps)).toContain(3); // the vector was renewed
+});
+
+test("a summary made from an old <context> is not embedded", async () => {
+  await put("ctx", [header("ctx"), msg("user", "u1", null, "first"), msg("assistant", "a1", "u1", "r1"), msg("user", "u2", "a1", "second"), msg("assistant", "a2", "u2", "r2"), msg("user", "u3", "a2", "third")]);
+  await drain(db, ["project", "summarize"]);
+  const before = (await db`select count(*)::int n from span_summary`)[0].n;
+  expect(before).toBe(2);
+  requests = [];
+  // u1 is revised: [u2 a2] keeps its records (same span id) but its <context> changes.
+  await put("ctx", [header("ctx"), msg("user", "u1", null, "first REVISED"), msg("assistant", "a1", "u1", "r1"), msg("user", "u2", "a1", "second"), msg("assistant", "a2", "u2", "r2"), msg("user", "u3", "a2", "third")]);
+  await drain(db, ["project"]);
+  await drain(db, ["embed"]);
+  const embedded = requests.filter((r) => r.path.endsWith("/embeddings")).length;
+  expect(embedded).toBe(0); // both summaries depend on the old u1 (as record or as context)
+  await drain(db);
+  const sent = chats().map((r) => r.body.messages[1].content as string);
+  expect(sent.length).toBe(2);
+  expect(sent.every((t) => !t.includes(">\nfirst\n<"))).toBe(true);
+});
+
+test("allow racing a skip: the skipped work is not lost", async () => {
+  const { hooks } = await import("./derive.ts");
+  await db`delete from grant_rule where purpose = 'derive'`;
+  await put("race", session("race"));
+  await runOne(db, ["project"]);
+  hooks.beforeSkip = async () => {
+    hooks.beforeSkip = async () => {};
+    await allowGrant(db, "personal", "derive", "llm");
+    await allowGrant(db, "personal", "derive", "embedding");
+  };
+  await drain(db);
+  expect(chats().length).toBe(1);
+});
+
+test("a child's prefix cut from the parent's span is a representation of that span", async () => {
+  const P = sourceIdOf("pi", "up");
+  const pl = [header("up"), msg("user", "u1", null, "q " + "y".repeat(100)), msg("assistant", "a1", "u1", "r1"), msg("assistant", "a2", "a1", "r2"), msg("user", "u3", "a2", "next")];
+  await put("up", pl);
+  await drain(db, ["project"]);
+  const [S] = (await db`select id from span where source = ${P} and keys[1] like '%/u1:%'`).map((r: any) => r.id);
+  const kid = [JSON.stringify({ ...JSON.parse(header("uk")), parentSession: "/x/up.jsonl" }), pl[1], pl[2], msg("assistant", "b2", "a1", "child branch")];
+  const decl = { source: sourceIdOf("pi", "uk"), harness: "pi" as const, nativeId: "uk", scope: "personal", parent: P };
+  const l = await requestLease(db, decl, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "uk0", length: kid.length, changes: kid.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db, ["project"]);
+  const prefix = await db`select id, unit from span where prefix and cut = ${S}`;
+  expect(prefix.length).toBe(1);
+  expect(prefix[0].unit).toBe(S);
+});

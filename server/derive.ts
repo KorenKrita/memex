@@ -20,7 +20,10 @@ import { sourceIdOf } from "../client/records.ts";
 export const PROMPT_VERSION = "span-summary-v1";
 export const EMBED_DIM = Number(process.env.MEMEX_EMBED_DIM ?? 1024);
 const SEND_DEADLINE_MS = 5_000; // connecting and writing the body, while the barrier is held shared
-const RESPONSE_MS = () => Number(process.env.MEMEX_MODEL_TIMEOUT_MS ?? 90_000); // below the job lock (120 s)
+// Measured summary latency: p95 5.5 s, max 10.6 s (eval/span-trial.py, 101 calls). Three tries stay below
+// the job lock (JOB_LOCK_MS 120 s); a lapsed lock only costs a duplicate call, both runs pass every check.
+const RESPONSE_MS = () => Number(process.env.MEMEX_MODEL_TIMEOUT_MS ?? 30_000);
+const GRANT_LOCK = 3; // serializes widening a grant against recording work skipped for lack of it
 const MAX_TRIES = 3;
 
 addMigration(`
@@ -28,6 +31,8 @@ create table if not exists span_summary (span text primary key references span (
                                          deps jsonb not null, model text not null, prompt_v text not null, summary jsonb not null,
                                          text text not null, text_hash text not null, embedding vector(${EMBED_DIM}), embed_model text,
                                          at timestamptz not null default now());
+-- span.input_fp the summary was made from: a summary is valid only while it equals the span's.
+alter table span_summary add column if not exists input_fp text not null default '';
 create index if not exists span_summary_unit on span_summary (unit);
 create index if not exists span_summary_trgm on span_summary using gin (text gin_trgm_ops);
 -- Work not done for a reason that a later change can lift (a grant): requeued when it is.
@@ -40,6 +45,7 @@ create table if not exists derive_skip (kind text not null, span text not null, 
 /** Allow (scope, purpose, dest). Work skipped for lack of it is queued again. */
 export async function allowGrant(db: Db, scope: string, purpose: string, dest: string) {
   await db.begin(async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock(${GRANT_LOCK})`;
     await tx`insert into grant_rule values (${scope}, ${purpose}, ${dest}) on conflict do nothing`;
     const skipped = await tx`delete from derive_skip where reason = ${"not-granted:" + dest} and ${scope} = any(scopes) returning kind, span`;
     for (const s of skipped) await enqueue(tx, s.kind, s.span);
@@ -56,7 +62,7 @@ export async function revokeGrant(db: Db, scope: string, purpose: string, dest: 
 
 // ---------- exact check ----------
 
-type SpanRow = { id: string; source: string; unit: string; records: any[]; context: any[] };
+type SpanRow = { id: string; source: string; unit: string; records: any[]; context: any[]; input_fp: string };
 type Checked = { ok: true; span: SpanRow; deps: Record<string, number>; scopes: string[] } | { ok: false; reason: string; scopes?: string[] };
 
 /** A span record key `native/rec:hash#j` → its L0 coordinates (the dry-run builds keys this way). */
@@ -70,7 +76,7 @@ function parseKey(key: string) {
 
 /** Step 1 for a span and destination, in the caller's read-only repeatable-read snapshot. */
 async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> {
-  const [span] = await q`select s.id, s.source, s.unit, s.records, s.context, src.harness from span s join source src on src.id = s.source where s.id = ${spanId}`;
+  const [span] = await q`select s.id, s.source, s.unit, s.records, s.context, s.input_fp, src.harness from span s join source src on src.id = s.source where s.id = ${spanId}`;
   if (!span) return { ok: false, reason: "gone" };
   const closed = await q`select 1 from view v, jsonb_array_elements(v.spans) x
                          where v.source = ${span.source} and x->>'id' = ${spanId} and (x->>'end')::int <= v.closed_end limit 1`;
@@ -110,7 +116,7 @@ async function unchanged(tx: Tx, deps: Record<string, number>) {
 }
 
 /** Test seam: runs between the exact check and the guarded send (where a concurrent change can land). */
-export const hooks = { afterCheck: async () => {} };
+export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {} };
 
 const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isolation level repeatable read read only", f) as Promise<T>;
 
@@ -125,6 +131,8 @@ async function guardedPost(db: Db, deps: Record<string, number>, url: string, ke
   await hooks.afterCheck();
   let reply!: Promise<Reply>;
   const sent = await db.begin(async (tx: Tx) => {
+    // The whole held interval is bounded: waiting for the lock, the comparison, and the send below.
+    await tx`select set_config('lock_timeout', ${SEND_DEADLINE_MS + "ms"}, true), set_config('statement_timeout', ${SEND_DEADLINE_MS + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
     if (!(await unchanged(tx, deps))) return false;
     const req = (u.protocol === "https:" ? https : http).request(u, {
@@ -231,9 +239,18 @@ const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex"
 
 /** Finish without a result, remembering a liftable reason. No barrier needed: nothing is published. */
 async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
+  await hooks.beforeSkip();
   return db.begin(async (tx: Tx) => {
+    const grant = reason.startsWith("not-granted:");
+    if (grant) await tx`select pg_advisory_xact_lock(${GRANT_LOCK})`; // then the job row, as allowGrant does
     const fin = await finishJob(tx, job);
-    if (fin === "done" && reason.startsWith("not-granted:"))
+    if (fin !== "done" || !grant) return fin;
+    // Under the grant lock: either the widening committed before (we see it, run again) or it runs after
+    // and finds this row.
+    const dest = reason.slice("not-granted:".length);
+    const ok = await tx`select count(*)::int n from grant_rule where purpose = 'derive' and dest = ${dest} and scope = any(${tx.array(scopes, "text")})`;
+    if (ok[0].n === scopes.length) await enqueue(tx, job.kind, job.key);
+    else
       await tx`insert into derive_skip values (${job.kind}, ${job.key}, ${tx.array(scopes, "text")}, ${reason}, now())
                on conflict (kind, span) do update set scopes = excluded.scopes, reason = excluded.reason, at = now()`;
     return fin;
@@ -251,7 +268,7 @@ async function publish(db: Db, job: Job, deps: Record<string, number>, write: (t
       await enqueue(tx, job.kind, job.key, {}, 5_000);
       return "stale";
     }
-    if (!(await tx`select 1 from span where id = ${job.key}`).length) return fin; // re-projected away meanwhile
+    if (!(await tx`select 1 from span where id = ${job.key}`).length) return fin; // re-projected away meanwhile (the version moved too)
     await write(tx);
     return fin;
   });
@@ -262,11 +279,18 @@ export async function runSummarize(db: Db, job: Job) {
   const url = env("MEMEX_LLM_URL").replace(/\/+$/, "") + "/chat/completions";
   const model = env("MEMEX_LLM_MODEL");
   const key = env("MEMEX_LLM_KEY");
-  if ((await db`select 1 from span_summary where span = ${job.key} and model = ${model} and prompt_v = ${PROMPT_VERSION}`).length) return skip(db, job, "done");
   let problems: string[] = [];
   for (let i = 0; i < MAX_TRIES; i++) {
-    const c = await snapshot(db, (q) => checkSpan(q, job.key, "llm"));
+    const c = await snapshot(db, async (q) => {
+      const r = await checkSpan(q, job.key, "llm");
+      if (!r.ok) return r;
+      const [old] = await q`select 1 from span_summary where span = ${job.key} and model = ${model} and prompt_v = ${PROMPT_VERSION} and input_fp = ${r.span.input_fp}`;
+      return { ...r, current: !!old };
+    });
     if (!c.ok) return skip(db, job, c.reason, c.scopes);
+    // The same input (records and context with their content hashes and canonical sources) was already
+    // summarized: only the conservative version vector is renewed, no model call.
+    if (c.current) return publish(db, job, c.deps, (tx) => tx`update span_summary set deps = ${c.deps} where span = ${job.key} and input_fp = ${c.span.input_fp}`);
     const messages = [{ role: "system", content: SYSTEM }, { role: "user", content: render(c.span) }];
     if (problems.length) messages.push({ role: "user", content: "Your previous answer was invalid: " + problems.slice(0, 4).join("; ") + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
@@ -282,10 +306,11 @@ export async function runSummarize(db: Db, job: Job) {
     problems = validate(s, c.span);
     if (problems.length) continue;
     return publish(db, job, c.deps, async (tx) => {
-      await tx`insert into span_summary (span, unit, deps, model, prompt_v, summary, text, text_hash)
-               values (${job.key}, ${c.span.unit}, ${c.deps}, ${model}, ${PROMPT_VERSION}, ${s}, ${s.summary}, ${sha(s.summary)})
+      await tx`insert into span_summary (span, unit, deps, model, prompt_v, summary, text, text_hash, input_fp)
+               values (${job.key}, ${c.span.unit}, ${c.deps}, ${model}, ${PROMPT_VERSION}, ${s}, ${s.summary}, ${sha(s.summary)}, ${c.span.input_fp})
                on conflict (span) do update set unit = excluded.unit, deps = excluded.deps, model = excluded.model, prompt_v = excluded.prompt_v,
-                 summary = excluded.summary, text = excluded.text, text_hash = excluded.text_hash, embedding = null, embed_model = null, at = now()`;
+                 summary = excluded.summary, text = excluded.text, text_hash = excluded.text_hash, input_fp = excluded.input_fp,
+                 embedding = null, embed_model = null, at = now()`;
       await enqueue(tx, "embed", job.key);
     });
   }
@@ -299,9 +324,12 @@ export async function runEmbed(db: Db, job: Job) {
   const key = env("MEMEX_EMBED_KEY");
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
-      const [s] = await q`select text, text_hash from span_summary where span = ${job.key}`;
+      const [s] = await q`select text, text_hash, input_fp from span_summary where span = ${job.key}`;
       if (!s) return { ok: false as const, reason: "gone" };
       const r = await checkSpan(q, job.key, "embedding");
+      // The summary must have been made from the span's current input; the check above vouches for that
+      // input only. A stale summary waits for its own summarize job.
+      if (r.ok && s.input_fp !== r.span.input_fp) return { ok: false as const, reason: "summary-stale" };
       return r.ok ? { ...r, text: s.text as string, hash: s.text_hash as string } : r;
     });
     if (!c.ok) return skip(db, job, c.reason, c.scopes);
