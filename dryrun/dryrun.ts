@@ -891,20 +891,24 @@ export function dryRun(inputs: string[]) {
   // projection merge this tool does not do, so the whole group is `conflicting-copies` and forks of it stay
   // unresolved. The pre-pass reads with the same checks as analysis and keeps only (id, content hash); the
   // analysis must then see the same content. Codex files are not grouped: a thread id may legitimately span
-  // several rollouts.
+  // several rollouts. Every file read here is hashed, whatever its format, so none can turn into a Pi
+  // session unseen by the grouping; a file this pass cannot read is reported unreadable, not read again.
   const copyHash = new Map<string, string>(); // path → sha256 of the content seen here
+  const prepassError = new Map<string, string>();
   const groups = new Map<string, string[]>(); // header id → paths
   for (const f of files) {
     if (PI_SUBAGENT.test(f) || f.endsWith(".zst")) continue;
+    let text: string;
     try {
-      const text = readText(f, identity.get(f));
-      const head = parseLines(text, emptyResult(f))[0]; // the header the analysis will take
-      if (head?.type !== "session" || typeof head.id !== "string" || !head.id) continue;
-      copyHash.set(f, createHash("sha256").update(text).digest("hex"));
-      (groups.get(head.id) ?? groups.set(head.id, []).get(head.id)!).push(f);
-    } catch {
-      // unreadable or not JSON: the analysis reports it
+      text = readText(f, identity.get(f));
+    } catch (e) {
+      prepassError.set(f, String((e as Error)?.message ?? e));
+      continue;
     }
+    copyHash.set(f, createHash("sha256").update(text).digest("hex"));
+    const head = parseLines(text, emptyResult(f))[0]; // the header the analysis will take
+    if (head?.type !== "session" || typeof head.id !== "string" || !head.id) continue;
+    (groups.get(head.id) ?? groups.set(head.id, []).get(head.id)!).push(f);
   }
   const canonicalPath = new Map<string, string>(); // path → the path analysed for its session
   const conflicting = new Set<string>();
@@ -922,7 +926,11 @@ export function dryRun(inputs: string[]) {
     if (!r) {
       const res = emptyResult(f);
       const canon = canonicalPath.get(f);
-      if (conflicting.has(f)) {
+      const failed = prepassError.get(f);
+      if (failed !== undefined) {
+        Object.assign(res, { status: "skipped", reason: "unreadable", error: failed.slice(0, 200) });
+        r = { res };
+      } else if (conflicting.has(f)) {
         res.harness = "pi";
         skip(res, "conflicting-copies");
         r = { res };

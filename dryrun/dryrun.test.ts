@@ -729,8 +729,7 @@ describe("fourth review", () => {
       ]);
       // S: u′ (same id, other content: native to S) then P's c, inherited; too big for one span → [u′] [c]
       file(`${d}/${sName}.jsonl`, [piHeader({ id: "sS", parentSession: P }), piMsg("u", null, user("x".repeat(12280))), piMsg("c", "u", call("t"))]);
-      const t = dryRun([join(dir, d)]).total;
-      return { prefixSpans: t.prefixSpans, spans: t.spans, summaryInputBytes: t.summaryInputBytes };
+      return dryRun([join(dir, d)]).total; // every total field, not only the prefix count
     };
     const a = run("pi/roles-ab", "A", "B");
     expect(run("pi/roles-ba", "B", "A")).toEqual(a);
@@ -884,6 +883,37 @@ describe("input boundary", () => {
     const report = dryRun([join(root, "missing"), root]);
     expect(report.discoveryErrors.map((e) => e.path)).toEqual([join(root, "missing"), join(root, "locked")]);
     expect(report.indexed.pi).toBe(1);
+  });
+
+  test("a file that becomes a Pi session after the copy pre-pass is refused, not counted outside its group", () => {
+    const rows = [piHeader({ id: "same" }), piMsg("u", null, user("u"))];
+    const a = file("pi/race/a.jsonl", rows);
+    file("pi/race/b.jsonl", rows);
+    const spy = spyOn(fs, "readFileSync");
+    let n = 0;
+    // a's pre-pass read sees an empty file (header not yet written), every later read the full session
+    spy.mockImplementation((() => (++n === 1 ? "" : jsonl(rows))) as any);
+    const r = dryRun([join(dir, "pi/race")]);
+    spy.mockRestore();
+    expect(r.perFile.find((f) => f.path === a)).toMatchObject({ status: "skipped", reason: "unreadable" });
+    expect(r.total).toMatchObject({ evidence: 1, spans: 1, summaryInputBytes: D("user", "u") });
+  });
+
+  test("a file the copy pre-pass cannot read is reported unreadable and not read again", () => {
+    const rows = [piHeader({ id: "same" }), piMsg("u", null, user("u"))];
+    const a = file("pi/race2/a.jsonl", rows);
+    file("pi/race2/b.jsonl", rows);
+    const spy = spyOn(fs, "readFileSync");
+    let n = 0;
+    // a's pre-pass read fails, every later read would succeed
+    spy.mockImplementation((() => {
+      if (++n === 1) throw new Error("EIO");
+      return jsonl(rows);
+    }) as any);
+    const r = dryRun([join(dir, "pi/race2")]);
+    spy.mockRestore();
+    expect(r.perFile.find((f) => f.path === a)).toMatchObject({ status: "skipped", reason: "unreadable", error: "EIO" });
+    expect(r.total).toMatchObject({ evidence: 1, spans: 1 });
   });
 
   test("a symlink given straight to analyzeFile is not followed", () => {

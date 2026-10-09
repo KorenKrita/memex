@@ -12,7 +12,7 @@ opens no network connection and calls no model. There are no default directories
 
 Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
 only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
-cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log`, `mutate-dryrun6-144322.log` and `mutate-dryrun7-151942.log` (there `parentGeq`, a tie taking the parent's view, survived: it is not equivalent, the seventh review found a case; now tested) and `mutate-dryrun8-153025.log`.
+cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log`, `mutate-dryrun6-144322.log` and `mutate-dryrun7-151942.log` (there `parentGeq`, a tie taking the parent's view, survived: it is not equivalent, the seventh review found a case; now tested) and `mutate-dryrun8-153025.log`, `mutate-dryrun9-153826.log` (`rereadAfterFail` survived until its test was added: `rereadAfterFail2`).
 Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
@@ -56,8 +56,9 @@ Rules without a listed mutation there are tested but not mutation-checked.
   identical copies are analysed once (first path) and the others are `duplicate-copy` with `copyOf`; a fork
   naming either copy resolves to the same one. Copies that differ need a projection merge this tool does
   not do, so the whole group is `conflicting-copies` and forks of it stay `unresolved`, whatever the file
-  names. A pre-pass reads each Pi file once (same open checks) and keeps only its id and content hash; the
-  analysis must see the same hash, a file rewritten in between is `unreadable`. Codex files are not
+  names. A pre-pass reads every input once (same open checks) and keeps only its content hash and, for Pi, its
+  header id; the analysis must see the same hash, so a file rewritten in between (e.g. its header written
+  only after the pre-pass) is `unreadable`, as is a file the pre-pass could not read (not retried). Codex files are not
   grouped by id: one thread id may legitimately span several rollout files.
   Cost: linear in entries for a linear session (tested for a 4× size ratio; a cheap per-entry copy is
   not caught); a branching session materializes every view, so work is the sum of view lengths plus
