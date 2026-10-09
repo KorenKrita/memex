@@ -139,7 +139,7 @@ describe("publish barrier (§5.5)", () => {
         await tx`select pg_sleep(5)`;   // simulates an oversized vector compare inside the lock
       },
     }, { lockDeadlineMs: 300 });
-    expect(r).toBe("timeout");
+    expect(r).toBe("timeout");           // deadline hit mid-statement: Bun receives SQLSTATE 25P04
     await writer;                       // would hang for 5s if the lock were still held
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
@@ -154,7 +154,7 @@ describe("publish barrier (§5.5)", () => {
         for (let i = 0; i < 8; i++) await tx`select pg_sleep(0.1)`;   // 100ms each, deadline 300ms
       },
     }, { lockDeadlineMs: 300 });
-    expect(r).toBe("timeout");
+    expect(r).toBe("timeout");           // deadline hit mid-statement: Bun receives SQLSTATE 25P04
     await writer;
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
@@ -190,7 +190,7 @@ describe("publish barrier (§5.5)", () => {
       },
     }, { lockDeadlineMs: 300 });
     expect(doneDuringPause).toBe(true);
-    expect(r).toBe("timeout");
+    expect(r).toBe("aborted");          // deadline hit while idle: Bun sees only "connection closed"
     expect(await P.publicationCount(db, "R1")).toBe(0);
   });
 

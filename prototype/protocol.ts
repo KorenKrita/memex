@@ -165,7 +165,7 @@ export type PublishOpts = { reuseSnapshot?: boolean; omitViewSessions?: boolean;
  *         bounds the WHOLE locked transaction server-side (including client pauses between statements); on
  *         expiry Postgres terminates the backend, which releases the lock and discards the publication.
  */
-export type PublishResult = "published" | "rejected" | "timeout" | "uncertain";
+export type PublishResult = "published" | "rejected" | "timeout" | "aborted" | "uncertain";
 export async function publish(pool: Db, id: string, hooks: PublishHooks = {}, opts: PublishOpts = {}): Promise<PublishResult> {
   const c = await pool.reserve();
   try { return await publishOn(c, id, hooks, opts); } finally { c.release(); }
@@ -187,7 +187,7 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
   await hooks.beforeLock?.();
 
   await c`begin isolation level read committed`;
-  let commitSent = false;
+  let commitAttempted = false;
   try {
     await c.unsafe(`set local transaction_timeout = ${Math.max(1, Math.floor(opts.lockDeadlineMs ?? LOCK_DEADLINE_MS))}`);
     let now: Record<string, number>;
@@ -202,15 +202,17 @@ async function publishOn(c: Db, id: string, hooks: PublishHooks, opts: PublishOp
     if (!keys.every(k => now[k] === vec[k])) { await c`rollback`; return "rejected"; }
     await c`insert into publication (artifact) values (${id})`;       // "hand to transport" stand-in
     await hooks.beforeCommit?.();
-    commitSent = true;
+    commitAttempted = true;
     await c`commit`;
     await hooks.afterCommit?.();
     return "published";
   } catch (e: any) {
     await safeRollback(c);
-    // transaction_timeout terminates the backend; Bun reports only "connection closed" (no 25P04 SQLSTATE).
-    // Before COMMIT was sent the server cannot have committed: a definite abort. After it, the outcome is unknown.
-    if (e?.code === "ERR_POSTGRES_CONNECTION_CLOSED" || e?.errno === "25P04") return commitSent ? "uncertain" : "timeout";
+    // 25P04 (deadline fired during a statement) = confirmed timeout. A deadline firing while idle in transaction
+    // reaches Bun 1.4.2 only as "connection closed", indistinguishable from any other disconnect: before COMMIT
+    // was attempted the server cannot have committed ("aborted", cause unknown); after, "uncertain".
+    if (e?.errno === "25P04" && !commitAttempted) return "timeout";
+    if (e?.errno === "25P04" || e?.code === "ERR_POSTGRES_CONNECTION_CLOSED") return commitAttempted ? "uncertain" : "aborted";
     throw e;
   }
 }
@@ -324,8 +326,9 @@ export async function syncCommit(db: Db, c: SyncCommit, opts: SyncOpts = {}): Pr
     await opts.afterLeaseCheck?.();
     if (!opts.noMergeLock) await tx`select pg_advisory_xact_lock(${BARRIER})`;
     // Lease validity on the server clock, after every lock wait; the rest of the transaction is then bounded by
-    // the lease's remaining lifetime (floor: dies no later than expiry). Expiry mid-transaction terminates the
-    // backend and rolls everything back; the caller sees a closed connection and retries with the same commit id.
+    // the lease's remaining lifetime (rounded down; timer precision and the COMMIT phase are not hard-bounded —
+    // see README). Expiry mid-transaction terminates the backend and rolls back; the caller sees a closed
+    // connection and retries with the same commit id.
     // One statement computes the remaining lifetime and arms the timer (PG17 starts it at the SET), no gap between.
     const [v] = await tx`select left_ms, case when left_ms > 0 and ${!opts.noLeaseDeadline}
                            then set_config('transaction_timeout', left_ms::text, true) end as armed

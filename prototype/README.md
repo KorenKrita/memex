@@ -53,15 +53,18 @@ third round: exclusive (not shared) merge lock, and the lease-lifetime bound on 
   whole transaction including client pauses between statements; on expiry the backend is terminated, which
   releases the lock and discards the publication. `statement_timeout` is not enough: many short statements
   can hold the lock indefinitely. `publish()` reserves its own pool connection for this reason.
-- Bun reports the terminated backend only as `ERR_POSTGRES_CONNECTION_CLOSED` (no `25P04` SQLSTATE reaches the
-  client). `publish()` therefore classifies by position: lost before COMMIT was sent = `timeout` (definitely not
-  committed); lost after = `uncertain` (could be "committed, ack lost"; the caller must not assume a rollback).
+- When the deadline fires during a statement, Bun receives SQLSTATE `25P04` → `timeout` (confirmed). When it fires
+  while the session is idle in transaction (client pause), Bun reports only `ERR_POSTGRES_CONNECTION_CLOSED`,
+  indistinguishable from any other disconnect. `publish()` therefore classifies a closed connection by position:
+  before COMMIT was attempted = `aborted` (definitely not committed, cause unknown); after = `uncertain`
+  (could be "committed, ack lost"; the caller must not assume a rollback).
 - Bun 1.4.2 quirk: on a closed reserved connection the `IN ${sql(list)}` helper raises an extra unhandled
   rejection that escapes try/catch; version reads use `= any(${sql.array(keys, "text")})` instead.
 - A lease queue advances on any caller's poll: the oldest pending request is granted even if its client is gone,
   then expires after its ttl and is reaped, so a dead head cannot block the queue. `syncCommit()` re-checks
   lease expiry after the barrier wait, then — in the same statement — arms `transaction_timeout` with the lease's
-  remaining server-clock lifetime, so expiry at any later point terminates the transaction and rolls back every
-  write (the caller sees a closed connection and retries with the same commit id).
+  remaining server-clock lifetime (rounded down). Tested: expiry during the merge terminates the transaction and
+  leaves no shared state or scan progress. Not established: a hard bound at millisecond precision, or what
+  happens if the timer fires while COMMIT itself is being processed.
 - "Published" means a row in `publication`, written inside the locked section. HTTP/socket hand-off and
   cancellation at that boundary are **not** verified here.
