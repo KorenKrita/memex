@@ -1,0 +1,2 @@
+{"type": "session", "version": 3, "id": "r", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"}
+{"type": "message", "id": "r1", "parentId": null, "timestamp": "2026-01-01T00:00:02Z", "message": {"role": "user", "content": [{"type": "text", "text": "subagent run says GREEN"}]}}

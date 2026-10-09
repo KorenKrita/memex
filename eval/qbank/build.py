@@ -1,29 +1,34 @@
-"""Build the question bank from drafts (local only, not in the repo).
+"""Build the question bank from drafts (run locally; the bank itself never enters the repo).
 
   uv run --no-project python build.py OUTDIR drafts1.jsonl [drafts2.jsonl ...]
   env MEMEX_CORPUS=<frozen corpus dir> (default /tmp/memex-eval/corpus-20261009, made by freeze.py)
 
-Retrievable scope ("visible set") of a question with cutoff C, computed from the frozen corpus:
-  * indexable files: Pi top-level session files (not <session>/<id>/run-N/ subagent runs) and Codex rollouts
-    whose session_meta.source is not an object (subagent / guardian threads are archived but not indexed);
+Retrievable scope ("visible set") of a question with cutoff C:
+  * indexable files are those the reference dry-run indexes (indexable.ts runs dryrun/dryrun.ts over the
+    corpus: Codex legacy, child (subagent / guardian) and compressed files and Pi subagent transcripts are
+    skipped), minus Pi `<session>/<id>/run-N/` subagent runs;
   * per file, the visible prefix = all lines before the first line whose timestamp >= C (file order decides
-    ties and out-of-order clocks; a Pi file prefix contains every branch written before C);
-  * files whose first record is already >= C are not visible.
+    ties and clocks that go backwards; a Pi prefix contains every branch written before C); a file whose
+    first timestamped line is already >= C is not visible.
 Evidence for a history question must lie inside that prefix (checked by line number, not only by time).
 
-Outputs (0600; directories 0700):
-  OUTDIR/public/questions.jsonl         id, question, current_context, cutoff, visible (file name below)
-  OUTDIR/public/visible/<cutoff>.json   {corpus, corpus_manifest_sha256, files: {path: [sha256, visible_lines]}}
+Outputs (directories 0700, files 0600):
+  OUTDIR/public/questions.jsonl         id, question, current_context, cutoff, visible
+  OUTDIR/public/visible/<cutoff>.json   {corpus, corpus_manifest_sha256, cutoff, files: {path: [sha256, lines]}}
   OUTDIR/grader/grading.jsonl           everything else, evidence enriched with sha256/line/timestamp/role
   OUTDIR/grader/evidence/<sha256>.jsonl copies of evidence files (grader only)
-Checks: unique ids; quotes are substrings of the cited record; evidence inside the visible prefix; every
-task_cluster and every fact_group stays inside one split.
+Checks: unique ids; files match the frozen manifest; quotes are substrings of the cited record; history
+evidence inside the visible prefix of an indexable file; no task_cluster, no fact_group and no answer
+record (file, entry) in both splits; correction types carry old-claim and correction evidence in the
+stated file relation (same file and later line, or another file). The span distance of a correction is
+checked separately with span-distance.ts (see eval/README.md).
 Pi evidence paths are relative to CORPUS/pi (entry = record id); Codex paths start with codex/ or
 codex-archived/ (entry = str(ordinal) of a response_item: message, tool call or tool output).
 """
-import hashlib, json, os, shutil, sys
+import hashlib, json, os, subprocess, sys
 from datetime import datetime
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 CORPUS = os.environ.get("MEMEX_CORPUS", "/tmp/memex-eval/corpus-20261009")
 MAN_BYTES = open(CORPUS + "/manifest.json", "rb").read()
 MANIFEST = json.loads(MAN_BYTES)["files"]
@@ -31,6 +36,17 @@ outdir, drafts_paths = sys.argv[1], sys.argv[2:]
 if os.path.exists(outdir):
     sys.exit(f"{outdir} exists; build into a new directory")
 ts = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def fail(msg):
+    raise SystemExit(msg)
+
+
+ref = json.loads(subprocess.run(["bun", f"{HERE}/indexable.ts", CORPUS], check=True, capture_output=True, text=True).stdout)
+INDEXABLE = set(ref["indexed"])
+for k in INDEXABLE:
+    if k not in MANIFEST:
+        fail(f"dry-run indexes {k}, which is not in the frozen manifest")
 
 
 def text_of(m):
@@ -48,22 +64,20 @@ def text_of(m):
 
 
 def parse(key, data):
-    """-> (line timestamps, {entry: (line, timestamp, role, text)}, indexable)"""
+    """-> (line timestamps, {entry: (line, timestamp, role, text)})"""
     codex = key.startswith(("codex/", "codex-archived/"))
-    stamps, es, indexable = [], {}, True
-    if not codex and "/run-" in key:
-        indexable = False
-    for n, line in enumerate(data.decode("utf-8", "replace").split("\n")):
+    stamps, es = [], {}
+    for n, line in enumerate(data.decode("utf-8").split("\n")):
         try:
             d = json.loads(line)
         except Exception:
             stamps.append(None)
             continue
-        stamps.append(d.get("timestamp"))
+        stamps.append(d.get("timestamp") if isinstance(d, dict) else None)
+        if not isinstance(d, dict):
+            continue
         if codex:
             p = d.get("payload") or {}
-            if d.get("type") == "session_meta" and n == 0 and isinstance(p.get("source"), dict):
-                indexable = False
             if d.get("type") != "response_item":
                 continue
             if p.get("type") == "message":
@@ -79,7 +93,7 @@ def parse(key, data):
         elif d.get("type") == "message":
             m = d.get("message", {})
             es[d["id"]] = (n, d["timestamp"], m.get("role"), text_of(m))
-    return stamps, es, indexable
+    return stamps, es
 
 
 def prefix(stamps, cutoff):
@@ -95,54 +109,69 @@ cache = {}
 
 def load(key):
     if key not in cache:
+        if key not in MANIFEST:
+            fail(f"{key} is not in the frozen corpus manifest")
         data = open(f"{CORPUS}/{key}", "rb").read()
         sha = hashlib.sha256(data).hexdigest()
-        assert MANIFEST.get(key) == sha, f"{key} differs from the frozen corpus manifest"
-        cache[key] = (sha, data) + parse(key, data)
+        if MANIFEST[key] != sha:
+            fail(f"{key} differs from the frozen corpus manifest")
+        cache[key] = (sha, data) + (parse(key, data) if key in INDEXABLE else ([], {}))
     return cache[key]
 
 
 drafts = [json.loads(l) for p in drafts_paths for l in open(p) if l.strip()]
 ids = [q["id"] for q in drafts]
-assert len(ids) == len(set(ids)), "duplicate ids"
-for field in ("task_cluster", "fact_group"):
-    seen = {}
-    for q in drafts:
-        for g in ([q[field]] if field == "task_cluster" else q.get(field, [])):
-            if seen.setdefault(g, q["split"]) != q["split"]:
-                raise SystemExit(f"{q['id']}: {field} {g!r} spans splits")
+if len(ids) != len(set(ids)):
+    fail("duplicate ids")
 evkey = lambda f: f if f.startswith(("codex/", "codex-archived/")) else "pi/" + f
+seen = {}
+for q in drafts:
+    groups = [("task_cluster", q["task_cluster"])] + [("fact_group", g) for g in q.get("fact_group", [])]
+    groups += [("answer record", f"{evkey(e['file'])}#{e['entry']}") for e in q["evidence"] if e["use"] == "answer"]
+    for kind, g in groups:
+        if seen.setdefault((kind, g), q["split"]) != q["split"]:
+            fail(f"{q['id']}: {kind} {g!r} spans splits")
 for q in drafts:
     for ev in q["evidence"]:
         key = evkey(ev["file"])
-        sha, _, stamps, es, indexable = load(key)
+        sha, _, stamps, es = load(key)
+        if key not in INDEXABLE:
+            if q["needs_history"]:
+                fail(f"{q['id']}: evidence {ev['entry']} is in a non-indexed file {key}")
+            stamps, es = parse(key, cache[key][1])
         if ev["entry"] not in es:
-            raise SystemExit(f"{q['id']}: no entry {ev['entry']} in {key}")
+            fail(f"{q['id']}: no entry {ev['entry']} in {key}")
         n, t, role, text = es[ev["entry"]]
         if ev["quote"] not in text:
-            raise SystemExit(f"{q['id']}: quote not in {ev['entry']}: {ev['quote']!r}")
+            fail(f"{q['id']}: quote not in {ev['entry']}: {ev['quote']!r}")
         ev.update(sha256=sha, line=n, timestamp=t, role=role)
-        if q["needs_history"]:
-            if not indexable:
-                raise SystemExit(f"{q['id']}: evidence {ev['entry']} is in a non-indexed (subagent) file")
-            if n >= prefix(stamps, q["cutoff"]):
-                raise SystemExit(f"{q['id']}: evidence {ev['entry']} (line {n}, {t}) is outside the visible prefix")
+        if q["needs_history"] and n >= prefix(stamps, q["cutoff"]):
+            fail(f"{q['id']}: evidence {ev['entry']} (line {n}, {t}) is outside the visible prefix")
     if q["needs_history"] and not q["evidence"]:
-        raise SystemExit(f"{q['id']}: history question without evidence")
+        fail(f"{q['id']}: history question without evidence")
+    if q["type"].startswith("correction") or q["type"] == "state-update-other-session":
+        old = [e for e in q["evidence"] if e["use"] == "old-claim"]
+        cor = [e for e in q["evidence"] if e["use"] == "correction"]
+        if not old or not cor:
+            fail(f"{q['id']}: {q['type']} needs old-claim and correction evidence")
+        o, other = old[0], q["type"].endswith("other-session")
+        c = [e for e in cor if (e["file"] != o["file"]) == other]
+        if not c:
+            fail(f"{q['id']}: no correction in {'another' if other else 'the same'} file as the old claim")
+        if not other and min(e["line"] for e in c) <= o["line"]:
+            fail(f"{q['id']}: correction is not after the old claim")
 
+old_umask = os.umask(0o077)
 for d in ("public/visible", "grader/evidence"):
-    os.makedirs(f"{outdir}/{d}", mode=0o700)
-os.chmod(outdir, 0o700)
-os.chmod(f"{outdir}/public", 0o700)
-os.chmod(f"{outdir}/grader", 0o700)
+    os.makedirs(f"{outdir}/{d}")
 man_sha = hashlib.sha256(MAN_BYTES).hexdigest()
 cutoffs = sorted({q["cutoff"] for q in drafts})
 vis_name = {c: c.replace(":", "") + ".json" for c in cutoffs}
 for c in cutoffs:
     files = {}
-    for key in MANIFEST:
-        sha, _, stamps, _, indexable = load(key)
-        k = prefix(stamps, c) if indexable else 0
+    for key in sorted(INDEXABLE):
+        sha, _, stamps, _ = load(key)
+        k = prefix(stamps, c)
         if k:
             files[key] = [sha, k]
     with open(f"{outdir}/public/visible/{vis_name[c]}", "w") as f:
@@ -160,7 +189,9 @@ for q in drafts:
         p = f"{outdir}/grader/evidence/{sha}.jsonl"
         if not os.path.exists(p):
             open(p, "wb").write(data)
-for dp, _, fs in os.walk(outdir):
+os.umask(old_umask)
+for dp, ds, fs in os.walk(outdir):
+    os.chmod(dp, 0o700)
     for fn in fs:
         os.chmod(f"{dp}/{fn}", 0o600)
 h = lambda p: hashlib.sha256(open(f"{outdir}/{p}", "rb").read()).hexdigest()

@@ -1,4 +1,4 @@
-{"type": "session", "id": "s1", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"}
+{"type": "session", "version": 3, "id": "s1", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"}
 {"type": "message", "id": "a1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "message": {"role": "user", "content": [{"type": "text", "text": "old value is RED"}]}}
 {"type": "message", "id": "a2", "parentId": "a1", "timestamp": "2026-01-01T00:00:05Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "branch-1 says RED"}]}}
 {"type": "message", "id": "b2", "parentId": "a1", "timestamp": "2026-01-01T00:00:06Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "branch-2 says BLUE"}]}}
