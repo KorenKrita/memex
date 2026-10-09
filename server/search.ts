@@ -111,7 +111,7 @@ function validate(b: any): SearchReq {
 }
 
 /** Query scope check, readable and valid sources, in one snapshot. */
-async function basis(q: Tx, r: SearchReq) {
+async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purpose" | "inContext">) {
   const [src] = await q`select scope, harness from source where id = ${r.source}`;
   if (src && src.scope !== r.scope) throw new HttpError(409, "scope differs from the registered scope");
   if ((await q`select 1 from tomb where key = ${"source:" + r.source}`).length) throw new HttpError(410, "source forgotten");
@@ -129,7 +129,7 @@ async function basis(q: Tx, r: SearchReq) {
   }
   // Records still in the host's context, as canonical ids (inherited ones map to their origin).
   const ctx = new Set<string>();
-  if (src && r.inContext!.length) {
+  if (src && r.inContext?.length) {
     const [p] = await q`select keys from projected where source = ${r.source}`;
     const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
     for (const id of r.inContext!) ctx.add(inherited.has(id) ? canonOf(src.harness, inherited.get(id)!) : `${r.source}:${id}`);
@@ -452,6 +452,132 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       rerank_skipped: rerankSkip ?? null,
       trace: Number(t.id),
     }, run);
+  };
+  return run();
+}
+
+// ---------- zoom and grep (§6.4) ----------
+
+const ZOOM_PAGE = 16 * 1024; // [待标定] bytes of record text per page
+const GREP_MAX = 50;
+
+type ToolReq = { source: string; scope: string; purpose: string };
+function toolReq(b: any): ToolReq {
+  const r = validate({ ...b, query: "-" });
+  return { source: r.source, scope: r.scope, purpose: r.purpose };
+}
+const depsOf = (b: Awaited<ReturnType<typeof basis>>, sources: string[]) => {
+  const d: Record<string, number> = { "d:memex": b.dMemex };
+  for (const s of sources) Object.assign(d, b.valid.get(s)!.deps);
+  return d;
+};
+/** Record texts of `keys` (all chunks joined), without forgotten canonical records. */
+async function texts(q: Tx, keys: string[], valid: string[]) {
+  const rows = await q`select key, source, canon, kind, string_agg(text, '' order by part) text from lexical l
+                       where key = any(${q.array(keys, "text")}) and source = any(${q.array(valid, "text")})
+                       and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon)
+                       group by key, source, canon, kind`;
+  return new Map<string, any>(rows.map((x: any) => [x.key, x]));
+}
+
+/** mem_zoom: a span (or unit, or record) with its records' text, paged, and its neighbours on a view. */
+export async function zoom(db: Db, body: any): Promise<Guarded> {
+  const r = toolReq(body);
+  const id = typeof body.id === "string" ? body.id : "";
+  const offset = Number.isInteger(body.offset) && body.offset >= 0 ? body.offset : 0;
+  const limit = Number.isInteger(body.limit) && body.limit > 0 ? Math.min(body.limit, ZOOM_PAGE) : ZOOM_PAGE;
+  const run = async (): Promise<Guarded> => {
+    const out = await snapshot(db, async (q) => {
+      const b = await basis(q, r);
+      const valid = [...b.valid.keys()];
+      if (id.startsWith("record:")) {
+        const canon = id.slice(7);
+        const [row] = await q`select key from lexical l where canon = ${canon} and source = any(${q.array(valid, "text")})
+                              and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key limit 1`;
+        if (!row) throw new HttpError(404, "not found or not readable");
+        const t = (await texts(q, [row.key], valid)).get(row.key);
+        const page = Buffer.from(t.text).subarray(offset, offset + limit).toString();
+        return { deps: depsOf(b, [t.source]), body: { id, source: t.source, kind: t.kind, bytes: Buffer.byteLength(t.text), offset, text: page } };
+      }
+      const sid = id.replace(/^(span|unit):/, "");
+      const [sp] = await q`select id, source, keys, canons from span where id = ${sid} and source = any(${q.array(valid, "text")})`;
+      if (!sp || (await q`select 1 from tomb where key = any(${q.array((sp.canons as string[]).map((c) => "canon:" + c), "text")}) limit 1`).length)
+        throw new HttpError(404, "not found or not readable");
+      // The view: the leaf the caller names, else the result's view basis (same rule as search labels).
+      const views = await q`select ord, tip, spans, span_ids from view where source = ${sp.source} and span_ids @> array[${sid}]::text[] order by ord`;
+      const v = views.find((x: any) => x.tip === body.leaf) ?? views.at(-1);
+      const order = v ? (v.spans as any[]).filter((x) => x.id).map((x) => x.id as string) : [sid];
+      const i = order.indexOf(sid);
+      const t = await texts(q, sp.keys, valid);
+      let skip = offset, left = limit, more = false;
+      const records = [];
+      for (const k of sp.keys as string[]) {
+        const x = t.get(k);
+        if (!x) continue;
+        const buf = Buffer.from(x.text);
+        if (skip >= buf.length) {
+          skip -= buf.length;
+          continue;
+        }
+        const part = buf.subarray(skip, skip + left);
+        records.push({ key: k, canon: x.canon, kind: x.kind, bytes: buf.length, from: skip, text: part.toString() });
+        left -= part.length;
+        skip = 0;
+        if (left <= 0) {
+          more = true;
+          break;
+        }
+      }
+      const summary = (await q`select text from span_summary ss join span s on s.id = ss.span where ss.span = ${sid} and ss.input_fp = s.input_fp`)[0]?.text ?? null;
+      return {
+        deps: depsOf(b, [sp.source, ...[...t.values()].map((x) => x.source)]),
+        body: {
+          id: "span:" + sid, source: sp.source, view_tip: v?.tip ?? null, summary, records, more, next_offset: more ? offset + limit : null,
+          before: i > 0 ? "span:" + order[i - 1] : null, after: i >= 0 && i < order.length - 1 ? "span:" + order[i + 1] : null,
+        },
+      };
+    });
+    return new Guarded(out.deps, out.body, run);
+  };
+  return run();
+}
+
+/** mem_grep: exact substring (or POSIX regex) over the raw text; record positions and a short snippet. */
+export async function grep(db: Db, body: any): Promise<Guarded> {
+  const r = toolReq(body);
+  const pattern = typeof body.pattern === "string" && body.pattern && body.pattern.length <= 512 ? body.pattern : null;
+  if (!pattern) throw new HttpError(400, "pattern must be a non-empty string");
+  const regex = body.regex === true;
+  const run = async (): Promise<Guarded> => {
+    const out = await snapshot(db, async (q) => {
+      await q`select set_config('statement_timeout', '5000ms', true)`;
+      const b = await basis(q, r);
+      const valid = [...b.valid.keys()];
+      const rows = await (regex
+        ? q`select distinct on (key) key, source, canon, kind, part, text from lexical l
+            where source = any(${q.array(valid, "text")}) and text ~ ${pattern}
+            and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key, part limit ${GREP_MAX}`
+        : q`select distinct on (key) key, source, canon, kind, part, text from lexical l
+            where source = any(${q.array(valid, "text")}) and text like ${"%" + esc(pattern) + "%"}
+            and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by key, part limit ${GREP_MAX}`).catch((e: any) => {
+        if (/regular expression|canceling statement/.test(String(e?.message))) throw new HttpError(400, "pattern invalid or too slow");
+        throw e;
+      });
+      const hits = [];
+      for (const x of rows) {
+        const m = regex ? new RegExp(pattern).exec(x.text) : null;
+        const at = regex ? (m?.index ?? 0) : x.text.indexOf(pattern);
+        const pre = Buffer.byteLength(x.text.slice(0, at));
+        const buf = Buffer.from(x.text);
+        hits.push({
+          record: "record:" + x.canon, key: x.key, source: x.source, kind: x.kind,
+          offset: x.part * 2048 + at, // character offset in the record's text (chunks are 2,048 characters)
+          snippet: buf.subarray(Math.max(0, pre - 120), pre + 200).toString().replace(/^\uFFFD+|\uFFFD+$/g, ""),
+        });
+      }
+      return { deps: depsOf(b, [...new Set<string>(rows.map((x: any) => x.source))]), body: { hits, truncated: rows.length >= GREP_MAX } };
+    });
+    return new Guarded(out.deps, out.body, run);
   };
   return run();
 }

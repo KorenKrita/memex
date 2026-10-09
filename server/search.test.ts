@@ -5,7 +5,7 @@ import { connect, migrate, bump, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, httpHooks, serve, transport } from "./http.ts";
-import { search, GUARANTEED } from "./search.ts";
+import { search, zoom, grep, GUARANTEED } from "./search.ts";
 import { drain } from "./worker.ts";
 import { sourceIdOf } from "../client/records.ts";
 
@@ -333,4 +333,82 @@ test("over HTTP: a forget committed after the result was computed is not deliver
   const r = await http()("POST", "/v1/search", Q("deliver-check"));
   expect(fired).toBe(2); // the first delivery found its vector stale and recomputed
   expect(JSON.stringify(r)).not.toContain("deliver-check");
+});
+
+// ---------- zoom / grep ----------
+
+const T0 = (extra: object = {}) => ({ source: sourceIdOf("pi", "asker"), scope: "personal", purpose: "tool", ...extra });
+
+test("grep: exact substring with record positions; scope and forget filter it; regex errors are 400", async () => {
+  const s = await put("g1", linear("g1", [["see /etc/memex.conf line", "r"], ["other", "the path /etc/memex.conf again"]]));
+  await put("w1", linear("w1", [["/etc/memex.conf at work", "r"]]), "work");
+  await drain(db);
+  let r = (await grep(db, T0({ pattern: "/etc/memex.conf" }))).body as any;
+  expect(r.hits.length).toBe(2);
+  expect(r.hits.every((h: any) => h.source === s && h.snippet.includes("/etc/memex.conf"))).toBe(true);
+  r = (await grep(db, T0({ pattern: "memex\\.conf a", regex: true }))).body as any;
+  expect(r.hits.length).toBe(1);
+  await expect(grep(db, T0({ pattern: "(", regex: true }))).rejects.toThrow("pattern invalid");
+  await db`insert into tomb values (${"canon:" + s + ":u0"})`;
+  r = (await grep(db, T0({ pattern: "/etc/memex.conf" }))).body as any;
+  expect(r.hits.map((h: any) => h.record)).toEqual(["record:" + s + ":a1"]);
+  r = (await grep(db, T0({ pattern: "memex\\.conf", regex: true }))).body as any;
+  expect(r.hits.map((h: any) => h.record)).toEqual(["record:" + s + ":a1"]);
+  // Not authorized to query: refused.
+  await db`delete from grant_rule where scope = 'personal' and purpose = 'tool'`;
+  await expect(grep(db, T0({ pattern: "x" }))).rejects.toThrow("not authorized");
+});
+
+test("zoom: a span's records with paging and neighbours on its view; a record by canonical id", async () => {
+  const s = await put("z1", linear("z1", [["first " + "f".repeat(300), "r1"], ["second", "r2"], ["third", "r3"]]));
+  await drain(db);
+  const spans = (await db`select id, keys from span where source = ${s}`) as any[];
+  const mid = spans.find((x) => x.keys[0].startsWith("z1/u1:"))!;
+  let r = (await zoom(db, T0({ id: "span:" + mid.id }))).body as any;
+  expect(r.records.map((x: any) => x.text)).toEqual(["second", "r2"]);
+  expect(r.before).toBeTruthy();
+  expect(r.after).toBeTruthy();
+  const first = (await zoom(db, T0({ id: r.before }))).body as any;
+  expect(first.records[0].text.startsWith("first")).toBe(true);
+  expect(first.before).toBeNull();
+  // Paging inside a span.
+  const p1 = (await zoom(db, T0({ id: r.before, limit: 100 }))).body as any;
+  expect(p1.more).toBe(true);
+  expect(Buffer.byteLength(p1.records.map((x: any) => x.text).join(""))).toBe(100);
+  const p2 = (await zoom(db, T0({ id: r.before, limit: 100, offset: p1.next_offset }))).body as any;
+  expect(p2.records[0].text).toBe("f".repeat(100));
+  // A record by canonical id.
+  const rec = (await zoom(db, T0({ id: "record:" + s + ":a2" }))).body as any;
+  expect(rec.text).toBe("r3");
+  // Forgetting one of the span's records makes the span unreadable.
+  await db`insert into tomb values (${"canon:" + s + ":u1"})`;
+  await expect(zoom(db, T0({ id: "span:" + mid.id }))).rejects.toThrow("not found or not readable");
+});
+
+test("zoom over HTTP: another scope's span is not readable", async () => {
+  const w = await put("wz", linear("wz", [["work secret", "r"]]), "work");
+  await drain(db);
+  const [sp] = await db`select id from span where source = ${w}`;
+  const res = await fetch(`http://127.0.0.1:${api.port}/v1/zoom`, { method: "POST", headers: { authorization: `Bearer ${key}` }, body: JSON.stringify(T0({ id: "span:" + sp.id })) });
+  expect(res.status).toBe(404);
+  expect(await res.text()).not.toContain("work secret");
+});
+
+test("zoom over HTTP: a forget committed before delivery is not answered from the old state", async () => {
+  const s = await put("zf", linear("zf", [["zoom-forget-me", "r"]]));
+  await drain(db);
+  const [sp] = await db`select id from span where source = ${s} limit 1`;
+  let fired = 0;
+  httpHooks.beforeGuard = async () => {
+    if (fired++) return;
+    await db.begin(async (tx: any) => {
+      await tx`select pg_advisory_xact_lock(${BARRIER})`;
+      await tx`insert into tomb values (${"source:" + s})`;
+      await bump(tx, "s:" + s);
+    });
+  };
+  const res = await fetch(`http://127.0.0.1:${api.port}/v1/zoom`, { method: "POST", headers: { authorization: `Bearer ${key}` }, body: JSON.stringify(T0({ id: "span:" + sp.id })) });
+  expect(fired).toBe(1); // the first delivery found its vector stale; recomputing finds nothing readable
+  expect(res.status).toBe(404);
+  expect(await res.text()).not.toContain("zoom-forget-me");
 });
