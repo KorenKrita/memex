@@ -1,10 +1,11 @@
 // Search (DESIGN §6.3, §4.3, §7) over real Postgres, HTTP via node:http, and a fake model endpoint.
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import net from "node:net";
 import { connect, migrate, bump, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
-import { addApiKey, httpHooks, serve, transport } from "./http.ts";
+import { addApiKey, Guarded, httpHooks, route, serve, transport } from "./http.ts";
 import { search, zoom, grep, GUARANTEED } from "./search.ts";
 import { forgetSource } from "./forget.ts";
 import { drain } from "./worker.ts";
@@ -502,3 +503,65 @@ test("forget tombs every native record: a fork imported later cannot revive them
   expect(await hasText("late-parent-secret")).toBe(false);
   expect(await hasText("late-child-own")).toBe(true);
 });
+
+// ---------- delivery boundary (§5.5 "对外响应") ----------
+
+// A guarded test route with a body far larger than the socket buffers.
+route("POST", /^\/v1\/test-big$/, async () => {
+  const g: Guarded = new Guarded({ "d:memex": 1 }, { blob: "z".repeat(32 * 1024 * 1024) }, async () => g);
+  return g;
+});
+const rawPost = async (path: string) => {
+  const sock = net.connect(api.port, "127.0.0.1");
+  await new Promise((ok) => sock.once("connect", ok));
+  sock.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${key}\r\nContent-Length: 2\r\n\r\n{}`);
+  sock.pause();
+  return sock;
+};
+const writerWait = async () => {
+  const t0 = Date.now();
+  await db.begin(async (tx: any) => void (await tx`select pg_advisory_xact_lock(${BARRIER})`));
+  return Date.now() - t0;
+};
+
+test("a client that does not read: the barrier is held until hand-over; the deadline cancels the response", async () => {
+  const sock = await rawPost("/v1/test-big");
+  await Bun.sleep(300);
+  const waited = await writerWait();
+  expect(waited).toBeGreaterThan(3_000); // not released when Bun merely had the bytes
+  expect(waited).toBeLessThan(7_000); // the 5 s deadline released it
+  // Cancelled: the connection ends; the client never gets the whole body.
+  let got = 0;
+  sock.on("data", (d) => (got += d.length));
+  const closed = new Promise((ok) => sock.once("close", ok));
+  sock.resume();
+  await Promise.race([closed, Bun.sleep(3_000)]);
+  expect(got).toBeLessThan(32 * 1024 * 1024);
+  sock.destroy();
+}, 20_000);
+
+test("a client that resumes reading: the hand-over completes and releases the barrier", async () => {
+  const sock = await rawPost("/v1/test-big");
+  await Bun.sleep(300);
+  let got = 0;
+  sock.on("data", (d) => (got += d.length));
+  const w = writerWait();
+  await Bun.sleep(1_000);
+  sock.resume();
+  const waited = await w;
+  expect(waited).toBeGreaterThan(900); // held while the client did not read
+  expect(waited).toBeLessThan(4_000); // released once the body was taken, before the deadline
+  await Bun.sleep(300);
+  expect(got).toBeGreaterThan(32 * 1024 * 1024);
+  sock.destroy();
+}, 20_000);
+
+test("a client that disconnects: the barrier is released without waiting for the deadline", async () => {
+  const sock = await rawPost("/v1/test-big");
+  await Bun.sleep(300);
+  const w = writerWait();
+  await Bun.sleep(500);
+  sock.destroy();
+  const waited = await w;
+  expect(waited).toBeLessThan(2_500);
+}, 20_000);

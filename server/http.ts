@@ -1,12 +1,19 @@
-// HTTP API (node:http). Every route needs `Authorization: Bearer <api key>`; keys are stored as sha256.
+// HTTP API (Bun.serve). Every route needs `Authorization: Bearer <api key>`; keys are stored as sha256.
 // Bodies are JSON, at most MAX_BODY bytes. Errors: {error} with a status; no request text is logged.
 // A route may return `Guarded`: a response derived from published state (search, zoom, grep). It is written
 // only after its version vector is compared under the shared barrier, and the barrier is held until the
 // body is handed to the transport (DESIGN §5.5 "对外响应"); a stale result is recomputed.
-import http from "node:http";
+//
+// The hand-over point. Bun's `res.end` callback (node:http) and `flush()` resolve once Bun has the bytes,
+// before the socket takes them (measured: 64 MB "sent" in 55 ms to a client not reading). A pull-mode
+// body stream with highWaterMark 0 is asked for its next chunk only after the previous one went to the
+// socket (measured: pulls stop while the client does not read, resume when it does). So the body goes out
+// in CHUNK pieces and is handed over when the stream is asked for more after the last piece; at most one
+// CHUNK can still be in Bun's buffer then. Past the deadline the stream errors and the connection closes.
 import type { Db, Tx } from "./db.ts";
 import { blockRecords, BARRIER, commit, HttpError, manifest, releaseLease, requestLease, tryGrant } from "./sync.ts";
 import { unchanged } from "./derive.ts";
+const CHUNK = 16 * 1024;
 
 export const MAX_BODY = 10 * 1024 * 1024;
 export const DELIVER_DEADLINE_MS = 5_000; // lock wait + comparison + handing the body to the transport
@@ -71,69 +78,92 @@ export async function addApiKey(db: Db, name: string): Promise<string> {
   return key;
 }
 
-const send = (res: http.ServerResponse, status: number, body: unknown) => {
-  const data = Buffer.from(JSON.stringify(body));
-  res.writeHead(status, { "content-type": "application/json", "content-length": data.length });
-  return data;
-};
+const json = (status: number, body: unknown) => Response.json(body, { status });
 
-/** Write a guarded response: compare under the shared barrier, hand the body over, then release. */
-async function deliver(db: Db, res: http.ServerResponse, g: Guarded) {
+/** A guarded response: compare under the shared barrier, stream the body out, release once handed over.
+ *  One deadline covers the lock wait, the comparison and the hand-over. */
+async function deliver(db: Db, g: Guarded): Promise<Response> {
   for (let i = 0; i < GUARD_TRIES; i++) {
     await httpHooks.beforeGuard();
-    const done = await db.begin(async (tx: Tx) => {
-      await tx`select set_config('lock_timeout', ${DELIVER_DEADLINE_MS + "ms"}, true), set_config('statement_timeout', ${DELIVER_DEADLINE_MS + "ms"}, true)`;
+    let respond!: (r: Response) => void;
+    const response = new Promise<Response>((ok) => (respond = ok));
+    const held = db.begin(async (tx: Tx) => {
+      const until = Date.now() + DELIVER_DEADLINE_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const left = () => Math.max(1, until - Date.now()) + "ms";
+      await tx`select set_config('lock_timeout', ${left()}, true), set_config('statement_timeout', ${left()}, true)`;
       await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
+      await tx`select set_config('statement_timeout', ${left()}, true)`;
       if (!(await unchanged(tx, g.deps))) return false;
       await httpHooks.beforeDeliver();
-      const data = send(res, 200, g.body);
-      // Handed over once the transport has taken the body; past the deadline the response is cancelled.
-      await new Promise<void>((ok, bad) => {
-        const t = setTimeout(() => (res.destroy(), bad(new Error("deliver deadline"))), DELIVER_DEADLINE_MS);
-        res.end(data, () => (clearTimeout(t), ok()));
+      const data = Buffer.from(JSON.stringify(g.body));
+      await new Promise<void>((done, fail) => {
+        let at = 0;
+        let ctl!: ReadableStreamDefaultController<Uint8Array>;
+        const stop = (e: Error) => (clearTimeout(timer), fail(e));
+        timer = setTimeout(() => {
+          try { ctl.error(new Error("deliver deadline")); } catch {}
+          stop(new Error("deliver deadline"));
+        }, Math.max(1, until - Date.now()));
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => void (ctl = c),
+          pull: (c) => {
+            if (at >= data.length) {
+              clearTimeout(timer);
+              c.close();
+              done(); // every piece went to the socket (the last one may still be in Bun's buffer)
+              return;
+            }
+            c.enqueue(data.subarray(at, (at += CHUNK)));
+          },
+          cancel: () => stop(new Error("client gone")),
+        }, { highWaterMark: 0 });
+        respond(new Response(body, { headers: { "content-type": "application/json", "content-length": String(data.length) } }));
       });
       return true;
     });
-    if (done) return;
-    g = await g.again();
+    const out = await Promise.race([held.then((ok) => (ok ? "held" : "stale")), response]).catch((e) => {
+      throw e instanceof HttpError ? e : new HttpError(503, "busy; retry");
+    });
+    if (out instanceof Response) {
+      held.catch(() => {}); // the hand-over failed after the head went out: the stream already errored
+      return out;
+    }
+    if (out === "stale") {
+      g = await g.again();
+      continue;
+    }
   }
   throw new HttpError(503, "state kept changing; retry");
 }
 
-export function serve(db: Db, opts: { port: number; hostname?: string }): Promise<{ port: number; stop: () => Promise<void> }> {
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", "http://x");
-    try {
-      if (url.pathname === "/healthz") return void res.end(send(res, 200, { ok: true }));
-      const m = (req.headers.authorization ?? "").match(/^Bearer (\S+)$/);
-      const [k] = m ? await db`select 1 from api_key where hash = ${sha(m[1])} and not revoked` : [];
-      if (!k) return void res.end(send(res, 401, { error: "unauthorized" }));
-      const found = routes.find(([method, re]) => method === req.method && re.test(url.pathname));
-      if (!found) return void res.end(send(res, 404, { error: "not found" }));
-      const parts: Buffer[] = [];
-      let size = 0;
-      for await (const c of req) {
-        size += c.length;
-        if (size > MAX_BODY) throw new HttpError(413, "body too large");
-        parts.push(c);
+export function serve(db: Db, opts: { port: number; hostname?: string }) {
+  const server = Bun.serve({
+    port: opts.port,
+    hostname: opts.hostname ?? "127.0.0.1",
+    maxRequestBodySize: MAX_BODY,
+    async fetch(req) {
+      const url = new URL(req.url);
+      try {
+        if (url.pathname === "/healthz") return json(200, { ok: true });
+        const m = (req.headers.get("authorization") ?? "").match(/^Bearer (\S+)$/);
+        const [k] = m ? await db`select 1 from api_key where hash = ${sha(m[1])} and not revoked` : [];
+        if (!k) return json(401, { error: "unauthorized" });
+        const found = routes.find(([method, re]) => method === req.method && re.test(url.pathname));
+        if (!found) return json(404, { error: "not found" });
+        const text = req.method === "GET" ? "" : await req.text();
+        let body: any = {};
+        if (text) try { body = JSON.parse(text); } catch { throw new HttpError(400, "body must be JSON"); }
+        const out = await found[2](db, body ?? {}, url.pathname.match(found[1])!.slice(1), url);
+        return out instanceof Guarded ? await deliver(db, out) : json(200, out);
+      } catch (e) {
+        if (e instanceof HttpError) return json(e.status, { error: e.message });
+        console.error(`${req.method} ${url.pathname}: ${(e as Error).name}: ${(e as Error).message?.slice(0, 200)}`);
+        return json(500, { error: "internal" });
       }
-      const text = Buffer.concat(parts).toString();
-      let body: any = {};
-      if (text) try { body = JSON.parse(text); } catch { throw new HttpError(400, "body must be JSON"); }
-      const out = await found[2](db, body ?? {}, url.pathname.match(found[1])!.slice(1), url);
-      if (out instanceof Guarded) await deliver(db, res, out);
-      else res.end(send(res, 200, out));
-    } catch (e) {
-      if (res.headersSent) return void res.destroy();
-      if (e instanceof HttpError) return void res.end(send(res, e.status, { error: e.message }));
-      console.error(`${req.method} ${url.pathname}: ${(e as Error).name}: ${(e as Error).message?.slice(0, 200)}`);
-      res.end(send(res, 500, { error: "internal" }));
-    }
+    },
   });
-  server.requestTimeout = 60_000;
-  return new Promise((ok) =>
-    server.listen(opts.port, opts.hostname ?? "127.0.0.1", () =>
-      ok({ port: (server.address() as any).port, stop: () => new Promise<void>((done) => (server.closeAllConnections(), server.close(() => done()))) })));
+  return Promise.resolve({ port: server.port as number, stop: async () => void (await server.stop(true)) });
 }
 
 /** Client transport for tests and plugins: JSON over fetch with the API key. */
