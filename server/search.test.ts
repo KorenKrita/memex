@@ -565,3 +565,77 @@ test("a client that disconnects: the barrier is released without waiting for the
   const waited = await w;
   expect(waited).toBeLessThan(2_500);
 }, 20_000);
+
+// ---------- forget by canonical source ----------
+
+test("forget a child: a grandchild keeps the grandparent's evidence and its own; only the child's records go", async () => {
+  const P = sourceIdOf("pi", "gp");
+  const pl = [header("gp"), msg("user", "u0", null, "grandparent-fact"), msg("assistant", "a0", "u0", "r")];
+  await put("gp", pl);
+  await drain(db);
+  const kl = [header("ch", { parentSession: "/x/gp.jsonl" }), pl[1], pl[2], msg("user", "c1", "a0", "kid-fact"), msg("assistant", "c2", "c1", "r")];
+  const K = await put("ch", kl, "personal", P);
+  await drain(db);
+  const gl = [header("gc", { parentSession: "/x/ch.jsonl" }), ...kl.slice(1), msg("user", "g1", "c2", "grandchild-fact"), msg("assistant", "g2", "g1", "r")];
+  await put("gc", gl, "personal", K);
+  await drain(db);
+  for (const t of ["grandparent-fact", "kid-fact", "grandchild-fact"]) expect(await hasText(t)).toBe(true);
+  await forgetSource(db, K);
+  await drain(db);
+  expect(await hasText("kid-fact")).toBe(false);
+  expect(await hasText("grandparent-fact")).toBe(true);
+  expect(await hasText("grandchild-fact")).toBe(true);
+  // The grandparent's records keep their origin in the grandchild (not relabelled as its own).
+  const g = (await grep(db, T0({ pattern: "grandparent-fact" }))).body as any;
+  expect(g.hits.map((h: any) => h.record)).toEqual(["record:" + P + ":u0"]);
+  // The grandparent's records are not tombed, under its id or by content.
+  expect((await db`select count(*)::int n from tomb where key like ${"canon:" + P + ":%"}`)[0].n).toBe(0);
+  // A new fork of the grandparent, imported now, keeps the copied prefix (not refused as forgotten).
+  const nl = [header("nf", { parentSession: "/x/gp.jsonl" }), pl[1], pl[2], msg("user", "n1", "a0", "new-fork-own")];
+  const l = await requestLease(db, { source: sourceIdOf("pi", "nf"), harness: "pi", nativeId: "nf", scope: "personal", parent: P }, "m1");
+  await tryGrant(db, l);
+  const c = await commit(db, { leaseId: l, commitId: "nf0", length: nl.length, changes: nl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(c).toMatchObject({ ok: true, refused: 0 });
+});
+
+test("forget a parent whose record was revised: the child's copy of the old version goes too", async () => {
+  const P = sourceIdOf("pi", "rv");
+  const old = [header("rv"), msg("user", "u0", null, "old-version-secret"), msg("assistant", "a0", "u0", "r")];
+  await put("rv", old);
+  await drain(db);
+  const kl = [header("rk2", { parentSession: "/x/rv.jsonl" }), old[1], old[2], msg("user", "k1", "a0", "kid-own-2"), msg("assistant", "k2", "k1", "r")];
+  await put("rk2", kl, "personal", P);
+  await drain(db);
+  // The parent's file now holds a revised u0 (the child's copy keeps the old one).
+  await put("rv", [old[0], msg("user", "u0", null, "new-version"), old[2]]);
+  await drain(db);
+  await forgetSource(db, P);
+  await drain(db);
+  expect(await hasText("old-version-secret")).toBe(false);
+  expect(await hasText("kid-own-2")).toBe(true);
+});
+
+test("forget a parent: a child's own record that reuses a parent record id is kept", async () => {
+  const P = sourceIdOf("pi", "sid");
+  const pl = [header("sid"), msg("user", "u0", null, "parent-text-x"), msg("assistant", "a0", "u0", "r")];
+  await put("sid", pl);
+  await drain(db);
+  // The child's own entry happens to have id "x9", as does a later parent entry with other content.
+  const kl = [header("sk", { parentSession: "/x/sid.jsonl" }), pl[1], pl[2], msg("user", "x9", "a0", "child-own-x9"), msg("assistant", "x10", "x9", "r")];
+  const K = await put("sk", kl, "personal", P);
+  await drain(db);
+  await put("sid", [...pl, msg("user", "x9", "a0", "parent-later-x9")]);
+  await drain(db);
+  await forgetSource(db, P);
+  await drain(db);
+  expect(await hasText("child-own-x9")).toBe(true);
+  expect(await hasText("parent-later-x9")).toBe(false);
+  // The child syncs again: its own x9 is accepted, not refused as a forgotten ancestor id.
+  const l = await requestLease(db, { source: K, harness: "pi", nativeId: "sk", scope: "personal", parent: P }, "m1");
+  await tryGrant(db, l);
+  const c = await commit(db, { leaseId: l, commitId: "sk-again", length: kl.length, changes: kl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(c).toMatchObject({ ok: true, refused: 2 }); // only the two copies of the parent's records
+  await drain(db);
+  expect(await hasText("child-own-x9")).toBe(true);
+  expect(await hasText("parent-text-x")).toBe(false);
+});

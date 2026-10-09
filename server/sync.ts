@@ -10,6 +10,7 @@
 import type { Db, Tx } from "./db.ts";
 import { bump, enqueue } from "./db.ts";
 import { blockHashes, CHUNK, sourceIdOf, type Harness } from "../client/records.ts";
+import { contentHash } from "../dryrun/dryrun.ts";
 
 export const BARRIER = 1; // global visibility barrier and merge serializer (advisory lock, one-key form)
 const COMMIT_NS = 0x6d656d78; // two-key namespace for commit ids
@@ -152,17 +153,19 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       await tx`update lease set done = true where id = ${c.leaseId}`;
       return { ok: false, reason: "not-granted" } as const;
     }
-    // Refuse forgotten canonical records: this source's own (`canon:source:rec`), and copies of a forgotten
-    // fork ancestor's records (a copy keeps the ancestor's record id), so an import after the forget cannot
-    // bring them back as this session's own.
-    const chain = (await tx`with recursive a(id, n) as (select parent_id, 1 from source where id = ${l.source} and parent_id is not null
-                              union all select s.parent_id, a.n + 1 from source s join a on s.id = a.id where s.parent_id is not null and a.n < 64)
-                            select id from a`).map((r: any) => r.id as string);
-    // ("header" is every file's own first line, never a copy.)
-    const owners = (ch: Change) => (ch.id === "header" ? [l.source] : [l.source, ...chain]);
-    const cand = c.changes.flatMap((ch) => owners(ch).map((s) => `canon:${s}:${ch.id}`));
+    // Refuse forgotten records: this source's own (`canon:source:rec`), and copies of a forgotten fork
+    // ancestor's own records, by content (`copy:rec:content hash`, forget.ts), so an import after the forget
+    // cannot bring them back as this session's own. A record that only reuses an id is not a copy.
+    const copyKey = (ch: Change) => {
+      try {
+        return `copy:${ch.id}:${contentHash(JSON.parse(ch.raw))}`;
+      } catch {
+        return "";
+      }
+    };
+    const cand = c.changes.flatMap((ch) => [`canon:${l.source}:${ch.id}`, ...(ch.id === "header" ? [] : [copyKey(ch)])]);
     const tombs = new Set<string>((await tx`select key from tomb where key = any(${tx.array(cand, "text")})`).map((r: any) => r.key));
-    const keep = c.changes.filter((ch) => !owners(ch).some((s) => tombs.has(`canon:${s}:${ch.id}`)));
+    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !tombs.has(copyKey(ch))));
     // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
     const dropped = await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}
                              returning rec`;

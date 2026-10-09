@@ -102,6 +102,16 @@ type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: Proj
 /** Analyse one source (and, through `parent`, read its fork parent's stored projection). */
 async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; idleMs: number; parentId: string | null }> {
   const [src] = await q`select harness, scope, parent_id from source where id = ${source}`;
+  // A forgotten parent is skipped: forget removed its own records from this L0, and what it had inherited
+  // keeps its origin through the nearest living ancestor (the copies match that ancestor's records).
+  for (const seen = new Set([source]); src.parent_id && (await q`select 1 from tomb where key = ${"source:" + src.parent_id}`).length; ) {
+    if (seen.has(src.parent_id)) {
+      src.parent_id = null; // a cycle of declared parents: no usable ancestor
+      break;
+    }
+    seen.add(src.parent_id);
+    src.parent_id = (await q`select parent_id from source where id = ${src.parent_id}`)[0]?.parent_id ?? null;
+  }
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
   const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
@@ -110,10 +120,8 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    const gone = src.parent_id && (await q`select 1 from tomb where key = ${"source:" + src.parent_id}`).length;
-    // Unknown, other-scope or forgotten parent: a root session. A forgotten parent's copies were removed from
-    // this L0 by forget, so only the records new here remain (their first parentId dangles: an orphan root).
-    if (!src.parent_id || gone) delete lines[0].parentSession;
+    // Unknown or no living ancestor: a root session (records whose parent entry was forgotten are orphan roots).
+    if (!src.parent_id) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
       const [p] = await q`select s.scope, pr.status, pr.keys from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
