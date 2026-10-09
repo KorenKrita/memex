@@ -207,69 +207,96 @@ function unitsOf(path: Rec[], unpaired: Set<string>): Rec[][] {
   return out;
 }
 
-type Span = { id: string; keys: string[]; size: number };
-// Spans and forest nodes already made, by first record key / (left,right). One registry per resolved Pi
-// fork family, shared (not copied): a span is identified by its ordered canonical record keys (id + content
-// hash), so a P one fork cut is reused by its siblings, as DESIGN §4.3's immutable spans would be.
-type Registry = { spanAt: Map<string, Span[]>; nodeId: Map<string, string> };
+// One per resolved fork family (a file and its resolved Pi forks), shared, never copied. Three jobs, kept
+// apart (DESIGN §4.3, §4.4):
+//  - source partition: a trie over the views' canonical record keys finds, for a new view, the earliest
+//    earlier view sharing its longest prefix; only that view's span list decides what is reused and where
+//    P is cut, so another fork's spans never change this one's cut;
+//  - span identity: a span is its ordered canonical record keys; an identical span (e.g. the same P cut by
+//    two sibling forks) is one object;
+//  - forest nodes: identical (left, right) pairs are one node.
+// Canonical record keys carry the session the record is native to, so byte-identical records new in two
+// sessions stay two records, and an inherited record keeps its source through every descendant.
+type ViewSpan = { start: number; end: number; id?: string }; // id undefined: nothing to summarize
+type Registry = {
+  trie: Map<string, { node: number; view: number }>; // `${parentNode}|${recordKey}` → trie node
+  viewSpans: ViewSpan[][]; // per view, in partition order, record offsets on that view's path
+  spanId: Map<string, string>; // ordered record keys → span id
+  nodeId: Map<string, string>; // `${left},${right}` → node id
+};
+const newRegistry = (): Registry => ({ trie: new Map(), viewSpans: [], spanId: new Map(), nodeId: new Map() });
 const SHORT_SESSION = 4; // DESIGN §4.4 [待标定]: a session whose views all have fewer leaves builds no nodes
 
 // Partition every view into spans the way DESIGN §4.3 does it online, given the views in creation order:
-// a later view reuses every earlier span lying whole on its path and ending on one of its unit
-// boundaries; where it forks inside an earlier span it gets a prefix span P (cut back to whole units, so
+// a later view reuses its source view's spans lying whole on the shared prefix and ending on one of its own
+// unit boundaries; where it forks inside a source span it gets a prefix span P (cut back to whole units, so
 // a call never leaves its result) followed by its own spans. Spans never cross a user message.
 // Assumption: spans are taken as finally cut; whether a span was still open at fork time is not in the logs.
-function partition(views: Rec[][], res: FileResult, registry: Registry = { spanAt: new Map(), nodeId: new Map() }): Registry {
-  const { spanAt, nodeId } = registry;
+function partition(views: Rec[][], res: FileResult, reg: Registry = newRegistry()): Registry {
   const unpaired = new Set<string>();
   const pending = new Map<string, string>(); // this file's new nodes, published only if it is not short
   let longest = 0;
   let n = 0;
-  const register = (us: Rec[][], prefix: boolean): Span | undefined => {
+  const register = (us: Rec[][], start: number, prefix: boolean): ViewSpan => {
     const recs = us.flat();
+    const end = start + recs.length;
     const size = recs.reduce((a, r) => a + digestSize(r), 0);
-    if (size === 0) return undefined; // e.g. a lone memory result: nothing to summarize
-    const sp: Span = { id: `${res.path}#s${n++}`, keys: recs.map((r) => r.key), size };
-    (spanAt.get(sp.keys[0]) ?? spanAt.set(sp.keys[0], []).get(sp.keys[0])!).push(sp);
-    res.spans++;
-    res.summaryInputBytes += size;
-    if (prefix) res.prefixSpans++;
-    if (size > SPAN_MAX) res.oversizedSpans++; // only a lone indivisible unit gets here
-    return sp;
+    if (size === 0) return { start, end }; // e.g. a lone memory result
+    const key = recs.map((r) => r.key).join("\u0000");
+    let id = reg.spanId.get(key);
+    if (id === undefined) {
+      reg.spanId.set(key, (id = `${res.path}#s${n++}`));
+      res.spans++;
+      res.summaryInputBytes += size;
+      if (prefix) res.prefixSpans++;
+      if (size > SPAN_MAX) res.oversizedSpans++; // only a lone indivisible unit gets here
+    }
+    return { start, end, id };
   };
   for (const path of views) {
     res.views++;
+    const vi = reg.viewSpans.length;
+    // Shared prefix with earlier views, and the earliest view that has it.
+    let node = 0;
+    let shared = 0;
+    let src = -1;
+    for (; shared < path.length; shared++) {
+      const t = reg.trie.get(`${node}|${path[shared].key}`);
+      if (!t) break;
+      node = t.node;
+      src = t.view;
+    }
+    for (let i = shared; i < path.length; i++) {
+      const id = reg.trie.size + 1;
+      reg.trie.set(`${node}|${path[i].key}`, { node: id, view: vi });
+      node = id;
+    }
     const us = unitsOf(path, unpaired);
     const starts: number[] = []; // record offset of each unit
     let off = 0;
     for (const u of us) starts.push(off), (off += u.length);
-    const boundary = new Set([...starts, off]);
-    const order: string[] = []; // this view's span list
-    let ui = 0;
+    const unitAt = new Map(starts.map((s, i) => [s, i]));
+    unitAt.set(off, us.length);
+    const mine: ViewSpan[] = [];
+    let pos = 0;
+    let limit = shared; // where a prefix span must end at the latest
+    for (const sp of src >= 0 ? reg.viewSpans[src] : []) {
+      if (sp.end <= shared && unitAt.has(sp.end)) {
+        mine.push(sp); // whole on the shared prefix and ending on one of this view's unit boundaries
+        pos = sp.end;
+        continue;
+      }
+      limit = Math.min(shared, sp.end);
+      break;
+    }
+    let ui = unitAt.get(pos)!;
+    let k = 0;
+    while (ui + k < us.length && starts[ui + k] + us[ui + k].length <= limit) k++;
+    if (k > 0) {
+      mine.push(register(us.slice(ui, ui + k), pos, true));
+      ui += k;
+    }
     while (ui < us.length) {
-      let full: Span | undefined;
-      let partial = 0;
-      for (const sp of spanAt.get(us[ui][0].key) ?? []) {
-        let m = 0;
-        while (m < sp.keys.length && starts[ui] + m < path.length && path[starts[ui] + m].key === sp.keys[m]) m++;
-        // whole on the path and ending where one of this view's units ends: reusable as is
-        if (m === sp.keys.length && boundary.has(starts[ui] + m)) full = !full || sp.keys.length > full.keys.length ? sp : full;
-        else partial = Math.max(partial, m);
-      }
-      if (full) {
-        order.push(full.id);
-        const end = starts[ui] + full.keys.length;
-        while (ui < us.length && starts[ui] < end) ui++;
-        continue;
-      }
-      let k = 0;
-      while (ui + k < us.length && starts[ui + k] + us[ui + k].length <= starts[ui] + partial) k++;
-      if (k > 0) {
-        const p = register(us.slice(ui, ui + k), true);
-        if (p) order.push(p.id);
-        ui += k;
-        continue;
-      }
       // Fresh span: whole units, up to SPAN_MAX, never across a user message.
       let len = 1;
       let size = us[ui].reduce((a, r) => a + digestSize(r), 0);
@@ -279,17 +306,18 @@ function partition(views: Rec[][], res: FileResult, registry: Registry = { spanA
         size += add;
         len++;
       }
-      const sp = register(us.slice(ui, ui + len), false);
-      if (sp) order.push(sp.id);
+      mine.push(register(us.slice(ui, ui + len), starts[ui], false));
       ui += len;
     }
+    reg.viewSpans.push(mine);
     // Forest over this view's span list: binary carries; identical subtrees are one node (DESIGN §4.4).
+    const order = mine.flatMap((s) => (s.id ? [s.id] : []));
     longest = Math.max(longest, order.length);
     for (let level = order; level.length > 1; ) {
       const up: string[] = [];
       for (let i = 0; i + 1 < level.length; i += 2) {
         const key = `${level[i]},${level[i + 1]}`;
-        let id = nodeId.get(key) ?? pending.get(key);
+        let id = reg.nodeId.get(key) ?? pending.get(key);
         if (id === undefined) pending.set(key, (id = `${res.path}#n${pending.size}`));
         up.push(id);
       }
@@ -298,10 +326,10 @@ function partition(views: Rec[][], res: FileResult, registry: Registry = { spanA
   }
   // Short sessions list span summaries directly (DESIGN §4.4): their nodes are neither counted nor
   // published, so a longer fork builds (and counts) them itself.
-  if (longest >= SHORT_SESSION) for (const [k, v] of pending) nodeId.set(k, v);
+  if (longest >= SHORT_SESSION) for (const [k, v] of pending) reg.nodeId.set(k, v);
   res.forestInternalNodes = longest >= SHORT_SESSION ? pending.size : 0;
   res.unpairedCalls = unpaired.size;
-  return registry;
+  return reg;
 }
 
 // Unique records: evidence, digest and lexical bytes, exclusions. Independent of how views share them.
@@ -456,8 +484,9 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
   }
 }
 
-// A resolved fork parent: its entry keys (id + content) and the spans / nodes it already made.
-type ParentInfo = { keys: Set<string>; registry: Registry };
+// A resolved fork parent: its entries by match key (id + content) → canonical record key, and its family's
+// registry.
+type ParentInfo = { keys: Map<string, string>; registry: Registry };
 type ParentLookup = (p: string) => ParentInfo | "invalid" | undefined; // undefined: parent not among the inputs
 
 // A root, as in Pi's getTree(): parentId null, pointing at itself, or at an entry not in the file (an
@@ -482,7 +511,7 @@ function piTreeValid(entries: Record<string, any>[], byId: Map<string, Record<st
   return true;
 }
 
-function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLookup): Parsed & { keys?: Set<string> } {
+function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLookup): Parsed & { keys?: Map<string, string> } {
   res.harness = "pi";
   const [header, ...rest] = lines;
   if (header.version !== 3) return skip(res, "unsupported-version");
@@ -513,18 +542,26 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
     res.forkStatus = p === undefined ? "parent-not-given" : p === "invalid" ? "unresolved" : "resolved";
     if (p !== undefined && p !== "invalid") from = p;
   }
-  const keyOf = (e: Record<string, any>) => `${e.id}:${contentHash(e).slice(0, 16)}`;
-  const keys = new Set<string>();
+  // Matching uses id + content; identity adds the session the record is native to (DESIGN §4.1), so a
+  // record new here is not mistaken for a byte-identical record new in a sibling, and an inherited one
+  // keeps its source. The session is the header id (the file path if there is none).
+  const session = typeof header.id === "string" && header.id ? header.id : res.path;
+  const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e).slice(0, 16)}`;
+  const keys = new Map<string, string>();
   const navOf = new Map<string, Rec[]>(); // records for navigation (inherited ones included)
   const own: Rec[] = []; // records new in this file: the only ones counted as evidence
   for (const e of entries) {
-    const k = keyOf(e);
-    keys.add(k);
+    const m = matchOf(e);
     if (res.forkStatus === "parent-not-given" || res.forkStatus === "unresolved") {
       // Copied history keeps the parent's ids; without a usable parent nothing here can be called new.
       res.unresolved++;
       navOf.set(e.id, []);
-    } else if (from?.keys.has(k)) {
+      continue;
+    }
+    const inheritedKey = from?.keys.get(m);
+    const k = inheritedKey ?? `${session}/${m}`;
+    keys.set(m, k);
+    if (inheritedKey) {
       res.inherited++;
       navOf.set(e.id, piRecords(e, emptyResult(""), k)); // tallies go to a scratch result: the parent has them
     } else {
@@ -541,29 +578,28 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   }
   const textKids = (id: string) => (children.get(id) ?? []).filter((k) => hasText.get(k.id));
   for (const e of entries) if (textKids(e.id).length > 1) res.branchPoints++;
-  // Views: root → tip paths. A view is born at the last entry on its path that is not its parent's first
-  // text child (a root counts as one): that is when the branch it follows was appended. Views are
-  // partitioned in birth order. One mutable DFS path, cut back to the depth of each popped entry.
-  const pos = new Map(entries.map((e, i) => [e.id, i]));
-  const views: { birth: number; recs: Rec[] }[] = [];
+  // Views: root → tip paths, depth first, children in file (= creation) order. A view's source is the
+  // first view through the deepest shared record (see partition); that is the first-child chain from it,
+  // in this order and in append order alike, so no further ordering is needed. One mutable DFS path, cut
+  // back to the depth of each popped entry.
+  const views: Rec[][] = [];
   const path: Rec[] = [];
   const lens: number[] = []; // path length after each depth
-  const stack: { e: Record<string, any>; depth: number; birth: number }[] = [];
+  const stack: { e: Record<string, any>; depth: number }[] = [];
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
-    if (piIsRoot(e, byId) && hasText.get(e.id)) stack.push({ e, depth: 0, birth: i });
+    if (piIsRoot(e, byId) && hasText.get(e.id)) stack.push({ e, depth: 0 });
   }
   while (stack.length) {
-    const { e, depth, birth } = stack.pop()!;
+    const { e, depth } = stack.pop()!;
     path.length = depth ? lens[depth - 1] : 0;
     for (const r of navOf.get(e.id)!) if (inSpan(r)) path.push(r);
     lens[depth] = path.length;
     const kids = textKids(e.id);
-    if (kids.length === 0) views.push({ birth, recs: path.slice() });
-    for (let i = kids.length - 1; i >= 0; i--) stack.push({ e: kids[i], depth: depth + 1, birth: i === 0 ? birth : pos.get(kids[i].id)! });
+    if (kids.length === 0) views.push(path.slice());
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ e: kids[i], depth: depth + 1 });
   }
-  views.sort((a, b) => a.birth - b.birth);
-  return { recs: own, views: views.map((v) => v.recs), seed: from?.registry, keys };
+  return { recs: own, views, seed: from?.registry, keys };
 }
 
 // ---------- Codex (rollout, Paginated only) ----------
@@ -743,7 +779,7 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
   try {
     const lines = readLines(path, res, opts.identity);
     if (lines.length === 0) return skip(res, "empty"), { res };
-    let parsed: Parsed & { keys?: Set<string> };
+    let parsed: Parsed & { keys?: Map<string, string> };
     if (lines[0].type === "session") parsed = piFile(lines, res, opts.parent ?? (() => undefined));
     else if (lines[0].type === "session_meta") parsed = codexFile(path, lines, res);
     else return skip(res, "unknown-format"), { res };

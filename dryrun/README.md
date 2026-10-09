@@ -12,7 +12,7 @@ opens no network connection and calls no model. There are no default directories
 
 Rules implemented (tested in `dryrun.test.ts` on synthetic logs only). Mutation checks: a mutation counts
 only if it compiles, changes the targeted behaviour, turns a named test red (or hangs the suite past its
-cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log` and `mutate-dryrun5-141336.log`.
+cap) and the suite is green again once restored; logs `/tmp/memex-review/mutate-dryrun4-132111.log`, `mutate-dryrun5-141336.log` and `mutate-dryrun6-144322.log`.
 Rules without a listed mutation there are tested but not mutation-checked.
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
@@ -27,11 +27,12 @@ Rules without a listed mutation there are tested but not mutation-checked.
 - Pi session v3 only. Duplicate ids or a parent cycle make the file `invalid-tree` (not read further). An
   entry whose `parentId` names no entry in the file is a root, as in Pi's own `getTree()`, and is counted
   in `orphanRoots`. **All branches are counted** (retrieval covers every branch,
-  DESIGN §4.3). Each root-to-tip path is a view, born when the entry that starts its own branch was
-  appended (file order); views are partitioned in birth order: a later view reuses every earlier span
-  lying whole on its path and ending on one of its own unit boundaries; where it forks inside an earlier
-  span S it gets a prefix span P (cut back to whole units) and then its own spans, and S stays for its
-  view. A fork on a span boundary shares directly. **Assumption:** spans are taken as finally cut; the logs
+  DESIGN §4.3). Each root-to-tip path is a view; views are partitioned depth first, children in file
+  (= creation) order. A later view's **source** is the first earlier view sharing its longest prefix (a resolved fork's views continue its parent's): it reuses the
+  source's spans lying whole on that prefix and ending on one of its own unit boundaries; where it forks
+  inside a source span S it gets a prefix span P (cut back to whole units) and then its own spans, and S
+  stays for its view. Spans other views made never change this cut. A fork on a span boundary shares
+  directly. **Assumption:** spans are taken as finally cut; the logs
   do not say whether a span was still open when a later branch forked from it, so P counts are what
   DESIGN's rule gives for closed spans, not a replay. Records are counted once however many views hold
   them. Children holding only labels, state or extension context do not make a branch. Forest internal
@@ -40,11 +41,16 @@ Rules without a listed mutation there are tested but not mutation-checked.
   fork to build and count. The inferred tail (last entry) is reported only, as `offTail`.
   `subagent-artifacts/*_transcript.jsonl` is skipped without being opened. A fork inherits an entry only
   when the parent has the same id and content (key-order-independent hash); inherited entries are not new
-  evidence but stay on the child's views. A resolved fork family shares one span registry, keyed by the
-  ordered records (id + content hash), so a P cut by one fork is reused by its siblings. Only a file
-  whose own ancestry is resolved (or that is no fork) can be a parent: parent not given → every entry
-  `unresolved`; parent invalid, itself unresolved, or a fork chain looping back → `unresolved` too.
-  Traversal is linear in entries (tested for a 4× size ratio; a cheap per-entry copy is not caught).
+  evidence but stay on the child's views and keep the canonical identity of the session they are native
+  to (header `id`), through any number of descendants. Records new in a file are native to it, so
+  byte-identical records new in two sibling forks stay two. A span is its ordered canonical records: an
+  identical span (e.g. the same P cut by two forks) is counted once in the family, whichever file meets
+  it first. Only a file whose own ancestry is resolved (or that is no fork) can be a parent: parent not
+  given → every entry `unresolved`; parent invalid, itself unresolved, or a fork chain looping back →
+  `unresolved` too.
+  Cost: linear in entries for a linear session (tested for a 4× size ratio; a cheap per-entry copy is
+  not caught); a branching session materializes every view, so work is the sum of view lengths plus
+  sorting views and partitioning (a 4000-view synthetic file is tested to finish in a subprocess deadline).
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
   `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
   uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is

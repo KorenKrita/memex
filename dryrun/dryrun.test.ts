@@ -461,12 +461,26 @@ describe("third review", () => {
       piMsg("b", "u", say("b".repeat(1000))), // view 2: u-b
       piMsg("y", "a", say("y".repeat(1000))), // view 3: u-a-y
     ]);
-    // [u a x]; P = [u], [b]; reuse P, then [a y]
+    // [u a x]; view 2 forks from it at u: P = [u], [b]; view 3 forks from view 1 (not view 2) at a:
+    // P = [u a], [y]. (The third review expected 4 spans by letting view 2's short P decide view 3's cut;
+    // DESIGN §4.3 cuts P out of the span the branch actually forked from.)
     const r = analyzeFile(p);
-    expect(r).toMatchObject({ views: 3, spans: 4, prefixSpans: 1 });
+    expect(r).toMatchObject({ views: 3, spans: 5, prefixSpans: 2 });
     const U = D("user", "u".repeat(3000));
     const A = D("assistant", "a".repeat(3000));
-    expect(r.summaryInputBytes).toBe(U + A + D("assistant", "x".repeat(3000)) + U + D("assistant", "b".repeat(1000)) + A + D("assistant", "y".repeat(1000)));
+    expect(r.summaryInputBytes).toBe(U + A + D("assistant", "x".repeat(3000)) + U + D("assistant", "b".repeat(1000)) + U + A + D("assistant", "y".repeat(1000)));
+  });
+
+  test("the source is the view sharing the longest prefix, not the first one sharing any", () => {
+    const p = file("pi/deep-source.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("u".repeat(3000))),
+      piMsg("b", "u", say("b".repeat(1000))), // view 1: [u b]
+      piMsg("a", "u", say("a".repeat(3000))),
+      piMsg("x", "a", say("x".repeat(3000))), // view 2 forks from 1 at u: P = [u], [a x]
+      piMsg("y", "a", say("y".repeat(1000))), // view 3 forks from 2 at a: reuse [u], P = [a], [y]
+    ]);
+    expect(analyzeFile(p)).toMatchObject({ views: 3, spans: 5, prefixSpans: 2 });
   });
 
   test("a branch that keeps growing after a later fork is still the earlier view", () => {
@@ -493,11 +507,11 @@ describe("third review", () => {
   });
 
   test("a fork whose parent file is invalid is not resolved against it", () => {
-    const parent = file("pi/badparent/parent.jsonl", [piHeader(), piMsg("u", null, user("q")), piMsg("u", "u", user("dup"))]);
+    const parent = file("pi/badparent/parent.jsonl", [piHeader(), piMsg("u", null, user("q")), piMsg("b", "u", user("x")), piMsg("u", "b", user("dup"))]);
     const child = file("pi/badparent/child.jsonl", [piHeader({ id: "s2", parentSession: parent }), piMsg("u", null, user("q")), piMsg("b", "u", say("new"))]);
-    const r = dryRun([join(dir, "pi/badparent")]);
-    expect(r.skipped["invalid-tree"]).toEqual([parent]);
-    expect(r.perFile.find((f) => f.path === child)).toMatchObject({ forkStatus: "unresolved", evidence: 0 });
+    const r = isolated(`const r = dryRun([${JSON.stringify(join(dir, "pi/badparent"))}]); const c = r.perFile.find((f) => f.path === ${JSON.stringify(child)}); console.log(JSON.stringify([r.skipped, c.forkStatus, c.evidence]));`);
+    expect(r.signal).toBeNull();
+    expect(JSON.parse(r.out)).toEqual([{ "invalid-tree": [parent] }, "unresolved", 0]);
   });
 
   test("short sessions (< 4 leaves) build no internal nodes", () => {
@@ -575,6 +589,53 @@ describe("fourth review", () => {
     expect(r.summaryInputBytes).toBe(r.digestBytes + D("user", "u"));
   });
 
+  // Fifth review: the partition a fork gets depends only on the view it forked from; identical spans are
+  // shared afterwards; records new in different sessions are different records.
+  test("sibling forks cut at different places: totals do not depend on file names", () => {
+    const run = (d: string, shortName: string, longName: string) => {
+      const P = file(`${d}/P.jsonl`, [piHeader(), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("x", "a", say("x"))]);
+      file(`${d}/${shortName}.jsonl`, [piHeader({ id: "s-short", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+      file(`${d}/${longName}.jsonl`, [piHeader({ id: "s-long", parentSession: P }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("y", "a", say("y"))]);
+      return dryRun([join(dir, d)]).total;
+    };
+    // S = [u a x], P_short = [u], [b], P_long = [u a], [y]
+    const want = { spans: 5, prefixSpans: 2, summaryInputBytes: 3 * D("user", "u") + 2 * D("assistant", "a") + 3 * D("assistant", "x") };
+    expect(run("pi/order-ab", "A", "B")).toMatchObject(want);
+    expect(run("pi/order-ba", "B", "A")).toMatchObject(want);
+  });
+
+  test("records new in two sibling forks are distinct even when byte-identical", () => {
+    const P = file("pi/collide/P.jsonl", [piHeader(), piMsg("u", null, user("u"))]);
+    const z = piMsg("z", "u", user("same"));
+    file("pi/collide/A.jsonl", [piHeader({ id: "sA", parentSession: P }), piMsg("u", null, user("u")), z]);
+    file("pi/collide/B.jsonl", [piHeader({ id: "sB", parentSession: P }), piMsg("u", null, user("u")), z]);
+    const r = dryRun([join(dir, "pi/collide")]).total;
+    expect(r).toMatchObject({ evidence: 3, spans: 3, digestBytes: 30, summaryInputBytes: 30 });
+  });
+
+  test("a record inherited through a middle ancestor stays one record", () => {
+    const P = file("pi/grand/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
+    const C = file("pi/grand/C.jsonl", [piHeader({ id: "sC", parentSession: P }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("c", "a", say("c"))]);
+    file("pi/grand/G.jsonl", [piHeader({ id: "sG", parentSession: C }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("c", "a", say("c")), piMsg("g", "c", user("g"))]);
+    const r = dryRun([join(dir, "pi/grand")]);
+    // P: S = [u a]. C forks where S ends (a span boundary): S shared, [c] new. G: S and [c] shared, [g] new.
+    expect(r.total).toMatchObject({ evidence: 4, spans: 3, prefixSpans: 0 });
+    expect(r.perFile.map((f) => [f.path.split("/").pop(), f.inherited])).toEqual([
+      ["C.jsonl", 2],
+      ["G.jsonl", 3],
+      ["P.jsonl", 0],
+    ]);
+  });
+
+  test("a grandchild forking inside a span its grandparent made cuts P from it, reused by an uncle", () => {
+    const P = file("pi/grand2/P.jsonl", [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("x", "a", say("x"))]);
+    const C = file("pi/grand2/C.jsonl", [piHeader({ id: "sC", parentSession: P }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("x", "a", say("x")), piMsg("q", "x", user("q"))]);
+    file("pi/grand2/G.jsonl", [piHeader({ id: "sG", parentSession: C }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("y", "a", say("y"))]);
+    file("pi/grand2/U.jsonl", [piHeader({ id: "sU", parentSession: P }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("z", "a", say("z"))]);
+    // S = [u a x]; C: S, [q]; G and U both fork at a inside S → one P = [u a], then [y] and [z]
+    expect(dryRun([join(dir, "pi/grand2")]).total).toMatchObject({ spans: 5, prefixSpans: 1, evidence: 6 });
+  });
+
   test("a long linear session is traversed in linear time", () => {
     const timed = (n: number) => {
       const rows: string[] = [JSON.stringify(piHeader())];
@@ -591,6 +652,19 @@ describe("fourth review", () => {
     // 4x the entries: linear work grows ~4x, quadratic path copying ~16x
     expect(timed(40000) / timed(10000)).toBeLessThan(8);
   }, 60000);
+
+  test("a branch-heavy session finishes within its deadline (views are materialized: sum of view lengths)", () => {
+    // a chain of 4000 user entries with one extra leaf on each: 4000 views, ~8M records copied in total
+    const rows: string[] = [JSON.stringify(piHeader())];
+    for (let i = 0; i < 4000; i++) {
+      rows.push(JSON.stringify(piMsg(`c${i}`, i ? `c${i - 1}` : null, user(`q${i}`))));
+      rows.push(JSON.stringify(piMsg(`l${i}`, `c${i}`, say(`l${i}`))));
+    }
+    const p = file("pi/branchy.jsonl", rows.join("\n") + "\n");
+    const r = isolated(`const r = analyzeFile(${JSON.stringify(p)}); console.log(JSON.stringify([r.views, r.status]));`, 30000);
+    expect(r.signal).toBeNull();
+    expect(JSON.parse(r.out)).toEqual([4000, "indexed"]);
+  }, 40000);
 });
 
 describe("input boundary", () => {
