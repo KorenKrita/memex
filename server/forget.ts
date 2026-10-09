@@ -63,7 +63,8 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     await tx`delete from derive_skip where span = any(${tx.array(spans, "text")})`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
-    await tx`update lease set done = true where source = ${source}`;
+    // Lease rows are not touched: a commit holds its lease row before it waits for the barrier, so taking
+    // them here (after the barrier) would deadlock. Its commit finds the source tomb under the barrier.
     await tx`update source set meta = '{}' where id = ${source}`;
     await bump(tx, "s:" + source);
     return { records: ids.length, descendants: desc.length, copies };

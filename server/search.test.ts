@@ -639,3 +639,28 @@ test("forget a parent: a child's own record that reuses a parent record id is ke
   expect(await hasText("child-own-x9")).toBe(true);
   expect(await hasText("parent-text-x")).toBe(false);
 });
+
+test("forget concurrent with a real commit that holds its lease row: no deadlock, the commit is refused", async () => {
+  const s = await put("dl", linear("dl", [["deadlock-check", "r"]]));
+  await drain(db);
+  const lines = linear("dl", [["deadlock-check", "r"], ["more", "r2"]]);
+  const l = await requestLease(db, { source: s, harness: "pi", nativeId: "dl", scope: "personal" }, "m1");
+  await tryGrant(db, l);
+  // Hold the lease row as commit does before it waits for the barrier, while forget runs.
+  let release!: () => void;
+  const gate = new Promise<void>((ok) => (release = ok));
+  const holder = db.begin(async (tx: any) => {
+    await tx`select 1 from lease where id = ${l} for update`;
+    await gate;
+  });
+  await Bun.sleep(50);
+  const f = forgetSource(db, s);
+  const outcome = await Promise.race([f.then(() => "forgot"), Bun.sleep(2_000).then(() => "blocked")]);
+  release();
+  await holder;
+  expect(outcome).toBe("forgot"); // forget does not wait on lease rows
+  await f;
+  const c = await commit(db, { leaseId: l, commitId: "dl1", length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(c).toMatchObject({ ok: false, reason: "forgotten" });
+  expect((await db`select count(*)::int n from body where source = ${s}`)[0].n).toBe(0);
+});
