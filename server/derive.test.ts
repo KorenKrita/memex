@@ -254,15 +254,16 @@ test("an unchanged input is not summarized again", async () => {
   await put("same", session("same"));
   await drain(db);
   expect(chats().length).toBe(1);
-  const [sp] = await db`select span from span_summary`;
+  const [sp] = await db`select span, deps from span_summary`;
+  const k = "s:" + sourceIdOf("pi", "same");
   await db.begin(async (tx: any) => {
-    await tx`insert into vis_version values (${"s:" + sourceIdOf("pi", "same")}, 2) on conflict (key) do update set v = vis_version.v + 1`;
+    await tx`insert into vis_version values (${k}, 2) on conflict (key) do update set v = vis_version.v + 1`;
     await tx`insert into job (kind, key) values ('summarize', ${sp.span})`;
   });
   await drain(db);
   expect(chats().length).toBe(1);
   const [row] = await db`select deps from span_summary`;
-  expect(Object.values(row.deps)).toContain(3); // the vector was renewed
+  expect(row.deps[k]).toBe((sp.deps[k] ?? 1) + 1); // the vector was renewed
 });
 
 test("a summary made from an old <context> is not embedded", async () => {

@@ -142,3 +142,41 @@ test("a commit during a projection run is not lost: the run publishes nothing an
   await drain(db);
   expect((await views(s))[0].tip).toBe("a1");
 });
+
+test("appending exchanges does not move the session version; a revision of a closed span does", async () => {
+  const lines = [header("ap"), user("u1", null, "q1"), asst("a1", "u1", "r1"), user("u2", "a1", "q2"), asst("a2", "u2", "r2")];
+  const s = await put("ap", lines);
+  await drain(db);
+  const ver = async () => Number((await db`select v from vis_version where key = ${"s:" + s}`)[0]?.v ?? 1);
+  const v0 = await ver();
+  const spans0 = (await db`select id from span where source = ${s}`).map((r: any) => r.id).sort();
+  // Two more exchanges: the open tail [u2 a2] closes, new spans appear; nothing published is withdrawn.
+  await put("ap", [...lines, user("u3", "a2", "q3"), asst("a3", "u3", "r3"), user("u4", "a3", "q4"), asst("a4", "u4", "r4")]);
+  await drain(db);
+  expect(await ver()).toBe(v0);
+  const spans1 = (await db`select id from span where source = ${s}`).map((r: any) => r.id);
+  for (const id of spans0) expect(spans1).toContain(id); // earlier spans kept as they were
+  // A revision inside the first closed span withdraws it.
+  const rev = [...lines, user("u3", "a2", "q3"), asst("a3", "u3", "r3"), user("u4", "a3", "q4"), asst("a4", "u4", "r4")];
+  rev[2] = asst("a1", "u1", "r1 revised");
+  await put("ap", rev);
+  await drain(db);
+  expect(await ver()).toBeGreaterThan(v0);
+});
+
+test("a child's records taken over by a parent that catches up: a remap, the child's version moves", async () => {
+  const P = sourceIdOf("pi", "rp");
+  const pl = [header("rp"), user("x0", null, "q0"), asst("y0", "x0", "r0"), user("u1", "y0", "q1"), asst("a1", "u1", "r1")];
+  await put("rp", pl.slice(0, 3)); // the parent has its first exchange only
+  const C = await put("rk", [header("rk", "/x/rp.jsonl"), ...pl.slice(1), user("k1", "a1", "child")], { parent: P });
+  await drain(db);
+  const ver = async () => Number((await db`select v from vis_version where key = ${"s:" + C}`)[0]?.v ?? 1);
+  const v0 = await ver();
+  const own = (await db`select keys from projected where source = ${C}`)[0].keys as [string, string][];
+  expect(own.find(([k]) => k.startsWith("u1:"))![1].startsWith("rk/")).toBe(true); // the child's own, for now
+  await put("rp", pl);
+  await drain(db);
+  const now = (await db`select keys from projected where source = ${C}`)[0].keys as [string, string][];
+  expect(now.find(([k]) => k.startsWith("u1:"))![1].startsWith("rp/")).toBe(true); // now the parent's
+  expect(await ver()).toBeGreaterThan(v0);
+});

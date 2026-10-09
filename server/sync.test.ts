@@ -184,3 +184,25 @@ test("Pi fork parent is sent only when the parent file is in the same scope", as
     { native_id: "kid2-id", parent_id: null }, // the parent file outside the scope is never opened
   ]);
 });
+
+test("the session version moves on withdrawals only: an append does not, a revision or a removal does", async () => {
+  const p = piFile(allowDir, "v", 3);
+  const t = transport(base, key);
+  await syncFile(t, policy, p, "pi", { collector: "m1" });
+  const src = sourceIdOf("pi", "s-v");
+  const ver = async () => Number((await db`select v from vis_version where key = ${"s:" + src}`)[0]?.v ?? 1);
+  const v0 = await ver();
+  appendFileSync(p, M("e3", "e2", "appended") + "\n");
+  await syncFile(t, policy, p, "pi", { collector: "m1" });
+  expect(await ver()).toBe(v0); // nothing published from the old records is wrong now
+  expect((await db`select count(*)::int n from job where kind = 'project' and key = ${src} and state = 'queued'`)[0].n).toBe(1);
+  const lines = (await Bun.file(p).text()).split("\n");
+  lines[2] = lines[2].replace("text 1", "TEXT 1"); // same length: an in-place revision
+  writeFileSync(p, lines.join("\n"));
+  await syncFile(t, policy, p, "pi", { collector: "m1" });
+  const v1 = await ver();
+  expect(v1).toBeGreaterThan(v0);
+  writeFileSync(p, lines.slice(0, 3).join("\n") + "\n"); // e1 onwards removed
+  await syncFile(t, policy, p, "pi", { collector: "m1" });
+  expect(await ver()).toBeGreaterThan(v1);
+});

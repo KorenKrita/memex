@@ -258,8 +258,13 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => ({ source, key: r.key, part, rec: r.rec, kind: r.kind, text, canon: canonOf(a.harness, r.key) })));
       for (let i = 0; i < lex.length; i += 500) await tx`insert into lexical ${tx(lex.slice(i, i + 500))}`;
     }
-    // A changed canonical mapping or block state withdraws what was derived from the old one.
-    const remapped = !!before && (before.status !== a.status || JSON.stringify(before.keys) !== JSON.stringify(a.keys));
+    // A changed canonical mapping or block state withdraws what was derived from the old one. The map only
+    // growing (new records mapped, every earlier entry the same) changes nothing already published.
+    const oldMap = new Map<string, string>((before?.keys ?? []) as [string, string][]);
+    const newMap = new Map<string, string>((a.keys ?? []) as [string, string][]);
+    const remapped = !!before && (before.status !== a.status || (before.keys === null) !== (a.keys === null)
+      || [...oldMap].some(([k, v]) => newMap.get(k) !== v));
+    const grown = !!before && newMap.size > oldMap.size;
     if (withdrawn || remapped) await bump(tx, "s:" + source);
     // Read-side validity (search.ts): what this projection was built from. It holds while every entry is
     // current; any later commit, forget or parent change makes it stale until the next projection.
@@ -268,8 +273,9 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     if (a.parentId) Object.assign(deps, (await tx`select deps from projected where source = ${a.parentId}`)[0]?.deps ?? {});
     await tx`update projected set deps = ${deps} where source = ${source}`;
     const same = (x: any, y: any) => JSON.stringify(Object.entries(x ?? {}).sort()) === JSON.stringify(Object.entries(y ?? {}).sort());
-    // Children that fork from this source re-project when its projection or its basis changes.
-    if (!before || remapped || !same(before.deps, deps))
+    // Children that fork from this source re-project when its projection, its basis or its map changes
+    // (new parent records can take over records a child had as its own: the child's remap moves its version).
+    if (!before || remapped || grown || !same(before.deps, deps))
       for (const c of await tx`select id from source where parent_id = ${source}`) await enqueue(tx, "project", c.id);
     return fin;
   });

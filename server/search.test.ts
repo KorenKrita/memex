@@ -194,14 +194,19 @@ test("forgotten canonical records and stale projections are filtered before the 
   const has = (r: any) => JSON.stringify(r.results).includes("secret-one");
   let r = await body(Q("secret-one"));
   expect(has(r)).toBe(false);
-  // A newer L0 commit makes the projection stale: nothing from it until it is projected again.
+  // A newer L0 commit that only appends: the old projection stays readable (nothing in it was withdrawn).
   await db`delete from tomb`;
   await put("f1", linear("f1", [["alpha secret-one", "r"], ["beta", "r2"], ["gamma", "r3"]]));
+  r = await body(Q("secret-one"));
+  expect(has(r)).toBe(true);
+  // A revision withdraws: nothing from the old projection until it is projected again.
+  await drain(db);
+  await put("f1", linear("f1", [["alpha secret-one revised", "r"], ["beta", "r2"], ["gamma", "r3"]]));
   r = await body(Q("secret-one"));
   expect(r.results.length).toBe(0);
   await drain(db);
   r = await body(Q("secret-one"));
-  expect(has(r)).toBe(true);
+  expect(JSON.stringify(r.results)).toContain("secret-one revised");
 });
 
 test("records still in the asker's context are excluded, older ones of the same session are not", async () => {
@@ -996,22 +1001,32 @@ test("zoom takes the search result's view_key as returned; a key it cannot find 
   expect(z).toMatchObject({ view_key: { source: src, tip: "b2" }, after: "span:" + B1 });
 });
 
-test("zoom view_key: any later change to the key's source is refused as stale; an unreadable or bad key too", async () => {
-  const { P } = await branched();
+test("zoom view_key: growth elsewhere keeps the key, a revision makes it stale; an unreadable or bad key is refused", async () => {
+  const { P, B1 } = await branched();
   const vk = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
   const l1 = [header("br"), msg("user", "u0", null, "alpha choose db"), msg("assistant", "a0", "u0", "postgres"), msg("assistant", "a1", "a0", "and redis brtoken-off"),
     msg("user", "u1", "a1", "next q"), msg("assistant", "a2", "u1", "ok"), msg("assistant", "b1", "a0", "only postgres brtoken-on"), msg("user", "v1", "b1", "go on"),
     msg("assistant", "b2", "v1", "fine")];
-  // Even growth on the other branch (b2 still a tip) is a new version: the key no longer pins what is stored.
+  // The other branch grows: nothing the key's view shows was withdrawn; the key still pins it.
   await put("br", [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure")]);
   await drain(db);
-  await expect(zoom(db, T0({ id: "span:" + P, view_key: vk }))).rejects.toThrow("view-stale");
-  // The fresh key from a new search works.
+  expect(((await zoom(db, T0({ id: "span:" + P, view_key: vk }))).body as any)).toMatchObject({ view_key: { tip: "b2" }, after: "span:" + B1 });
+  // A fresh search now infers the grown branch's tail; P is not on it.
   const vk2 = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
-  expect(vk2.tip).toBe("a3"); // the tail moved to the grown branch; P is not on it
+  expect(vk2.tip).toBe("a3");
   expect(((await zoom(db, T0({ id: "span:" + P, view_key: vk2 }))).body as any)).toMatchObject({ view_basis: "unknown", reason: "view-not-found" });
-  expect(((await zoom(db, T0({ id: "span:" + P, view_key: { ...vk2, tip: "b2" } }))).body as any).view_key.tip).toBe("b2");
-  await expect(zoom(db, T0({ id: "span:" + P, view_key: { ...vk2, source: sourceIdOf("pi", "nobody") } }))).rejects.toThrow("not found");
+  // An in-place revision of a record on the key's view: stale.
+  const rev = [...l1, msg("user", "u2", "a2", "more on a"), msg("assistant", "a3", "u2", "sure")];
+  rev[2] = msg("assistant", "a0", "u0", "postgres, revised");
+  await put("br", rev);
+  await drain(db);
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: vk2 }))).rejects.toThrow("view-stale");
+  const vk3 = rec(await body(Q("brtoken", { dests: [] })), "brtoken-on").path.view_key;
+  // The revised prefix is a new span (content-addressed); the old id is gone, not served from old text.
+  await expect(zoom(db, T0({ id: "span:" + P, view_key: { ...vk3, tip: "b2" } }))).rejects.toThrow("not found");
+  const P2 = { id: (await db`select span_ids from view where source = ${sourceIdOf("pi", "br")} and tip = 'b2'`)[0].span_ids[0] as string };
+  expect(((await zoom(db, T0({ id: "span:" + P2.id, view_key: { ...vk3, tip: "b2" } }))).body as any).view_key.tip).toBe("b2");
+  await expect(zoom(db, T0({ id: "span:" + P2.id, view_key: { ...vk3, source: sourceIdOf("pi", "nobody") } }))).rejects.toThrow("not found");
   await expect(zoom(db, T0({ id: "span:" + P, view_key: { tip: "b2" } }))).rejects.toThrow("view_key");
 });
 

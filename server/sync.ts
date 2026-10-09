@@ -188,23 +188,26 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
                               left join projection p on p.source = ${l.source} and p.rec = r0.rec
                               left join record r on r.source = ${l.source} and r.rec = r0.rec
                               group by r0.rec, r.state, r.hash`;
-      let changed = false;
+      // Two kinds of change (§5.5 write-side rule): a new record only makes the projection out of date (it
+      // re-projects; nothing already published from other records becomes wrong), while a revised, removed or
+      // conflicting record withdraws inputs and moves the session's version, so work built on the old
+      // record is refused at its barrier check.
+      let added = false, withdrawn = false;
       for (const m of merged) {
         if (m.n === 0) {
-          if (m.state) changed = true;
+          if (m.state) withdrawn = true;
           await tx`delete from record where source = ${l.source} and rec = ${m.rec}`;
           continue;
         }
         const state = m.n === 1 ? "ok" : "conflict";
         const hash = m.n === 1 ? m.h : null;
-        if (!m.state || m.state !== state || m.old_hash !== hash) changed = true;
+        if (!m.state) added = state === "ok" ? true : ((withdrawn = true), added);
+        else if (m.state !== state || m.old_hash !== hash) withdrawn = true;
         await tx`insert into record (source, rec, state, hash, first_pos) values (${l.source}, ${m.rec}, ${state}, ${hash}, ${m.pos})
                  on conflict (source, rec) do update set state = excluded.state, hash = excluded.hash, first_pos = excluded.first_pos`;
       }
-      if (changed) {
-        await bump(tx, "s:" + l.source);
-        await enqueue(tx, "project", l.source);
-      }
+      if (withdrawn) await bump(tx, "s:" + l.source);
+      if (added || withdrawn) await enqueue(tx, "project", l.source);
     }
     if (c.scanChunks)
       await tx`insert into scan_progress values (${l.source}, ${l.collector}, ${c.scanChunks})
