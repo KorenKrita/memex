@@ -24,6 +24,7 @@ export const FOREST_VERSION = "forest-merge-v1";
 export const MIN_LEAVES = 4; // DESIGN §4.4 [待标定 4]
 const NODE_MAX = 1200; // UTF-8 bytes [待标定]
 const MAX_TRIES = 3;
+const HOLD_MS = () => Number(process.env.MEMEX_FOREST_HOLD_MS ?? 5_000); // the barrier held shared while writing structure
 const hotDays = () => Number(process.env.MEMEX_FOREST_HOT_DAYS ?? 30);
 
 addMigration(`
@@ -94,32 +95,44 @@ export async function runForest(db: Db, job: Job) {
                                or exists (select 1 from forest_access a where a.source = ${source}) hot
                         from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                         where r.source = ${source} and r.state = 'ok'`;
-    return { nodes: [...all.values()], hot: !!h?.hot };
+    const nodes = [...all.values()];
+    const rows = await q`select id, text is not null written, deps, model from forest_node where id = any(${q.array(nodes.map((n) => n.id), "text")})`;
+    const stored = new Map<string, any>(rows.map((r: any) => [r.id, r]));
+    // New rows (or old rows missing their configuration); merges: a written node whose vector moved is
+    // checked again (no model call) whether hot or not; an unwritten one whose children are written, if hot.
+    const fresh = nodes.filter((n) => !stored.get(n.id)?.model && !stored.get(n.id)?.written)
+      .map((n) => ({ id: n.id, size: n.size, kids: n.kids, kid_ids: n.kids.map(kidId), spans: n.spans }));
+    const merge: string[] = [];
+    for (const n of nodes) {
+      const r = stored.get(n.id);
+      if (r?.written) {
+        if (!(await unchanged(q, r.deps))) merge.push(n.id);
+      } else if (h?.hot && n.kids.every((k) => !("node" in k) || stored.get(k.node)?.written)) merge.push(n.id);
+    }
+    return { fresh, merge, spans: [...new Set(nodes.flatMap((n) => n.spans))] };
   });
+  // Under the barrier only set-based statements, with the whole held interval bounded (as guardedPost):
+  // what is new, what is ready and what moved were read in the snapshot above.
   return db.begin(async (tx: Tx) => {
+    await tx`select set_config('lock_timeout', ${HOLD_MS() + "ms"}, true), set_config('statement_timeout', ${HOLD_MS() + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`; // against forget, which deletes nodes of its spans
     const fin = await finishJob(tx, job);
     if (fin !== "done") return fin;
-    const spans = [...new Set(p.nodes.flatMap((n) => n.spans))];
-    const [have] = await tx`select count(*)::int n from span where id = any(${tx.array(spans, "text")})`;
-    if (have.n !== spans.length) return fin; // re-projected or forgotten meanwhile; that queues this job again
-    for (const n of p.nodes)
+    const [have] = await tx`select count(*)::int n from span where id = any(${tx.array(p.spans, "text")})`;
+    if (have.n !== p.spans.length) return fin; // re-projected or forgotten meanwhile; that queues this job again
+    if (p.fresh.length)
       await tx`insert into forest_node (id, size, kids, kid_ids, spans, model, prompt_v)
-               values (${n.id}, ${n.size}, ${n.kids as any}, ${tx.array(n.kids.map(kidId), "text")}, ${tx.array(n.spans, "text")}, ${model}, ${FOREST_VERSION})
-               on conflict (id) do nothing`;
-    const ids = p.nodes.map((n) => n.id);
-    const rows = await tx`select id, text is not null written, deps from forest_node where id = any(${tx.array(ids, "text")})`;
-    const written = new Map<string, any>(rows.map((r: any) => [r.id, r]));
-    for (const n of p.nodes) {
-      const r = written.get(n.id)!;
-      // A written node whose vector moved: checked again (no model call), whether the session is hot or not.
-      if (r.written) {
-        if (!(await unchanged(tx, r.deps))) await enqueue(tx, "merge", n.id);
-        continue;
-      }
-      const kidsReady = n.kids.every((k) => !("node" in k) || written.get(k.node)?.written);
-      if (p.hot && kidsReady) await enqueue(tx, "merge", n.id);
-    }
+               select x->>'id', (x->>'size')::int, x->'kids', array(select jsonb_array_elements_text(x->'kid_ids')),
+                      array(select jsonb_array_elements_text(x->'spans')), ${model}, ${FOREST_VERSION}
+               from jsonb_array_elements(${p.fresh as any}::jsonb) x
+               on conflict (id) do update set model = excluded.model, prompt_v = excluded.prompt_v
+                 where forest_node.model is null and forest_node.text is null`;
+    // (A row stored before the configuration was recorded: the id, planned now from the same inputs under
+    // this model and prompt, says which configuration it is for.)
+    if (p.merge.length)
+      await tx`insert into job (kind, key) select 'merge', x from unnest(${tx.array(p.merge, "text")}::text[]) x
+               on conflict (kind, key) where state in ('queued', 'running')
+               do update set req = job.req + 1, updated_at = now()`;
     return fin;
   });
 }

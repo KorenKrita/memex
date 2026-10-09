@@ -82,14 +82,28 @@ function parseKey(key: string) {
 export async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Checked> {
   const [span] = await q`select s.id, s.source, s.unit, s.records, s.context, s.input_fp, src.harness from span s join source src on src.id = s.source where s.id = ${spanId}`;
   if (!span) return { ok: false, reason: "gone" };
-  // Closed on some view: its own source's, or a fork child's whose view goes on past it (a parent's open tail
-  // closes on the child). Evidence from another source counts while that source is not forgotten, and its
-  // version joins the vector (its withdrawal can take the evidence away).
-  const closers = (await q`select distinct v.source from view v, jsonb_array_elements(v.spans) x
-                           where x->>'id' = ${spanId} and (x->>'end')::int <= v.closed_end
-                             and not exists (select 1 from tomb t where t.key = 'source:' || v.source)`).map((r: any) => r.source as string);
-  if (!closers.length) return { ok: false, reason: "not-closed" };
-  const closer = closers.includes(span.source) ? null : closers.sort()[0];
+  // Closed on some view whose projection is current: its own source's, or a fork child's whose view goes on
+  // past it (a parent's open tail closes on the child). A view's projection holds while its `projected.deps`
+  // are current (search.ts); a stale one proves nothing. The evidence's source must be readable for this
+  // destination too, and its projection vector joins ours (a withdrawal there takes the evidence away).
+  // Own source first; among others, any usable one — an unusable candidate does not hide a usable one.
+  const cands = await q`select distinct v.source, pr.deps, src.scope from view v join projected pr on pr.source = v.source join source src on src.id = v.source,
+                          jsonb_array_elements(v.spans) x
+                        where x->>'id' = ${spanId} and (x->>'end')::int <= v.closed_end
+                          and not exists (select 1 from tomb t where t.key = 'source:' || v.source)`;
+  const usable: { source: string; deps: Record<string, number> }[] = [];
+  let ungranted: string[] | null = null;
+  for (const c of [...cands].sort((a: any, b: any) => Number(b.source === span.source) - Number(a.source === span.source) || (a.source < b.source ? -1 : 1))) {
+    if (!(await unchanged(q, c.deps))) continue;
+    if (!(await q`select 1 from grant_rule where scope = ${c.scope} and purpose = 'derive' and dest = ${dest}`).length) {
+      ungranted ??= [c.scope];
+      continue;
+    }
+    usable.push({ source: c.source, deps: c.deps });
+  }
+  if (!usable.length) return ungranted ? { ok: false, reason: "not-granted:" + dest, scopes: ungranted } : { ok: false, reason: "not-closed" };
+  const closer = usable[0].source === span.source ? null : usable[0].source;
+  const closeDeps = usable[0].deps;
   const want = [...span.records, ...span.context].map((r: any) => {
     const k = parseKey(r.key);
     return { ...k, source: sourceIdOf(span.harness, k.native) };
@@ -114,7 +128,7 @@ export async function checkSpan(q: Tx, spanId: string, dest: string): Promise<Ch
       return { ok: false, reason: "not-granted:" + dest, scopes };
   const keys = [...sources.map((s) => "s:" + s), "d:" + dest];
   const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((r: any) => [r.key, Number(r.v)]));
-  return { ok: true, span: span as SpanRow, scopes, deps: Object.fromEntries(keys.map((k) => [k, vs.get(k) ?? 1])) };
+  return { ok: true, span: span as SpanRow, scopes, deps: { ...closeDeps, ...Object.fromEntries(keys.map((k) => [k, vs.get(k) ?? 1])) } };
 }
 
 /** Step 2 comparison, inside the caller's transaction that holds the barrier shared. */

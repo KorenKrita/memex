@@ -68,7 +68,8 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     await tx`delete from forest_node where spans && ${tx.array(spans, "text")}::text[] or deps ? ${"s:" + source}`;
     // Likewise a descendant's span summary made with it in the vector (its <context>, inherited records):
     // the span stays, its summary is made again from what is left.
-    await tx`delete from span_summary where deps ? ${"s:" + source}`;
+    // Queued again: it may be made lawfully from what remains (another view closes it, other context).
+    for (const r of await tx`delete from span_summary where deps ? ${"s:" + source} returning span`) await enqueue(tx, "summarize", r.span);
     await tx`delete from forest_access where source = ${source}`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;

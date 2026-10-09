@@ -346,14 +346,16 @@ test("canonical remap between the check and the send: the child's mixed merge is
   await drain(db);
   const C = await put("rn", [header("rn", "/x/rm.jsonl"), ...pl.slice(1), msg("user", "k1", "a4", "kid")], P);
   await coldThenStructure();
-  const [pair] = await db`select f.id from forest_node f where size = 2 and f.text is null order by id limit 1`;
+  // A pair over the child's records that the parent will take over (u1..a2 are the child's own for now).
+  const [pair] = await db`select f.id from forest_node f where size = 2 and f.text is null
+                            and exists (select 1 from span sp where sp.id = any(f.spans) and sp.source = ${C} and sp.keys[1] like 'rn/u1:%')`;
   expect(pair).toBeTruthy();
   const sent = await betweenCheckAndSend(pair.id, async () => {
     await put("rm", pl);
     await drain(db, ["project"]);
   });
   expect(sent).toBe(0);
-  expect((await db`select ${"s:" + C} = any(array(select jsonb_object_keys(deps) from forest_node where id = ${pair.id} and deps is not null))`)).toBeTruthy();
+  expect((await db`select text from forest_node where id = ${pair.id}`)[0]?.text ?? null).toBe(null);
 });
 
 test("forget of the parent while the child's mixed root is with the model: not published", async () => {
@@ -499,7 +501,9 @@ test("a node planned under one model or prompt is not written by a merge running
   } finally {
     process.env.MEMEX_LLM_MODEL = "fake-llm";
   }
-  expect((await db`select model from forest_node where text is not null`).every((r: any) => r.model === "fake-llm-b")).toBe(true);
+  const done = await db`select model from forest_node where text is not null`;
+  expect(done.length).toBe(3);
+  expect(done.every((r: any) => r.model === "fake-llm-b")).toBe(true);
 });
 
 test("forget removes every node made from the source: through <context> only, and over spans re-cut away", async () => {
@@ -536,7 +540,9 @@ test("a written root whose vector moved with no real change: one run re-checks d
   await db.begin(async (tx: any) => {
     await tx`select pg_advisory_xact_lock(${BARRIER})`;
     await tx`insert into vis_version values (${k}, 2) on conflict (key) do update set v = vis_version.v + 1`;
+    await tx`insert into job (kind, key) values ('project', ${s}) on conflict (kind, key) where state in ('queued', 'running') do update set not_before = now()`; // as every bump comes with a projection
   });
+  await drain(db, ["project"]);
   const n = requests.length;
   expect(await runMerge(db, (await claimJobFor("merge", root.id))!)).toBe("done");
   expect(requests.length).toBe(n); // no model call
@@ -544,4 +550,92 @@ test("a written root whose vector moved with no real change: one run re-checks d
   expect(now.deps[k]).toBe(root.deps[k] + 1);
   // The children were not touched: their vectors are still the old ones.
   expect((await db`select deps from forest_node where size = 2`).every((r: any) => r.deps[k] === root.deps[k])).toBe(true);
+});
+
+test("closing evidence from a child's view that is no longer current: the parent's open span is not sent", async () => {
+  const pl = linear("ep", 2); // parent: t2 open
+  const P = await put("ep", pl);
+  const kid = [header("ec", "/x/ep.jsonl"), ...pl.slice(1), msg("user", "k3", "a2", "c3"), msg("assistant", "k3a", "k3", "r")];
+  await put("ec", kid, P);
+  await drain(db, ["project"]);
+  const [t2] = await db`select id from span where source = ${P} and keys[1] like 'ep/u2:%'`;
+  // The child is cut back to the parent's records (c3 gone), not projected again yet.
+  await put("ec", kid.slice(0, pl.length), P);
+  const { runSummarize } = await import("./derive.ts");
+  const n = requests.length;
+  await runSummarize(db, (await claimJobFor("summarize", t2.id))!);
+  expect(requests.length).toBe(n);
+  expect((await db`select 1 from span_summary where span = ${t2.id}`).length).toBe(0);
+});
+
+test("forget of the fork whose view closed a parent's span: the summary is made again from a sibling's view", async () => {
+  const pl = linear("sp", 2); // parent: t2 open
+  const P = await put("sp", pl);
+  const kid = (n: string, w: string) => [header(n, "/x/sp.jsonl"), ...pl.slice(1), msg("user", n + "3", "a2", w), msg("assistant", n + "3a", n + "3", "r")];
+  const A = await put("sa", kid("sa", "ca"), P);
+  const B = await put("sb", kid("sb", "cb"), P);
+  await drain(db);
+  const [t2] = await db`select id from span where source = ${P} and keys[1] like 'sp/u2:%'`;
+  const [s0] = await db`select deps from span_summary where span = ${t2.id}`;
+  const closer = [A, B].find((x) => ("s:" + x) in s0.deps)!;
+  await forgetSource(db, closer);
+  await drain(db);
+  const [s1] = await db`select text, deps from span_summary where span = ${t2.id}`;
+  expect(s1?.text).toBe("S(t2)");
+  expect(("s:" + closer) in s1.deps).toBe(false);
+});
+
+test("unwritten nodes stored before the configuration was recorded: completed in a bounded number of jobs", async () => {
+  const s = await put("lg", linear("lg", 4));
+  await coldThenStructure();
+  await db`update forest_node set model = null, prompt_v = null where text is null`;
+  await db`insert into forest_access values (${s})`; // read once: merges wanted
+  await db`insert into job (kind, key) values ('forest', ${s}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
+  const ran = await drain(db, undefined, 50);
+  expect(ran).toBeLessThan(50);
+  expect((await readForest(db, s, await tipOf(s)))!.items.map((i) => i.size)).toEqual([4]);
+});
+
+test("a node planned under another prompt version is not written by the current merge", async () => {
+  const s = await put("pv", linear("pv", 4));
+  await coldThenStructure();
+  await db`update forest_node set prompt_v = 'forest-merge-v0'`;
+  const ids = (await db`select id from forest_node`).map((r: any) => r.id);
+  const n = merges().length;
+  for (const id of ids) await runMerge(db, (await claimJobFor("merge", id))!);
+  expect(merges().length).toBe(n);
+  expect((await db`select count(*)::int n from forest_node where text is not null`)[0].n).toBe(0);
+});
+
+test("a large forest (128 leaves) is written in one bounded step; a held exclusive barrier makes it give up, not wait", async () => {
+  const s = await put("big", linear("big", 128));
+  await coldThenStructure();
+  expect((await nodes()).length).toBe(127);
+  await db`truncate forest_node`;
+  await db`insert into job (kind, key) values ('forest', ${s}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
+  process.env.MEMEX_FOREST_HOLD_MS = "300";
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let locked!: () => void;
+  const isLocked = new Promise<void>((r) => (locked = r));
+  const blocker = db.begin(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(${BARRIER})`;
+    locked();
+    await held;
+  });
+  await isLocked;
+  const t0 = performance.now();
+  const { runOne } = await import("./worker.ts");
+  try {
+    await runOne(db, ["forest"]);
+  } finally {
+    delete process.env.MEMEX_FOREST_HOLD_MS;
+  }
+  expect(performance.now() - t0).toBeLessThan(3000);
+  expect((await nodes()).length).toBe(0);
+  release();
+  await blocker;
+  await db`update job set not_before = now() where kind = 'forest'`;
+  await coldThenStructure();
+  expect((await nodes()).length).toBe(127);
 });

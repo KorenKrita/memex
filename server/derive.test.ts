@@ -258,8 +258,11 @@ test("an unchanged input is not summarized again", async () => {
   const k = "s:" + sourceIdOf("pi", "same");
   await db.begin(async (tx: any) => {
     await tx`insert into vis_version values (${k}, 2) on conflict (key) do update set v = vis_version.v + 1`;
-    await tx`insert into job (kind, key) values ('summarize', ${sp.span})`;
+    // As every version move comes with a projection (a stale projection proves no span closed).
+    await tx`insert into job (kind, key) values ('project', ${sourceIdOf("pi", "same")}) on conflict (kind, key) where state in ('queued', 'running') do update set not_before = now()`;
   });
+  await drain(db, ["project"]);
+  await db`insert into job (kind, key) values ('summarize', ${sp.span}) on conflict (kind, key) where state in ('queued', 'running') do nothing`;
   await drain(db);
   expect(chats().length).toBe(1);
   const [row] = await db`select deps from span_summary`;
