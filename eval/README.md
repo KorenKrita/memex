@@ -11,7 +11,7 @@ user's OpenViking server is configured with; `ov.conf` is piped in over ssh and 
 | `sample-lexical.ts` | Lexical-index sample through `dryRun()`'s lexical hook: whole files, raw record text in ≤ 2 KB chunks |
 | `fts-compare.ts` | `pg_trgm` vs ParadeDB `pg_search` on that sample with a fixed query file |
 | `probes/pi-persist-probe.ts` | §11 item 2: Pi lifecycle events vs what is in the session file |
-| `probes/codex-hook-probe.sh`, `probes/codex-appserver-probe.ts` | §11 item 1: Codex hooks per entry point, rollout state at each hook |
+| `probes/codex-hook-probe.sh`, `probes/codex-appserver-probe.ts`, `probes/codex-tui-probe.py` | §11 item 1: Codex hooks per entry point, rollout state at each hook |
 
 ## Model endpoints (2026-10-09, read from the OV server config, not changed)
 
@@ -46,7 +46,14 @@ local Pi and Codex logs; mean input 9,837 B, mean `<context>` 638 B.
   PreToolUse, PostToolUse, Stop and SessionEnd all fire; `transcript_path` exists from SessionStart; at
   Stop the rollout already holds the assistant message and token count (only `task_complete` follows).
   Hooks run only when trusted (`[hooks.state."<key>"] trusted_hash`, from `hooks/list`) or with
-  `--dangerously-bypass-hook-trust`. **Interactive TUI not tested.**
+  `--dangerously-bypass-hook-trust`.
+- **Codex interactive TUI** (`probes/codex-tui-probe.py`, pseudo-terminal, two runs): the TUI attaches to a
+  shared app-server daemon it starts under `CODEX_HOME`, and the daemon runs the hooks with the environment
+  it was started with (the second run's hooks wrote to the first run's log). SessionStart, UserPromptSubmit
+  and Stop fire live; at Stop the assistant message is in the rollout, as above. Quitting the TUI prints
+  "Disconnected from this task. Any running work continues." and fires **no** SessionEnd; SessionEnd came
+  1 and 4 minutes later, when the daemon dropped the session. So a hook-based exporter must not wait for
+  SessionEnd, and it gets the daemon's environment, not the shell's.
 - Codex cold-file compression: the binary has it, but feature `local_thread_store_compression` is off
   ("under development") in this build; source (b12ac84) compresses rollouts older than 7 days when on.
 
