@@ -29,6 +29,7 @@ Tests: a Postgres 17 with pgvector and pg_trgm at `MEMEX_PG_URL` (default
 - The trace has no artefact versions (summary / embedding version per candidate) and no injection
   confirmation: `returned` and `pool[].returned` mean "assembled into the response to be delivered" — not
   delivered, not injected into a context; the plugins (stage 4) report what they inject. `pool[].selected`
-  means chosen for rerank; it was sent only when `rerank_skipped` is null.
+  means chosen for the rerank set; `rerank_skipped` is why rerank scores were not used and does not say whether
+  the request was sent (an endpoint error after sending also sets it).
 - Regex `mem_grep` joins every readable record's text and relies on the 5 s statement timeout; its cost at
   real corpus size is not measured.

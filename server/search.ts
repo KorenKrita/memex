@@ -363,7 +363,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   }
   // Trace (§6.5): each channel's first 10 by key, and every candidate of the pool (bounded by the channel
   // limits) with its per-channel ranks, the representations it was hit through, its fused rank and whether it
-  // was selected for rerank (sent only when rerank_skipped is null). Keys and numbers only.
+  // was selected for rerank. Keys and numbers only.
   const top = (rows: any[], f: (x: any) => string) => [...new Set(rows.map(f))].slice(0, 10);
   const fusedOrder = [...cands.values()].sort((a, b) => b.fused - a.fused || (a.key < b.key ? -1 : 1));
   return {
@@ -373,7 +373,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
     pool: fusedOrder.map((c, i) => ({
       key: c.key, ranks: c.ranks, fused: Number(c.fused.toFixed(5)), fused_rank: i + 1,
       reps: c.reps.map((p) => `${p.channel}:${p.span}`), ...(c.hit ? { hit: c.hit.key } : {}),
-      selected: chosen.includes(c), // chosen for rerank; whether it was sent is rerank_skipped
+      selected: chosen.includes(c), // chosen for the rerank set (rerank_skipped: why scores were not used, not whether sent)
     })),
   };
 }
@@ -498,7 +498,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         // Each attachment on its own (a correction may sit on another branch than the hit).
         for (const a of c.attach) a.path = labelOf(t, [a.key]);
         const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: viewVersion(b, src), at: t.at };
-        labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps });
+        labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps, src });
       }
       // Index lag (§6.5): derived work not yet published when this search read the index.
       const lag = Object.fromEntries((await q`select kind, count(*)::int n from job where state in ('queued', 'running') group by kind`).map((x: any) => [x.kind, x.n]));
@@ -537,7 +537,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
     base.sort((x, y) => y.score - x.score || x.i - y.i);
     const seen = new Map<string, number>();
     const final = base.map((x) => {
-      const src = x.c.kind === "record" ? x.c.hit!.source : x.c.reps[0].source;
+      const src = labels.get(x.c.key).src as string;
       const n = seen.get(src) ?? 0;
       seen.set(src, n + 1);
       return { ...x, adj: x.score * (labels.get(x.c.key).label === "off-path" ? 0.8 : 1) * Math.pow(0.9, n) };
@@ -547,12 +547,13 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       const L = labels.get(c.key);
       return {
         key: c.key,
-        source: c.kind === "record" ? c.hit!.source : c.reps[0].source,
-        scope: b.valid.get(c.kind === "record" ? c.hit!.source : c.reps[0].source)!.scope,
+        // The result's target session: its reference source (the session its view_key names).
+        source: L.src,
+        scope: b.valid.get(L.src)!.scope,
         path: { label: L.label, view_basis: L.basis, view_key: L.view_key, ...(L.reason ? { reason: L.reason } : {}) },
         score: x.adj,
         rerank_score: rerankSkip ? null : scores[x.i],
-        reps: c.reps.map((p, j) => ({ span: p.span, channel: p.channel, text: p.text, path: L.reps[j] })),
+        reps: c.reps.map((p, j) => ({ span: p.span, source: p.source, channel: p.channel, text: p.text, path: L.reps[j] })),
         excerpt: c.excerpt ?? null,
         attachments: c.attach,
         incomplete: [...new Set(c.incomplete)],
@@ -684,6 +685,11 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         if (!b.valid.has(k.source)) throw new HttpError(404, "not found or not readable");
         if (k.version !== viewVersion(b, k.source)) throw new HttpError(409, "view-stale");
         vkIn = { source: k.source, tip: k.tip, basis: k.basis };
+      } else if (body.version !== undefined) {
+        // A grep hit's pin: the version of the source it was found in (`in`); checked like a view key's.
+        if (typeof body.version !== "string" || typeof body.in !== "string") throw new HttpError(400, "version needs in");
+        if (!b.valid.has(body.in)) throw new HttpError(404, "not found or not readable");
+        if (body.version !== viewVersion(b, body.in)) throw new HttpError(409, "view-stale");
       } else if (typeof body.leaf === "string") {
         if (!b.valid.has(r.source)) throw new HttpError(404, "not found or not readable");
         vkIn = { source: r.source, tip: body.leaf, basis: "observed" };
@@ -697,9 +703,8 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         // parent: the view's record keys name the version it shows).
         const inSrc = typeof body.in === "string" ? body.in : null;
         if (inSrc && !b.valid.has(inSrc)) throw new HttpError(404, "not found or not readable");
-        const onView: string[] | null = vkIn
-          ? (await q`select distinct k from view v, unnest(v.keys) k where v.source = ${vkIn.source}`).map((x: any) => x.k)
-          : null;
+        const vviews = vkIn ? await q`select tip, keys from view where source = ${vkIn.source}` : [];
+        const onView: string[] | null = vkIn ? [...new Set<string>(vviews.flatMap((v: any) => v.keys as string[]))] : null;
         const [row] = await q`select source from lexical l where canon = ${canon} and source = any(${q.array(inSrc ? [inSrc] : valid, "text")})
                               and (${onView === null} or key = any(${q.array(onView ?? [], "text")}))
                               and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon) order by source limit 1`;
@@ -708,9 +713,21 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         keys.sort((x: string, y: string) => Number(x.slice(x.lastIndexOf("#") + 1)) - Number(y.slice(y.lastIndexOf("#") + 1)));
         const t = await texts(q, keys, [row.source]);
         const pg = page(keys.map((k) => ({ key: k, buf: Buffer.from(t.get(k)?.text ?? "") })), offset, limit);
+        // The key's view, resolved like a span's: its tip must name a view of its source; the record may be
+        // off that view (its text is still served, the label says where it is).
+        let vout: object = {};
+        if (vkIn) {
+          const v: any = vkIn.tip === null ? undefined : vviews.find((x: any) => x.tip === vkIn!.tip);
+          const vb: ViewBasis = v && vkIn.basis !== "unknown" ? vkIn.basis : "unknown";
+          vout = {
+            view_key: { source: vkIn.source, tip: v?.tip ?? null, basis: vb, version: viewVersion(b, vkIn.source) }, view_basis: vb,
+            ...(v ? { path: labelOf({ views: vviews.map((x: any, i: number) => ({ ord: i, tip: x.tip, keys: x.keys })), v, basis: vb, at: null }, keys) }
+                  : { reason: vkIn.tip === null ? "view-unknown" : "view-not-found" }),
+          };
+        }
         return {
           deps: depsOf(b, [row.source, ...(vkIn ? [vkIn.source] : [])]),
-          body: { id, source: row.source, ...(vkIn ? { view_key: { ...vkIn, version: viewVersion(b, vkIn.source) } } : {}), records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
+          body: { id, source: row.source, ...vout, records: pg.parts.map((x) => ({ ...x, kind: t.get(x.key)?.kind })), more: pg.more, next_offset: pg.next },
         };
       }
       const sid = id.replace(/^(span|unit):/, "");
@@ -804,7 +821,7 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
         : [];
       const lead = new Map<string, number>(before.map((x: any) => [x.key, Number(x.n)]));
       const hits = rows.map((x: any) => ({
-        record: "record:" + x.canon, in: x.source, key: x.key, kind: x.kind,
+        record: "record:" + x.canon, in: x.source, version: viewVersion(b, x.source), key: x.key, kind: x.kind,
         offset: lead.get(x.key)! + Number(x.pre), length: Number(x.len), // UTF-8 bytes, mem_zoom's record coordinates
         snippet: x.snippet,
       }));

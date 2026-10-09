@@ -1305,3 +1305,49 @@ test("corrections are labelled on their own: a fix only on the other branch is a
   expect(doc).toContain("[next exchange, off-path] 不对，改成 mysql");
   expect(doc).toContain("[next exchange, on-path] thanks, go on");
 });
+
+// ---------- grep pins a version; record zoom honours the key's tip; result source = reference source ----------
+
+test("grep → zoom with the hit's version: exact while unchanged, refused as stale after an in-place revision", async () => {
+  const s0 = await put("gv", linear("gv", [["q", "before gv-needle after"]]));
+  await drain(db);
+  const h = ((await grep(db, T0({ pattern: "gv-needle" }))).body as any).hits[0];
+  expect(typeof h.version).toBe("string");
+  const z = (await zoom(db, T0({ id: h.record, in: h.in, version: h.version, offset: h.offset, limit: h.length }))).body as any;
+  expect(z.records.map((x: any) => x.text).join("")).toBe("gv-needle");
+  await put("gv", [header("gv"), msg("user", "u0", null, "q"), msg("assistant", "a0", "u0", "much longer text in front now gv-needle")]);
+  await drain(db);
+  const res = await zoom(db, T0({ id: h.record, in: h.in, version: h.version, offset: h.offset, limit: h.length })).then((x) => x.body as any, (e) => e);
+  expect([res.status, String(res.message)]).toEqual([409, "view-stale"]);
+  // A version needs the source it belongs to.
+  await expect(zoom(db, T0({ id: h.record, version: h.version }))).rejects.toThrow("version");
+  void s0;
+});
+
+test("zoom a record with a real key whose tip names no view: reported unknown, not echoed as observed", async () => {
+  const { src } = await branched();
+  const off = rec(await body(Q("brtoken", { dests: [] })), "brtoken-off");
+  const vk = { ...off.path.view_key, tip: "no-such-tip", basis: "observed" };
+  const z = (await zoom(db, T0({ id: off.key, view_key: vk }))).body as any;
+  expect(z).toMatchObject({ view_key: { source: src, tip: null, basis: "unknown" }, view_basis: "unknown", reason: "view-not-found" });
+  expect(z.records[0].text).toContain("brtoken-off"); // the text is still readable
+  // With the real tip: the off-path record expands, along the key's view.
+  const z2 = (await zoom(db, T0({ id: off.key, view_key: off.path.view_key }))).body as any;
+  expect(z2).toMatchObject({ view_key: { tip: off.path.view_key.tip, basis: off.path.view_key.basis }, view_basis: off.path.view_key.basis });
+});
+
+test("a unit result's source and scope are its reference source; representations keep their own", async () => {
+  const P = sourceIdOf("pi", "us1");
+  const pl = [header("us1"), msg("user", "u0", null, "alpha ustoken fact"), msg("assistant", "a0", "u0", "first part"), msg("assistant", "a1", "a0", "later part")];
+  // The child's prefix representation ranks first in both channels.
+  summaryOf = (input) => (input.includes("later part") ? "S ustoken" : input.includes("first part") ? "P ustoken ustoken ustoken prefix" : "other");
+  await put("us1", pl);
+  await drain(db);
+  const C = await put("us2", [header("us2", { parentSession: "/x/us1.jsonl" }), pl[1], pl[2], msg("assistant", "b1", "a0", "child branch"), msg("user", "k1", "b1", "go")], "personal", P);
+  await drain(db);
+  const r = await body(Q("ustoken prefix", { dests: [] }));
+  const u = r.results.find((x: any) => x.reps?.length >= 2);
+  expect(u).toBeTruthy();
+  expect(u.source).toBe(u.path.view_key.source);
+  expect(u.reps.map((p: any) => p.source).sort()).toEqual([C, P].sort());
+});
