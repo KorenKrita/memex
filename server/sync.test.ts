@@ -30,7 +30,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job restart identity`);
+                   scan_progress, collector_view, job restart identity cascade`);
   key = await addApiKey(db, "test");
   await db`insert into grant_rule values ('personal', 'sync', 'memex')`;
 });

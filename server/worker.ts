@@ -2,9 +2,10 @@
 // not needed for correctness — every job publishes through finishJob).
 import { claimJob, failJob, type Db, type Job } from "./db.ts";
 import { runProject } from "./project.ts";
+import { runEmbed, runSummarize } from "./derive.ts";
 
 export type Handler = (db: Db, job: Job) => Promise<unknown>;
-export const handlers: Record<string, Handler> = { project: runProject };
+export const handlers: Record<string, Handler> = { project: runProject, summarize: runSummarize, embed: runEmbed };
 
 /** Run one due job of the given kinds. Returns false when none was due. */
 export async function runOne(db: Db, kinds = Object.keys(handlers)): Promise<boolean> {

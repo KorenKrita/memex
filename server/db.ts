@@ -82,10 +82,10 @@ export const bump = (tx: Tx, key: string) =>
 
 /** Enqueue derived work once: a pending job with the same (kind, key) absorbs the request, and a running one
  *  is told to run again (req moves past its claimed_req). */
-export const enqueue = (tx: Tx, kind: string, key: string, payload: object = {}) =>
-  tx`insert into job (kind, key, payload) values (${kind}, ${key}, ${payload})
+export const enqueue = (tx: Tx, kind: string, key: string, payload: object = {}, delayMs = 0) =>
+  tx`insert into job (kind, key, payload, not_before) values (${kind}, ${key}, ${payload}, now() + make_interval(secs => ${delayMs} / 1000.0))
      on conflict (kind, key) where state in ('queued', 'running')
-     do update set payload = excluded.payload, req = job.req + 1, updated_at = now()`;
+     do update set payload = excluded.payload, req = job.req + 1, updated_at = now(), not_before = least(job.not_before, excluded.not_before)`;
 
 export type Job = { id: number; kind: string; key: string; payload: any; attempts: number; claimed_req: number; claim: number };
 export const JOB_LOCK_MS = Number(process.env.MEMEX_JOB_LOCK_MS ?? 120_000);

@@ -167,7 +167,7 @@ function canon(v: unknown): string {
       .join(",")}}`;
   return JSON.stringify(v);
 }
-const contentHash = (v: unknown) => createHash("sha256").update(canon(v)).digest("hex");
+export const contentHash = (v: unknown) => createHash("sha256").update(canon(v)).digest("hex");
 
 function digestOf(r: Rec): string {
   if (r.kind !== "tool_result") return `${r.kind}: ${r.text}`;

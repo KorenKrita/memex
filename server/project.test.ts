@@ -17,7 +17,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical restart identity`);
+                   scan_progress, collector_view, job, span, view, projected, lexical restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('work', 'sync', 'memex')`;
   process.env.MEMEX_IDLE_CLOSE_MS = String(10 * 60_000);
 });

@@ -47,7 +47,7 @@ create index if not exists lexical_trgm on lexical using gin (text gin_trgm_ops)
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 export const spanIdOf = (recs: { key: string }[]) => "sp_" + sha(RULE_VERSION + "\u0000" + recs.map((r) => r.key).join("\u0000")).slice(0, 32);
 
-type Loaded = { lines: Record<string, any>[]; blocked?: string; idle: boolean };
+type Loaded = { lines: Record<string, any>[]; blocked?: string; idle: boolean; idleMs: number };
 
 /** L0 of a source as JSONL objects in file order: ok records parsed, conflicts as placeholders. */
 async function load(q: Tx, source: string, harness: string): Promise<Loaded> {
@@ -55,9 +55,9 @@ async function load(q: Tx, source: string, harness: string): Promise<Loaded> {
                        from record r left join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                        where r.source = ${source} order by r.first_pos`;
   const lines: Record<string, any>[] = [];
-  let idle = true;
+  const idleMs = rows.length ? Number(rows[0].idle_ms) : Infinity;
+  const idle = idleMs >= idleCloseMs();
   for (const r of rows) {
-    idle = Number(r.idle_ms) >= idleCloseMs();
     if (r.state === "ok") {
       lines.push(JSON.parse(r.raw));
       continue;
@@ -66,24 +66,24 @@ async function load(q: Tx, source: string, harness: string): Promise<Loaded> {
     const versions = await q`select distinct b.raw from projection p join body b on b.source = p.source and b.rec = p.rec and b.hash = p.hash
                              where p.source = ${source} and p.rec = ${r.rec}`;
     const parsed = versions.map((v: any) => JSON.parse(v.raw));
-    if (r.rec === "header" || (harness === "codex" && lines.length === 0)) return { lines: [], blocked: "header-conflict", idle };
+    if (r.rec === "header" || (harness === "codex" && lines.length === 0)) return { lines: [], blocked: "header-conflict", idle, idleMs };
     if (harness === "pi") {
       const parents = new Set(parsed.map((p: any) => p.parentId ?? null));
-      if (parents.size !== 1) return { lines: [], blocked: `tree-conflict:${r.rec}`, idle };
+      if (parents.size !== 1) return { lines: [], blocked: `tree-conflict:${r.rec}`, idle, idleMs };
       lines.push({ type: "memex_conflict", id: r.rec, parentId: [...parents][0], timestamp: parsed[0].timestamp });
     } else lines.push({ type: "memex_conflict", ordinal: parsed[0].ordinal });
   }
-  return { lines, idle };
+  return { lines, idle, idleMs };
 }
 
 type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: ProjectedView[]; spans: Map<string, Parameters<NonNullable<Parameters<typeof projectLines>[2]["onSpan"]>>[0]>; lexical: { key: string; rec: string; kind: string; text: string }[]; keys: [string, string][] | null };
 
 /** Analyse one source (and, through `parent`, read its fork parent's stored projection). */
-async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; parentId: string | null }> {
+async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; idleMs: number; parentId: string | null }> {
   const [src] = await q`select harness, scope, parent_id from source where id = ${source}`;
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
-  const { lines, blocked, idle } = await load(q, source, src.harness);
-  const base = { harness: src.harness, scope: src.scope, idle, parentId: src.parent_id };
+  const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
+  const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
   if (blocked) return { ...base, ...empty, status: "blocked", reason: blocked };
   if (!lines.length) return { ...base, ...empty, status: "empty" };
   // Fork parent (Pi): the header names it by file path, the server by source id.
@@ -180,6 +180,8 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
                              on conflict (id) do nothing returning id`;
         if (ins.length) own.add(id);
       }
+      // An open tail closes by idling, with no new commit to wake us: look again when it would have.
+      if (rows.some((r) => r.closed_end < r.keys.length)) await enqueue(tx, "project", source, {}, Math.max(0, idleCloseMs() - a.idleMs) + 1000);
       for (const id of closed) if (!wasClosed.has(id) && (own.has(id) || (await tx`select 1 from span where id = ${id} and source = ${source}`).length)) await enqueue(tx, "summarize", id);
       // Spans of this source no view uses any more and nothing else depends on: drop them.
       await tx`delete from span s where s.source = ${source} and not exists (select 1 from view v where v.span_ids @> array[s.id])

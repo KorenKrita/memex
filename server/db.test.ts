@@ -11,7 +11,7 @@ afterAll(async () => {
   await db.close();
 });
 beforeEach(async () => {
-  await db`truncate job restart identity`;
+  await db`truncate job restart identity cascade`;
 });
 
 const state = async () => (await db`select state, req, attempts from job order by id`).map((r: any) => `${r.state}:${r.req}`);
