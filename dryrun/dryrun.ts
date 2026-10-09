@@ -2,7 +2,7 @@
 // DESIGN §4.1–§4.3 rules locally and report how much would be archived, split and summarized.
 // Read-only, no network, no model calls, no default directories. Sizes are UTF-8 bytes.
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 // [待标定] values from DESIGN §4.3
@@ -24,6 +24,7 @@ export interface Rec {
   kind: Kind;
   text: string;
   callId?: string;
+  memory?: boolean; // memory tool result: keeps call/result pairing, contributes no text or evidence
 }
 const DIGEST_KINDS = new Set<Kind>(["user", "assistant", "tool_call", "tool_result", "agent"]);
 
@@ -98,7 +99,8 @@ const MEMEX_TOOL = /(^|__)mem_(search|zoom|grep)$/;
 const OTHER_MEMORY_TOOL = /(^|__)openviking_|^mcp__openviking__/;
 const OTHER_MEMORY_CUSTOM = /^(memini-|openviking|contextdb)/;
 
-// Removes memory-system blocks from any retained text; each record counts once per reason.
+// Removes memory-system blocks from retained text. `excluded` is the current record's own tally
+// (see perRecord), so a record counts once per reason however many blocks it holds.
 function stripMemory(text: string, excluded: Tally): string {
   let out = text;
   const strip = (re: RegExp, reason: string) => {
@@ -109,6 +111,13 @@ function stripMemory(text: string, excluded: Tally): string {
   strip(MEMEX_BLOCK, "memex-injected");
   for (const re of OTHER_MEMORY_BLOCKS) strip(re, "other-memory-injected");
   return out.trim();
+}
+
+function perRecord<T>(res: FileResult, fn: (ex: Tally) => T): T {
+  const ex: Tally = {};
+  const out = fn(ex);
+  for (const [k, v] of Object.entries(ex)) tally(res.excluded, k, v.bytes, 1);
+  return out;
 }
 
 function textOf(v: unknown): string {
@@ -152,7 +161,7 @@ export function digestOf(r: Rec): string {
     .map((l) => l.slice(0, 300));
   return `${r.kind}: ${head}\n‹tool-output record=${r.id} bytes=${n}›\n${errors.join("\n")}\n${tail}`;
 }
-const digestSize = (r: Rec) => (DIGEST_KINDS.has(r.kind) ? bytes(digestOf(r)) + 1 : 0);
+const digestSize = (r: Rec) => (DIGEST_KINDS.has(r.kind) && !r.memory ? bytes(digestOf(r)) + 1 : 0);
 
 // ---------- units and spans ----------
 
@@ -160,6 +169,10 @@ const digestSize = (r: Rec) => (DIGEST_KINDS.has(r.kind) ? bytes(digestOf(r)) + 
 // the calls still open (parallel calls, out-of-order results, commentary in between). A call whose result
 // never arrives keeps its unit open to the end of the segment.
 export function units(seg: Rec[]): Rec[][] {
+  return unitsOpen(seg).units;
+}
+
+export function unitsOpen(seg: Rec[]): { units: Rec[][]; open: boolean } {
   const out: Rec[][] = [];
   let cur: Rec[] | undefined;
   const open = new Set<string>();
@@ -177,13 +190,17 @@ export function units(seg: Rec[]): Rec[][] {
       out.push(cur);
     } else out.push([r]);
   }
-  return out;
+  return { units: out, open: cur !== undefined };
 }
 
-export function spansOf(seg: Rec[]): { recs: Rec[]; size: number; oversized: boolean }[] {
-  const spans: { recs: Rec[]; size: number; oversized: boolean }[] = [];
-  let cur: { recs: Rec[]; size: number; oversized: boolean } | undefined;
-  for (const u of units(seg)) {
+export type Span = { recs: Rec[]; size: number; oversized: boolean };
+export function spansOf(seg: Rec[]): Span[] {
+  return spansOfUnits(units(seg));
+}
+function spansOfUnits(us: Rec[][]): Span[] {
+  const spans: Span[] = [];
+  let cur: Span | undefined;
+  for (const u of us) {
     const n = u.reduce((s, r) => s + digestSize(r), 0);
     if (n === 0 && !cur) continue; // context-only units never open a span on their own
     if (cur && cur.size + n > SPAN_MAX) cur = undefined;
@@ -195,34 +212,70 @@ export function spansOf(seg: Rec[]): { recs: Rec[]; size: number; oversized: boo
   return spans.filter((s) => s.size > 0);
 }
 
-// Segments are chains along the conversation tree that never cross a branch point or an exchange start.
-function account(segments: Rec[][], res: FileResult) {
+// A segment is a chain of records along the conversation tree that never crosses a branch point or an
+// exchange start. `parent` is the index of the segment it continues (-1 for a root). A tool unit still
+// open at a segment's end is carried into every child segment, so a call is never cut from its result;
+// its records are counted once, its span once per branch (like DESIGN §4.3's prefix segment P).
+export type Segment = { recs: Rec[]; parent: number };
+
+const tz = (n: number) => 31 - Math.clz32(n & -n);
+
+function account(segments: Segment[], res: FileResult) {
   const evidence = new Set<string>();
-  for (const seg of segments) {
-    for (const s of spansOf(seg)) {
+  const excludedSeen = new Set<string>();
+  const depthEnd: number[] = []; // span depth at the end of each segment (spans from the root on this branch)
+  const carry: Rec[][] = []; // open unit carried out of each segment
+  segments.forEach((seg, i) => {
+    const inherit = seg.parent >= 0 ? carry[seg.parent] : [];
+    const { units: us, open } = unitsOpen([...inherit, ...seg.recs]);
+    const hasKids = segments.some((s) => s.parent === i);
+    const closed = open && hasKids ? us.slice(0, -1) : us;
+    carry[i] = open && hasKids ? us[us.length - 1] : [];
+    let depth = seg.parent >= 0 ? depthEnd[seg.parent] : 0;
+    for (const s of spansOfUnits(closed)) {
       res.spans++;
       if (s.oversized) res.oversizedSpans++;
+      // Binary carries along this branch: the span at depth d completes tz(d) merges. Depth is unique
+      // per span in a tree, so shared prefixes are counted once (DESIGN §4.4).
+      res.forestInternalNodes += tz(++depth);
     }
-    for (const r of seg) {
+    depthEnd[i] = depth;
+    for (const r of seg.recs) {
       if (r.kind === "user") res.exchanges++;
+      if (r.memory) continue;
       const d = digestSize(r);
       res.digestBytes += d;
       if (d) evidence.add(r.id);
-      else tally(res.digestExcluded, r.kind === "thinking" ? "thinking" : "context", bytes(r.text));
+      else {
+        const reason = r.kind === "thinking" ? "thinking" : "context";
+        const key = `${r.id}:${reason}`;
+        tally(res.digestExcluded, reason, bytes(r.text), excludedSeen.has(key) ? 0 : 1);
+        excludedSeen.add(key);
+      }
       const n = bytes(r.text);
       res.lexicalBytes += n;
       res.lexicalChunks += Math.ceil(n / LEXICAL_CHUNK);
     }
-  }
+  });
   res.evidence = evidence.size;
-  const popcount = (n: number) => n.toString(2).replace(/0/g, "").length;
-  res.forestInternalNodes = res.spans - popcount(res.spans);
 }
 
 // ---------- reading ----------
 
+// Identity (dev:ino) recorded by collect(); a file swapped after discovery is refused.
+const seenIdentity = new Map<string, string>();
+
 function readLines(path: string, res: FileResult): Record<string, any>[] {
-  const text = readFileSync(path, "utf8");
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let text: string;
+  try {
+    const st = fstatSync(fd);
+    const want = seenIdentity.get(path);
+    if (!st.isFile() || (want !== undefined && want !== `${st.dev}:${st.ino}`)) throw new Error("file changed since discovery");
+    text = readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
   const lines = text.split("\n");
   const out: Record<string, any>[] = [];
   lines.forEach((line, i) => {
@@ -248,8 +301,11 @@ function readLines(path: string, res: FileResult): Record<string, any>[] {
 export const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 
 function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
+  return perRecord(res, (ex) => piRecordsInner(entry, res, ex));
+}
+
+function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally): Rec[] {
   const id = String(entry.id);
-  const ex = res.excluded;
   const custom = (customType: string, content: unknown): Rec[] => {
     const text = textOf(content);
     if (String(customType).startsWith("memex-")) return tally(ex, "memex-injected", bytes(text)), [];
@@ -282,7 +338,10 @@ function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
       const texts: string[] = [];
       for (const p of Array.isArray(m.content) ? m.content : []) {
         if (p?.type === "text") texts.push(String(p.text ?? ""));
-        else if (p?.type === "thinking" && p.thinking) out.push({ id, kind: "thinking", text: String(p.thinking) });
+        else if (p?.type === "thinking" && p.thinking) {
+          const t = stripMemory(String(p.thinking), ex);
+          if (t) out.push({ id, kind: "thinking", text: t });
+        }
         else if (p?.type === "toolCall") out.push({ id, kind: "tool_call", callId: p.id, text: `${p.name} ${JSON.stringify(p.arguments ?? {})}` });
       }
       const text = stripMemory(texts.join("\n"), ex);
@@ -295,7 +354,7 @@ function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
       if (memory) {
         // The call stays in the span (the agent did look something up); the recalled text does not.
         tally(ex, `${memory}-tool-result`, bytes(text));
-        return [{ id, kind: "tool_result", callId: m.toolCallId, text: `[${memory} tool result]` }];
+        return [{ id, kind: "tool_result", callId: m.toolCallId, text: "", memory: true }];
       }
       return [{ id, kind: "tool_result", callId: m.toolCallId, text: (m.isError ? "[error] " : "") + stripMemory(text, ex) }];
     }
@@ -313,7 +372,8 @@ function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
         tally(ex, "memex-injected", bytes(textOf(sections.memex)));
         delete sections.memex;
       }
-      const text = sections ? Object.values(sections).map(textOf).join("\n") : textOf(m.content);
+      // `content` is the base prompt; sections render after it (pi-ai SystemMessage). Both are kept.
+      const text = [textOf(m.content), ...(sections ? Object.values(sections).map(textOf) : [])].filter(Boolean).join("\n");
       const kept = stripMemory(text, ex);
       return kept ? [{ id, kind: "context", text: kept }] : [];
     }
@@ -327,7 +387,7 @@ function piRecords(entry: Record<string, any>, res: FileResult): Rec[] {
   }
 }
 
-function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: string) => Set<string> | undefined): Rec[][] {
+function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: string) => Set<string> | undefined): Segment[] {
   res.harness = "pi";
   const [header, ...rest] = lines;
   if (header.version !== 3) return skip(res, "unsupported-version");
@@ -365,24 +425,36 @@ function piFile(lines: Record<string, any>[], res: FileResult, parentKeys: (p: s
       recsOf.set(e.id, []);
     } else recsOf.set(e.id, piRecords(e, res));
   }
+  // A child subtree without any text (labels, state, usage) does not make a branch.
+  const hasText = new Map<string, boolean>();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    hasText.set(e.id, recsOf.get(e.id)!.length > 0 || (children.get(e.id) ?? []).some((k) => hasText.get(k.id)));
+  }
+  const textKids = (id: string) => (children.get(id) ?? []).filter((k) => hasText.get(k.id));
   const opensExchange = (e: Record<string, any>) => recsOf.get(e.id)!.some((r) => r.kind === "user");
-  const isStart = (e: Record<string, any>) => {
-    if (!byId.has(e.parentId) || e.parentId === e.id) return true;
-    return (children.get(e.parentId)?.length ?? 0) > 1 || opensExchange(e);
-  };
-  const segments: Rec[][] = [];
-  const visited = new Set<string>();
-  for (const start of entries) {
-    if (!isStart(start) || visited.has(start.id)) continue;
-    const seg: Rec[] = [];
-    for (let e: Record<string, any> | undefined = start; e && !visited.has(e.id); ) {
-      visited.add(e.id);
-      seg.push(...recsOf.get(e.id)!);
-      const kids: Record<string, any>[] = children.get(e.id) ?? [];
+  const segments: Segment[] = [];
+  const segOf = new Map<string, number>(); // entry id → segment holding it
+  const visit = (start: Record<string, any>, parent: number) => {
+    const idx = segments.push({ recs: [], parent }) - 1;
+    for (let e: Record<string, any> | undefined = start; e; ) {
+      segOf.set(e.id, idx);
+      segments[idx].recs.push(...recsOf.get(e.id)!);
+      const kids = textKids(e.id);
       if (kids.length > 1) res.branchPoints++;
-      e = kids.length === 1 && !isStart(kids[0]) ? kids[0] : undefined;
+      if (kids.length === 1 && !opensExchange(kids[0])) {
+        e = kids[0];
+        continue;
+      }
+      for (const k of kids) stack.push([k, idx]);
+      e = undefined;
     }
-    segments.push(seg);
+  };
+  const stack: [Record<string, any>, number][] = [];
+  for (const e of entries) if (!byId.has(e.parentId) || e.parentId === e.id) stack.push([e, -1]);
+  while (stack.length) {
+    const [e, parent] = stack.pop()!;
+    if (!segOf.has(e.id)) visit(e, parent);
   }
   return segments;
 }
@@ -412,10 +484,11 @@ const isMarked = (t: string) => CODEX_CONTEXT_MARKERS.some((m) => t.trimStart().
 
 // Classify each content fragment. Codex aligns content_item_kinds with content positions
 // (models.rs / annotated_content.rs); text markers are only the fallback for unannotated fragments.
-function codexFragments(p: Record<string, any>, res: FileResult): { user: string[]; context: string[] } {
+function codexFragments(p: Record<string, any>, ex: Tally): { user: string[]; context: string[] } {
   const content: any[] = Array.isArray(p.content) ? p.content : [];
   const kinds: unknown = p.internal_chat_message_metadata_passthrough?.content_item_kinds;
-  const aligned = Array.isArray(kinds) && kinds.length === content.length ? (kinds as unknown[]).map(String) : undefined;
+  // Positional; a short array leaves the rest unknown (annotated_content.rs pads with "unknown").
+  const aligned = Array.isArray(kinds) ? (kinds as unknown[]).map(String) : undefined;
   const user: string[] = [];
   const context: string[] = [];
   content.forEach((c, i) => {
@@ -424,7 +497,7 @@ function codexFragments(p: Record<string, any>, res: FileResult): { user: string
     const k = aligned?.[i];
     const annotated = k !== undefined && k !== "" && k !== "unknown";
     if (annotated && k.startsWith("user.")) user.push(text);
-    else if (k === "hooks.additional_context" && /^\s*<memex/.test(text)) tally(res.excluded, "memex-injected", bytes(text));
+    else if (k === "hooks.additional_context" && /^\s*<memex/.test(text)) tally(ex, "memex-injected", bytes(text));
     else if (annotated || p.role !== "user" || isMarked(text)) context.push(text);
     else user.push(text);
   });
@@ -432,8 +505,11 @@ function codexFragments(p: Record<string, any>, res: FileResult): { user: string
 }
 
 function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<string, string>): Rec[] {
+  return perRecord(res, (ex) => codexRecordsInner(line, res, calls, ex));
+}
+
+function codexRecordsInner(line: Record<string, any>, res: FileResult, calls: Map<string, string>, ex: Tally): Rec[] {
   const id = String(line.ordinal);
-  const ex = res.excluded;
   if (line.type === "inter_agent_communication") {
     const text = stripMemory(textOf(line.payload), ex);
     return text ? [{ id, kind: "agent", text }] : [];
@@ -447,7 +523,7 @@ function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<str
         const text = stripMemory(textOf(p.content), ex);
         return text ? [{ id, kind: "assistant", text }] : [];
       }
-      const { user, context } = codexFragments(p, res);
+      const { user, context } = codexFragments(p, ex);
       const out: Rec[] = [];
       const u = stripMemory(user.join("\n"), ex);
       if (u) out.push({ id, kind: "user", text: u });
@@ -456,7 +532,7 @@ function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<str
       return out;
     }
     case "reasoning": {
-      const text = [textOf(p.summary), textOf(p.content)].filter(Boolean).join("\n");
+      const text = stripMemory([textOf(p.summary), textOf(p.content)].filter(Boolean).join("\n"), ex);
       return text ? [{ id, kind: "thinking", text }] : [];
     }
     case "function_call":
@@ -465,7 +541,6 @@ function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<str
     case "tool_search_call":
     case "web_search_call": {
       const name = String(p.name ?? p.type);
-      if (p.call_id) calls.set(String(p.call_id), name);
       return [{ id, kind: "tool_call", callId: p.call_id, text: `${name} ${p.arguments ?? p.input ?? JSON.stringify(p.action ?? {})}` }];
     }
     case "function_call_output":
@@ -473,8 +548,8 @@ function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<str
     case "tool_search_output": {
       const text = textOf(p.output) || textOf(p.tools);
       const name = calls.get(String(p.call_id)) ?? String(p.name ?? "");
-      if (MEMEX_TOOL.test(name)) return tally(ex, "memex-tool-result", bytes(text)), [{ id, kind: "tool_result", callId: p.call_id, text: "[memex tool result]" }];
-      if (OTHER_MEMORY_TOOL.test(name)) return tally(ex, "other-memory-tool-result", bytes(text)), [{ id, kind: "tool_result", callId: p.call_id, text: "[other-memory tool result]" }];
+      if (MEMEX_TOOL.test(name)) return tally(ex, "memex-tool-result", bytes(text)), [{ id, kind: "tool_result", callId: p.call_id, text: "", memory: true }];
+      if (OTHER_MEMORY_TOOL.test(name)) return tally(ex, "other-memory-tool-result", bytes(text)), [{ id, kind: "tool_result", callId: p.call_id, text: "", memory: true }];
       return [{ id, kind: "tool_result", callId: p.call_id, text: stripMemory(text, ex) }];
     }
     case "agent_message": {
@@ -510,7 +585,7 @@ export function codexForkBoundary(meta: Record<string, any>, path: string): numb
   return undefined;
 }
 
-function codexFile(path: string, lines: Record<string, any>[], res: FileResult): Rec[][] {
+function codexFile(path: string, lines: Record<string, any>[], res: FileResult): Segment[] {
   res.harness = "codex";
   const meta = lines[0].payload ?? {};
   if (meta.history_mode !== "paginated") return skip(res, "legacy");
@@ -519,8 +594,13 @@ function codexFile(path: string, lines: Record<string, any>[], res: FileResult):
   res.records = lines.length;
   const boundary = codexForkBoundary(meta, path);
   res.forkStatus = !meta.forked_from_id ? "none" : boundary === undefined ? "unresolved" : "resolved";
-  const segments: Rec[][] = [[]];
+  // Call names from the whole file first: an inherited call can own an output after the boundary.
   const calls = new Map<string, string>();
+  for (const l of lines) {
+    const p = l.type === "response_item" ? l.payload : undefined;
+    if (p && /_call$/.test(String(p.type)) && p.call_id) calls.set(String(p.call_id), String(p.name ?? p.type));
+  }
+  const segments: Segment[] = [{ recs: [], parent: -1 }];
   for (const l of lines) {
     if (meta.forked_from_id) {
       // Unknown boundary: every record could be inherited, so the whole file stays quarantined.
@@ -534,15 +614,16 @@ function codexFile(path: string, lines: Record<string, any>[], res: FileResult):
       }
     }
     const rs = codexRecords(l, res, calls);
-    if (rs.some((r) => r.kind === "user") && segments[segments.length - 1].length) segments.push([]);
-    segments[segments.length - 1].push(...rs);
+    const last = segments[segments.length - 1];
+    if (rs.some((r) => r.kind === "user") && last.recs.length) segments.push({ recs: [], parent: segments.length - 1 });
+    segments[segments.length - 1].recs.push(...rs);
   }
   return segments;
 }
 
 // ---------- driver ----------
 
-function skip(res: FileResult, reason: FileResult["reason"]): Rec[][] {
+function skip(res: FileResult, reason: FileResult["reason"]): Segment[] {
   res.status = "skipped";
   res.reason = reason;
   return [];
@@ -555,7 +636,7 @@ export function analyzeFile(path: string, parentKeys: (p: string) => Set<string>
   try {
     const lines = readLines(path, res);
     if (lines.length === 0) return skip(res, "empty"), res;
-    let segments: Rec[][];
+    let segments: Segment[];
     if (lines[0].type === "session") segments = piFile(lines, res, parentKeys);
     else if (lines[0].type === "session_meta") segments = codexFile(path, lines, res);
     else return skip(res, "unknown-format"), res;
@@ -568,21 +649,49 @@ export function analyzeFile(path: string, parentKeys: (p: string) => Set<string>
 }
 
 // Regular files under the inputs; symlinks are never followed (reported instead), paths deduplicated.
-export function collect(inputs: string[]): { files: string[]; symlinks: string[] } {
+// Roots are resolved to their real path once; below them every directory must still be its own real path
+// when it is listed, and every file is opened with O_NOFOLLOW and checked against the identity seen here.
+// Residual: a directory swapped for a link between that check and readdir; closing it needs openat-style
+// traversal, which Node does not offer.
+export function collect(inputs: string[]): { files: string[]; symlinks: string[]; errors: { path: string; error: string }[] } {
   const files = new Set<string>();
   const symlinks = new Set<string>();
+  const errors: { path: string; error: string }[] = [];
   const walk = (p: string) => {
-    const st = lstatSync(p);
-    if (st.isSymbolicLink()) symlinks.add(p);
-    else if (st.isDirectory()) for (const n of readdirSync(p).sort()) walk(join(p, n));
-    else if (st.isFile() && /\.jsonl(\.zst)?$/.test(p)) files.add(p);
+    try {
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) symlinks.add(p);
+      else if (st.isDirectory()) {
+        if (realpathSync(p) !== p) throw new Error("directory changed since discovery");
+        for (const n of readdirSync(p).sort()) walk(join(p, n));
+      } else if (st.isFile() && /\.jsonl(\.zst)?$/.test(p)) {
+        files.add(p);
+        seenIdentity.set(p, `${st.dev}:${st.ino}`);
+      }
+    } catch (e) {
+      errors.push({ path: p, error: String((e as Error).message ?? e).slice(0, 200) });
+    }
   };
-  for (const i of inputs) walk(resolve(i));
-  return { files: [...files].sort(), symlinks: [...symlinks].sort() };
+  for (const i of inputs) {
+    let root: string;
+    try {
+      const abs = resolve(i);
+      if (lstatSync(abs).isSymbolicLink()) {
+        symlinks.add(abs);
+        continue;
+      }
+      root = realpathSync(abs);
+    } catch (e) {
+      errors.push({ path: resolve(i), error: String((e as Error).message ?? e).slice(0, 200) });
+      continue;
+    }
+    walk(root);
+  }
+  return { files: [...files].sort(), symlinks: [...symlinks].sort(), errors };
 }
 
 export function dryRun(inputs: string[]) {
-  const { files, symlinks } = collect(inputs);
+  const { files, symlinks, errors } = collect(inputs);
   const approved = new Set(files);
   // Pi forks name their parent file. Only parents among the approved inputs are read, once, on demand.
   const cache = new Map<string, Set<string> | undefined>();
@@ -615,6 +724,7 @@ export function dryRun(inputs: string[]) {
   return {
     files: results.length,
     symlinksSkipped: symlinks,
+    discoveryErrors: errors,
     indexed: { pi: indexed.filter((r) => r.harness === "pi").length, codex: indexed.filter((r) => r.harness === "codex").length },
     skipped,
     forks: Object.fromEntries(["resolved", "parent-not-given", "unresolved"].map((s) => [s, indexed.filter((r) => r.forkStatus === s).length])),

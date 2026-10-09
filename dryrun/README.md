@@ -7,31 +7,39 @@ internal node count (`spans - popcount(spans)` per file). It reads only the give
 opens no network connection and calls no model. There are no default directories.
 
 Rules implemented (each pinned by a test in `dryrun.test.ts`, all on synthetic logs; each rule was also
-broken on purpose and the suite went red, log `/tmp/memex-review/mutate-dryrun-111432.log`):
+broken on purpose and the suite went red, logs `/tmp/memex-review/mutate-dryrun-111432.log` and
+`/tmp/memex-review/mutate-dryrun2-112736.log`):
 
 - Input boundary: only regular files under the given paths; symlinks are listed in `symlinksSkipped` and
-  never followed; overlapping inputs are deduplicated. A Pi fork's parent is read only if it is itself one of
+  never followed; overlapping inputs are deduplicated. Roots resolve to their real path; files are opened
+  with `O_NOFOLLOW` and must still be the inode seen at discovery. Residual: a directory swapped for a link
+  between its check and `readdir` (Node has no openat-style traversal). Missing or unlistable paths go to
+  `discoveryErrors` and the rest still runs. A Pi fork's parent is read only if it is itself one of
   the inputs. A file that fails to read or parse is reported as `unreadable` and the batch continues; a cut
   last line is `tornLines`, other bad lines `malformedLines`.
 - Pi session v3 only. **All branches are counted** (retrieval covers every branch, DESIGN §4.3): the tree is
   cut into segments at branch points and at user messages, so a shared prefix is counted once and two
-  branches never share a span. The inferred tail (last entry) is reported only, as `offTail`.
+  branches never share a span. A tool call still open at a branch point is carried into each branch's span
+  (counted once as evidence). Children holding only labels or state do not make a branch. Forest internal
+  nodes are the binary carries along each branch, shared prefixes once. The inferred tail (last entry) is reported only, as `offTail`.
   `subagent-artifacts/*_transcript.jsonl` is skipped without being read, also by the fork pre-pass. A fork
   inherits an entry only when the parent has the same id and content (key-order-independent hash); with
   the parent not given, every entry is `unresolved` (not new evidence).
 - Codex Paginated only: `history_mode` other than `paginated` (serde default is Legacy) or any line without
   `ordinal` skips the file. Child threads follow DESIGN §4.1 (`thread_source`, then `source`). Fork boundary
   uses Codex's own rule; an unknown boundary quarantines every record (`unresolved`). Message content is
-  classified per fragment using the aligned `content_item_kinds` (`user.*` = user, e.g. `user.goal`);
+  classified per fragment using `content_item_kinds` by position (`user.*` = user, e.g. `user.goal`; missing
+  positions are unknown);
   unannotated user fragments fall back to Codex's context start markers. `event_msg` repeats response items.
 - Removed from all derived text (`excluded`, records and bytes per reason): memex's own injections (Pi
   `sections.memex`, `memex-*` custom messages, Codex `hooks.additional_context` starting with `<memex`,
   `<memex…>` blocks), other memory systems (`<openviking-context>`, `<contextdb-auto-recall>` blocks,
   `memini-*` / `openviking*` / `contextdb*` custom messages), memory tool results (`mem_search/zoom/grep`,
-  `openviking_*`; Codex matched to the call by `call_id`; the call itself stays), host compaction / branch
-  summaries.
-- Kept in L0 and the lexical index but not summary input (`digestExcluded`): model thinking / reasoning,
-  harness and extension context (rest of the system prompt, developer messages, Codex context fragments,
+  `openviking_*`; Codex matched to the call by `call_id`, including calls before a fork boundary; the call
+  itself stays, the result adds no text), host compaction / branch summaries. Counts are per record: a
+  record with several blocks of one kind counts once.
+- Kept in L0 and the lexical index but not summary input (`digestExcluded`): model thinking / reasoning
+  (memory blocks stripped), harness and extension context (system `content` plus non-memex sections, developer messages, Codex context fragments,
   other Pi custom messages, whose `customType` names are listed in `extensionTypes`). These never open an
   exchange.
 - Exchange = a real user message and what follows on the same branch. Spans cut only between units; a unit

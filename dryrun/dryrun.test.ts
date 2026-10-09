@@ -1,12 +1,13 @@
 // Synthetic fixtures only: every log here is written by the test into a temp dir.
 import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { analyzeFile, codexForkBoundary, codexIsChild, collect, dryRun, type Rec, SPAN_MAX, spansOf, units } from "./dryrun";
+const tz = (n: number) => 31 - Math.clz32(n & -n);
 
-const dir = mkdtempSync(join(tmpdir(), "memex-dryrun-"));
+const dir = realpathSync(mkdtempSync(join(tmpdir(), "memex-dryrun-")));
 const jsonl = (rows: unknown[]) => rows.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("\n") + "\n";
 function file(name: string, rows: unknown[] | string): string {
   const p = join(dir, name);
@@ -99,6 +100,85 @@ describe("Pi", () => {
     expect(r.digestBytes).toBe(B("user: go\n") + B('tool_call: bash {}\n') + B("tool_result: out\n") + B("assistant: branch A\n") + B("assistant: branch B\n"));
   });
 
+  test("forest nodes are counted per branch with shared prefixes once", () => {
+    // 3 shared user messages, then 2 branches of 2 more each: depths 1-3 shared, 4-5 on each branch
+    const rows: unknown[] = [piHeader()];
+    for (let i = 0; i < 3; i++) rows.push(piMsg(`s${i}`, i ? `s${i - 1}` : null, user(`shared ${i}`)));
+    for (const b of ["a", "b"]) for (let i = 0; i < 2; i++) rows.push(piMsg(`${b}${i}`, i ? `${b}${i - 1}` : "s2", user(`${b} ${i}`)));
+    const r = analyzeFile(file("pi/forest-branch.jsonl", rows));
+    expect(r.spans).toBe(7);
+    expect(r.forestInternalNodes).toBe(tz(1) + tz(2) + tz(3) + 2 * (tz(4) + tz(5))); // 0+1+0+2*(2+0) = 5
+  });
+
+  test("a branch point between a call and its result keeps the call in both branches' spans", () => {
+    const p = file("pi/split-call.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("go")),
+      piMsg("c", "u", call("t")),
+      piMsg("x", "c", say("note A")),
+      piMsg("y", "c", say("note B")),
+      piMsg("rx", "x", result("t", "out A")),
+      piMsg("ry", "y", result("t", "out B")),
+    ]);
+    const r = analyzeFile(p);
+    expect(r.spans).toBe(3); // [u], [c x rx], [c y ry]: the call is in both, counted once as evidence
+    expect(r.evidence).toBe(6);
+    expect(r.digestBytes).toBe(B("user: go\n") + B("tool_call: bash {}\n") + B("assistant: note A\n") + B("assistant: note B\n") + B("tool_result: out A\n") + B("tool_result: out B\n"));
+  });
+
+  test("an open call carried across a branch point sits in each branch's span, not the parent's", () => {
+    const big = { s: "a".repeat(11000) }; // call ~11KB + result digest ~2KB (head/tail cut) > SPAN_MAX
+    const p = file("pi/carry.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("u".repeat(6000))),
+      piMsg("c", "u", call("t", "bash", big)),
+      piMsg("x", "c", say("A")),
+      piMsg("y", "c", say("B")),
+      piMsg("rx", "x", result("t", "r".repeat(7000))),
+      piMsg("ry", "y", result("t", "r".repeat(7000))),
+    ]);
+    const r = analyzeFile(p);
+    // [u] alone; each branch [c x rx] is one indivisible unit over SPAN_MAX
+    expect(r.spans).toBe(3);
+    expect(r.oversizedSpans).toBe(2);
+  });
+
+  test("a child holding only labels or state does not make a branch", () => {
+    const p = file("pi/label.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("q")),
+      { type: "label", id: "l", parentId: "u", timestamp: "t", targetId: "u", label: "x" },
+      piMsg("a", "u", say("answer")),
+    ]);
+    expect(analyzeFile(p)).toMatchObject({ branchPoints: 0, spans: 1 });
+  });
+
+  test("system content and non-memex sections are both kept", () => {
+    const p = file("pi/system.jsonl", [
+      piHeader(),
+      piMsg("a", null, { role: "system", content: "BASE", sections: { memex: "SNAP", tools: "TOOLS" }, timestamp: 1 }),
+      piMsg("b", "a", { role: "system", content: [{ type: "text", text: "ARRAY BASE" }], sections: { memex: "SNAP2" }, timestamp: 1 }),
+      piMsg("u", "b", user("q")),
+    ]);
+    const r = analyzeFile(p);
+    expect(r.digestExcluded.context).toEqual({ records: 2, bytes: B("BASE\nTOOLS") + B("ARRAY BASE") });
+    expect(r.excluded["memex-injected"]).toEqual({ records: 2, bytes: B("SNAP") + B("SNAP2") });
+  });
+
+  test("memory blocks are stripped from thinking; exclusions count records, not blocks", () => {
+    const p = file("pi/think-mem.jsonl", [
+      piHeader(),
+      piMsg("u", null, user("<openviking-context>A</openviking-context> q <openviking-context>B</openviking-context>")),
+      piMsg("a", "u", asst([{ type: "thinking", thinking: "plan <memex-recall>R</memex-recall> <openviking-context>C</openviking-context>more" }, { type: "text", text: "ok <openviking-context>D</openviking-context>" }])),
+    ]);
+    const r = analyzeFile(p);
+    // two records (u and a), although a holds blocks in two places
+    expect(r.excluded["other-memory-injected"]).toEqual({ records: 2, bytes: 4 * B("<openviking-context>A</openviking-context>") });
+    expect(r.excluded["memex-injected"]).toEqual({ records: 1, bytes: B("<memex-recall>R</memex-recall>") });
+    expect(r.digestExcluded.thinking).toEqual({ records: 1, bytes: B("plan  more") });
+    expect(r.digestBytes).toBe(B("user: q\n") + B("assistant: ok\n"));
+  });
+
   test("torn last line vs malformed lines", () => {
     const good = jsonl([piHeader(), piMsg("u1", null, user("hi")), "null", "[1]", "{bad"]);
     const r = analyzeFile(file("pi/torn.jsonl", good + '{"type":"message","id":"u2","par'));
@@ -187,6 +267,27 @@ describe("Codex", () => {
     expect(r.nonContent.event_msg).toBe(1);
   });
 
+  test("short or long content_item_kinds arrays classify by position", () => {
+    const p = file(
+      "codex/kinds.jsonl",
+      withOrd([meta(), cmsg("user", ["plain context", "typed"], ["environment.context"]), cmsg("user", ["more"], ["user.text", "extra"])]),
+    );
+    const r = analyzeFile(p);
+    expect(r.digestBytes).toBe(B("user: typed\n") + B("user: more\n"));
+    expect(r.digestExcluded.context.records).toBe(1);
+  });
+
+  test("an inherited memory call still marks its output after the fork boundary", () => {
+    const rows = withOrd([
+      meta({ forked_from_id: "22222222-2222-2222-2222-222222222222", forked_from_ordinal_exclusive: 2 }),
+      ri({ type: "function_call", name: "mem_search", arguments: "{}", call_id: "c1" }),
+      ri({ type: "function_call_output", call_id: "c1", output: "RECALLED" }),
+    ]);
+    const r = analyzeFile(file("codex/fork-mem.jsonl", rows));
+    expect(r.excluded["memex-tool-result"]).toEqual({ records: 1, bytes: B("RECALLED") });
+    expect(r.evidence).toBe(0);
+  });
+
   test("memory tool outputs are matched to their call by call_id", () => {
     const p = file(
       "codex/memtool.jsonl",
@@ -201,7 +302,8 @@ describe("Codex", () => {
     );
     const r = analyzeFile(p);
     expect(r.excluded["memex-tool-result"]).toEqual({ records: 1, bytes: B("ZOOMED") });
-    expect(r.lexicalBytes).toBe(B("q") + B("mcp__memex__mem_zoom {}") + B("[memex tool result]") + B("shell {}") + B("ls output"));
+    expect(r.lexicalBytes).toBe(B("q") + B("mcp__memex__mem_zoom {}") + B("shell {}") + B("ls output"));
+    expect(r.evidence).toBe(4); // user, both calls, the shell output; the memory result is not evidence
   });
 
   test("fork boundary reuses Codex's rule; unknown boundary quarantines the file", () => {
@@ -276,7 +378,7 @@ describe("units and spans", () => {
 
 describe("input boundary", () => {
   test("symlinks are reported, never followed; overlapping inputs are deduplicated", () => {
-    const outside = mkdtempSync(join(tmpdir(), "memex-outside-"));
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "memex-outside-")));
     writeFileSync(join(outside, "secret.jsonl"), jsonl([piHeader(), piMsg("u", null, user("outside"))]));
     const root = join(dir, "bound");
     mkdirSync(join(root, "sub"), { recursive: true });
@@ -302,6 +404,43 @@ describe("input boundary", () => {
     expect(report.skipped.unreadable).toEqual([join(root, "locked.jsonl")]);
     expect(report.perFile.find((f) => f.path.endsWith("odd.jsonl"))!.malformedLines).toBe(1);
     expect(report.skipped["unknown-format"]).toEqual([join(root, "ledger.jsonl")]);
+  });
+
+  test("missing inputs and unlistable directories are reported; the rest still runs", () => {
+    const root = join(dir, "disc");
+    file("disc/ok/a.jsonl", [piHeader(), piMsg("u", null, user("fine"))]);
+    mkdirSync(join(root, "locked"), { recursive: true });
+    chmodSync(join(root, "locked"), 0);
+    const report = dryRun([join(root, "missing"), root]);
+    expect(report.discoveryErrors.map((e) => e.path)).toEqual([join(root, "missing"), join(root, "locked")]);
+    expect(report.indexed.pi).toBe(1);
+  });
+
+  test("a symlink given straight to analyzeFile is not followed", () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "memex-outside-")));
+    writeFileSync(join(outside, "s.jsonl"), jsonl([piHeader(), piMsg("u", null, user("outside"))]));
+    const link = join(dir, "direct-link.jsonl");
+    symlinkSync(join(outside, "s.jsonl"), link);
+    expect(analyzeFile(link)).toMatchObject({ status: "skipped", reason: "unreadable" });
+  });
+
+  test("a memory result adds no digest bytes to its span", () => {
+    const rows = withOrd([meta(), cmsg("user", ["q"], ["user.text"]), ri({ type: "function_call", name: "mem_zoom", arguments: "{}", call_id: "c" }), ri({ type: "function_call_output", call_id: "c", output: "Z" })]);
+    const s = analyzeFile(file("codex/memsize.jsonl", rows));
+    expect(s.digestBytes).toBe(B("user: q\n") + B("tool_call: mem_zoom {}\n"));
+  });
+
+  test("a file swapped for a symlink after discovery is not read", () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "memex-outside-")));
+    writeFileSync(join(outside, "s.jsonl"), jsonl([piHeader(), piMsg("u", null, user("outside"))]));
+    const p = file("swap/a.jsonl", [piHeader(), piMsg("u", null, user("inside"))]);
+    const { files } = collect([join(dir, "swap")]);
+    fs.unlinkSync(p);
+    symlinkSync(join(outside, "s.jsonl"), p);
+    expect(analyzeFile(files[0])).toMatchObject({ status: "skipped", reason: "unreadable" });
+    fs.unlinkSync(p);
+    writeFileSync(p, jsonl([piHeader(), piMsg("u", null, user("replaced"))]));
+    expect(analyzeFile(files[0])).toMatchObject({ status: "skipped", reason: "unreadable" }); // new inode
   });
 
   test("dry run never writes into its inputs", () => {
