@@ -27,6 +27,11 @@ beforeAll(async () => {
         if (embedDown) return new Response("down", { status: 503 });
         return Response.json({ data: [{ embedding: Array.from({ length: 1024 }, (_, i) => (i === 0 ? 1 : 0)) }] });
       }
+      if (body.messages[0].content.startsWith("You write the card")) {
+        if (hold) await hold;
+        const parts = [...(body.messages[1].content as string).matchAll(/<(part|recent)>\n([\s\S]*?)\n<\/\1>/g)].map((m) => `${m[1]}:${m[2]}`);
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ title: "T", overview: parts.join(" | "), results: [], open_threads: [] }) } }] });
+      }
       if (body.messages[0].content.startsWith("You merge")) {
         if (hold) await hold;
         // A merged summary: the part texts joined, so tests can see exactly what went in.
@@ -51,7 +56,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access
+                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access, session_card
                    restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('personal', 'derive', 'llm'), ('personal', 'derive', 'embedding')`;
   process.env.MEMEX_IDLE_CLOSE_MS = String(10 * 60_000);
@@ -852,4 +857,197 @@ test("a merge publish holding the barrier is bounded as a whole: forget gets thr
   }
   expect((await db`select count(*)::int n from forest_node where text is not null`)[0].n).toBe(0);
   expect((await db`select 1 ok`)[0].ok).toBe(1);
+});
+
+// ---------- session cards ----------
+const cardCalls = () => requests.filter((r) => r.body.messages?.[0].content.startsWith("You write the card"));
+const cards = async () => (await db`select source, tip, input_fp, card from session_card order by tip`) as any[];
+const { readCard } = await import("./forest.ts");
+const { snapshot } = await import("./derive.ts");
+const cardOf = (s: string, tip: string) =>
+  snapshot(db, async (q) => {
+    const [v] = await q`select spans, closed_end from view where source = ${s} and tip = ${tip}`;
+    const { leavesOf } = await import("./forest.ts");
+    return readCard(q, s, leavesOf(v), tip, () => true);
+  });
+
+test("card: made once from the complete view's roots and recent summaries; the same input is not sent again", async () => {
+  const s = await put("ca", linear("ca", 5));
+  await drain(db);
+  const c = await cards();
+  expect(c.length).toBe(1);
+  expect(c[0].card.overview).toBe("part:S(t0) + S(t1) + S(t2) + S(t3) | part:S(t4) | recent:S(t2) | recent:S(t3) | recent:S(t4)");
+  expect(c[0].card.cwd).toBe("/x");
+  expect(cardCalls().length).toBe(1);
+  const r = await cardOf(s, await tipOf(s));
+  expect(r.degraded).toBe(false);
+  // Something else triggers the forest again: the card is not made again.
+  await db`insert into job (kind, key) values ('forest', ${s})`;
+  await drain(db);
+  expect(cardCalls().length).toBe(1);
+});
+
+test("card: an appended exchange makes a new card; until then the stored one is not shown for the new input", async () => {
+  const s = await put("cb", linear("cb", 4));
+  await drain(db);
+  expect(cardCalls().length).toBe(1);
+  await put("cb", linear("cb", 5));
+  await drain(db, ["project", "summarize", "embed"]);
+  // The view's tip moved: a different view; its card is degraded until made.
+  const r = await cardOf(s, await tipOf(s));
+  expect(r.degraded).toBe(true);
+  expect(r.card.overview).toContain("S(t4)");
+  await drain(db);
+  expect(cardCalls().length).toBe(2);
+  expect((await cardOf(s, await tipOf(s))).degraded).toBe(false);
+});
+
+test("card: a missing summary → degraded card from what is ready, no card job sent; filled in later", async () => {
+  const s = await put("cc", linear("cc", 4));
+  await drain(db, ["project"]);
+  const [t1] = await db`select id from span where source = ${s} and keys[1] like 'cc/u1:%'`;
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize' and key = ${t1.id}`;
+  await drain(db);
+  expect(cardCalls().length).toBe(0);
+  const r = await cardOf(s, await tipOf(s));
+  expect(r.degraded).toBe(true);
+  expect(r.card.overview).toBe("S(t0)\nS(t2) + S(t3)");
+  await db`update job set not_before = now() where key = ${t1.id}`;
+  await drain(db);
+  expect(cardCalls().length).toBe(1);
+});
+
+test("card: two branches get two cards, each from its own view only", async () => {
+  const base = linear("cd", 6);
+  const alt = [msg("user", "x4", "a3", "z4"), msg("assistant", "y4", "x4", "q"), msg("user", "x5", "y4", "z5"), msg("assistant", "y5", "x5", "q"),
+               msg("user", "x6", "y5", "z6"), msg("assistant", "y6", "x6", "q")];
+  await put("cd", [...base, ...alt]);
+  await drain(db);
+  const c = await cards();
+  expect(c.length).toBe(2);
+  const a = c.find((x) => x.tip === "a6")!, b = c.find((x) => x.tip === "y6")!;
+  expect(a.card.overview).not.toContain("z4");
+  expect(b.card.overview).not.toContain("t4");
+  expect(b.card.overview).toContain("S(z4) + S(z5)");
+});
+
+test("card: a cold session gets no card call; the read is degraded", async () => {
+  const old = T;
+  T = "2020-01-01T00:00:00Z";
+  try {
+    const s = await put("ce", linear("ce", 4));
+    await drain(db);
+    expect(cardCalls().length).toBe(0);
+    expect((await cardOf(s, await tipOf(s))).degraded).toBe(true);
+  } finally {
+    T = old;
+  }
+});
+
+test("card: forget during the card call → not published; a revision during it → not published", async () => {
+  for (const [name, change] of [
+    ["cf", async (s: string) => void (await forgetSource(db, s))],
+    ["cg", async () => {
+      const rev = linear("cg", 4, 100, "g");
+      rev[3] = msg("user", "u1", "a0", "t1 changed");
+      await put("cg", rev);
+    }],
+  ] as const) {
+    // Distinct content: the first case's forget leaves content tombs that would also drop identical records.
+    const s = await put(name, name === "cg" ? linear(name, 4, 100, "g") : linear(name, 4));
+    await drain(db);
+    await db`delete from session_card where source = ${s}`; // as if not made yet
+    let release!: () => void;
+    hold = new Promise((r) => (release = r));
+    const { runCard } = await import("./forest.ts");
+    const n = cardCalls().length;
+    const run = runCard(db, (await claimJobFor("card", JSON.stringify([s, await tipOf(s)])))!);
+    let done = false;
+    run.then(() => (done = true));
+    while (cardCalls().length === n && !done) await Bun.sleep(5);
+    expect(cardCalls().length).toBe(n + 1);
+    await change(s);
+    release();
+    await run;
+    hold = null;
+    expect((await db`select 1 from session_card where source = ${s}`).length).toBe(0);
+  }
+});
+
+test("card: a parent's forget removes the child's card made from the parent's text", async () => {
+  const pl = linear("cp2", 3);
+  const P = await put("cp2", pl);
+  const C = await put("cq2", [header("cq2", "/x/cp2.jsonl"), ...pl.slice(1, 7), msg("user", "k3", "a2", "c3"), msg("assistant", "k3a", "k3", "r"), msg("user", "k4", "k3a", "c4")], P);
+  await drain(db);
+  expect((await db`select card from session_card where source = ${C}`)[0].card.overview).toContain("S(t0)");
+  await forgetSource(db, P);
+  expect((await db`select count(*)::int n from session_card where card::text like '%S(t0)%'`)[0].n).toBe(0);
+});
+
+test("card: a stored card whose input no longer matches the view (a leaf summary redone) is not shown", async () => {
+  const s = await put("ch", linear("ch", 4));
+  await drain(db);
+  const tip = await tipOf(s);
+  expect((await cardOf(s, tip)).degraded).toBe(false);
+  // Same view, a leaf summary replaced: the forest shows other text; the old card is not its card.
+  const [sp] = await db`select id from span where source = ${s} and keys[1] like 'ch/u3:%'`;
+  await db`update span_summary set text = 'S(other)', text_hash = 'h-x' where span = ${sp.id}`;
+  const r = await cardOf(s, tip);
+  expect(r.degraded).toBe(true);
+  expect(r.card.overview).toContain("S(other)");
+});
+
+test("card: an incomplete view is not sent to the model even if its card job runs", async () => {
+  const s = await put("ci", linear("ci", 4));
+  await drain(db, ["project"]);
+  const [t1] = await db`select id from span where source = ${s} and keys[1] like 'ci/u1:%'`;
+  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize' and key = ${t1.id}`;
+  await drain(db);
+  const { runCard } = await import("./forest.ts");
+  await runCard(db, (await claimJobFor("card", JSON.stringify([s, await tipOf(s)])))!);
+  expect(cardCalls().length).toBe(0);
+});
+
+test("card: a cold session's card job is not queued by the forest", async () => {
+  const old = T;
+  T = "2020-01-01T00:00:00Z";
+  try {
+    await put("cj", linear("cj", 3)); // short: no nodes, so "complete" without any merge
+    await drain(db);
+    // A read asks for the merges (so the session counts as read); the merges, then the card follow.
+    expect((await db`select count(*)::int n from job where kind = 'card'`)[0].n).toBe(0);
+  } finally {
+    T = old;
+  }
+});
+
+test("card: a revoked destination between the check and the send → nothing sent", async () => {
+  const s = await put("ck", linear("ck", 4));
+  await drain(db);
+  await db`delete from session_card`;
+  const { hooks } = await import("./derive.ts");
+  hooks.afterCheck = async () => {
+    hooks.afterCheck = async () => {};
+    await revokeGrant(db, "personal", "derive", "llm");
+  };
+  const { runCard } = await import("./forest.ts");
+  try {
+    await runCard(db, (await claimJobFor("card", JSON.stringify([s, await tipOf(s)])))!);
+  } finally {
+    hooks.afterCheck = async () => {};
+  }
+  expect(cardCalls().length).toBe(1); // only the first card, before the delete
+});
+
+test("card: a written card's input text withdrawn after the check (a leaf's record forgotten) → no card for it", async () => {
+  // Inputs checked down to their records: a canon tomb (forget in progress) refuses the send.
+  const s = await put("cl", linear("cl", 4));
+  await drain(db);
+  await db`delete from session_card`;
+  const [sp] = await db`select canons from span where source = ${s} and keys[1] like 'cl/u0:%'`;
+  await db`insert into tomb values (${"canon:" + sp.canons[0]})`;
+  const n = cardCalls().length;
+  const { runCard } = await import("./forest.ts");
+  await runCard(db, (await claimJobFor("card", JSON.stringify([s, await tipOf(s)])))!);
+  expect(cardCalls().length).toBe(n);
 });

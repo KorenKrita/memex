@@ -36,6 +36,8 @@ beforeAll(async () => {
       const path = new URL(req.url).pathname;
       const body = await req.json();
       requests.push({ path, body });
+      if (path.endsWith("/chat/completions") && body.messages[0].content.startsWith("You write the card"))
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ title: "T", overview: "card", results: [], open_threads: [] }) } }] });
       if (path.endsWith("/chat/completions") && body.messages[0].content.startsWith("You merge")) {
         const parts = [...(body.messages[1].content as string).matchAll(/<part n="\d">\n([\s\S]*?)\n<\/part>/g)].map((m) => m[1]);
         return Response.json({ choices: [{ message: { content: JSON.stringify({ summary: parts.join(" + ") }) } }] });
@@ -73,7 +75,7 @@ const ALL = [
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
-                   forest_node, forest_access restart identity cascade`);
+                   forest_node, forest_access, session_card restart identity cascade`);
   for (const [s, p, d] of ALL) await db`insert into grant_rule values (${s}, ${p}, ${d})`;
   process.env.MEMEX_IDLE_CLOSE_MS = "0"; // every tail closes: everything is summarized
   process.env.MEMEX_FOREST_HOT_DAYS = "100000"; // the fixtures' timestamps are old: count them as recent
@@ -1492,4 +1494,17 @@ test("zoom forest: a revoke between the read and its delivery is refused (the re
   const g = await zoom(db, T0({ id: "session:" + s }));
   expect(Object.keys(g.deps)).toContain("d:memex");
   expect(Object.keys(g.deps)).toContain("s:" + s);
+});
+
+test("zoom session: carries its card (the stored one when current, else degraded), no model call in the read", async () => {
+  const s = await put("zc", lin("zc", ["w0", "w1", "w2", "w3"]));
+  await drain(db);
+  const n = requests.length;
+  const top = await zb({ id: "session:" + s });
+  expect(requests.length).toBe(n);
+  expect(top).toMatchObject({ card_degraded: false, card: { title: "T", overview: "card", cwd: "/x" } });
+  await db`delete from session_card`;
+  const d = await zb({ id: "session:" + s });
+  expect(d.card_degraded).toBe(true);
+  expect(d.card.overview).toContain("user: w0");
 });

@@ -20,7 +20,7 @@ import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { EMBED_DIM, guardedPost, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
-import { forestView, leavesOf, nodeOn, wantForest } from "./forest.ts";
+import { forestView, leavesOf, nodeOn, readCard, wantForest } from "./forest.ts";
 
 export const PURPOSES = new Set(["recall", "tool", "snapshot"]);
 export const CHANNEL_TOP = 50;
@@ -762,10 +762,13 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         // ancestors, which share its scope and whose versions its projection vector holds. The check and
         // the deps of the sources used keep it true if a summary's inputs ever reach further.)
         const f = await forestView(q, leaves, (x) => b.valid.has(x), sel ?? undefined);
+        // A session also carries its card (the stored one if current for this view, else a degraded one).
+        const card = node ? null : await readCard(q, src, leaves, v.tip, (x) => b.valid.has(x));
         return {
-          deps: depsOf(b, [src, ...f.used]),
+          deps: depsOf(b, [src, ...f.used, ...(card?.used ?? [])]),
           body: {
             id, view_key, view_basis: vb, complete: f.complete,
+            ...(card ? { card: card.card, card_degraded: card.degraded } : {}),
             items: f.items.map((x) => ({ id: x.node ? "node:" + x.node : "span:" + x.span, leaves: [x.start, x.start + x.size], summary: x.text })),
           },
           want: f.complete ? null : src,

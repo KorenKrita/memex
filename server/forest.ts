@@ -118,7 +118,14 @@ export async function runForest(db: Db, job: Job) {
       // insert). A merge whose children are not ready ends without a call; the child's publication, or this
       // job's next run, queues it again.)
     }
-    return { fresh, merge, spans: [...new Set(nodes.flatMap((n) => n.spans))] };
+    // Session cards (§4.4): a hot view whose forest is complete gets its card (the job finds out whether
+    // the stored card was made from the same input). A cold view of 4+ leaves is never complete before a
+    // read asks for its merges (which makes it hot); `hot` here also keeps short cold views card-less.
+    const cards: string[] = [];
+    if (h?.hot && !merge.length)
+      for (const v of await q`select tip, spans, closed_end from view where source = ${source} order by ord`)
+        if (leavesOf(v as any).length && (await forestView(q, leavesOf(v as any), () => true)).complete) cards.push(JSON.stringify([source, v.tip]));
+    return { fresh, merge, cards, spans: [...new Set(nodes.flatMap((n) => n.spans))] };
   });
   await snapshotHook.afterSnapshot();
   // Under the barrier only set-based statements, with the whole held interval bounded (as guardedPost):
@@ -142,10 +149,11 @@ export async function runForest(db: Db, job: Job) {
                  where forest_node.model is null and forest_node.text is null`;
     // (A row stored before the configuration was recorded: the id, planned now from the same inputs under
     // this model and prompt, says which configuration it is for.)
-    if (p.merge.length)
-      await tx`insert into job (kind, key) select 'merge', x from unnest(${tx.array(p.merge, "text")}::text[]) x
-               on conflict (kind, key) where state in ('queued', 'running')
-               do update set req = job.req + 1, updated_at = now()`;
+    for (const [kind, keys] of [["merge", p.merge], ["card", p.cards]] as const)
+      if (keys.length)
+        await tx`insert into job (kind, key) select ${kind}, x from unnest(${tx.array(keys, "text")}::text[]) x
+                 on conflict (kind, key) where state in ('queued', 'running')
+                 do update set req = job.req + 1, updated_at = now()`;
     return fin;
   });
 }
@@ -243,7 +251,12 @@ export async function runMerge(db: Db, job: Job) {
       const done = await tx`update forest_node set text = ${t}, text_hash = ${sha(t)}, model = ${model}, prompt_v = ${FOREST_VERSION},
                                    deps = ${c.deps}, at = now() where id = ${job.key} and text is null returning id`;
       // Written once; the parents that were waiting for it can merge now.
-      if (done.length) for (const p of await tx`select id from forest_node where kid_ids @> array[${job.key}]::text[] and text is null`) await enqueue(tx, "merge", p.id);
+      if (done.length) {
+        for (const p of await tx`select id from forest_node where kid_ids @> array[${job.key}]::text[] and text is null`) await enqueue(tx, "merge", p.id);
+        // The views holding it may be complete now: their forest job queues their session cards.
+        const [n] = await tx`select spans from forest_node where id = ${job.key}`;
+        for (const v of await tx`select distinct source from view where span_ids @> array[${n.spans[0]}]::text[]`) await enqueue(tx, "forest", v.source);
+      }
       await snapshotHook.beforeMergeCommit(job.key);
     });
   }
@@ -306,7 +319,7 @@ export async function forestView(q: Tx, leaves: string[], readable: (source: str
     // Children of the selected node (its own text is what the caller already has).
     if (sel.size > 1) for (const h of [0, sel.size / 2]) expand(sel.start + h, sel.size / 2, true);
   } else for (const [st, z] of roots(leaves.length)) expand(st, z, true);
-  return { items, used: [...used], complete };
+  return { items, used: [...used], complete, leafText: (sp: string) => sums.get(sp)?.text ?? null };
 }
 
 /** Where node `id` sits on a view's leaves, if it is one of that view's planned nodes. */
@@ -335,4 +348,146 @@ export async function readForest(db: Db, source: string, tip: string) {
   });
   if (r && !r.complete) await wantForest(db, source);
   return r;
+}
+
+// ---------- session card (§4.4) ----------
+// One card per view (source, tip), made by the model from the view's forest roots and its most recent span
+// summaries. The view key names which card; the input fingerprint (texts, model, prompt) says whether the
+// stored card was made from what the view shows now. A card not current is not shown: the reader gets a
+// deterministic degraded card from the ready summaries instead, never a model call.
+
+export const CARD_VERSION = "session-card-v1";
+const CARD_MAX = 1536; // UTF-8 bytes of overview, DESIGN §4.4 [待标定 ≤1.5KB]
+const RECENT = 3; // most recent span summaries next to the roots [待标定]
+
+addMigration(`
+create table if not exists session_card (source text not null, tip text not null, input_fp text not null, card jsonb not null,
+                                         model text not null, prompt_v text not null, deps jsonb not null,
+                                         at timestamptz not null default now(), primary key (source, tip));
+`);
+
+const clipBytes = (t: string, n: number) => {
+  const b = Buffer.from(t);
+  if (b.length <= n) return t;
+  let i = n;
+  while (i > 0 && (b[i] & 0xc0) === 0x80) i--; // never cut inside a character
+  return b.subarray(0, i).toString();
+};
+
+type CardInput = { roots: { id: string; text: string }[]; recent: { id: string; text: string }[]; complete: boolean; leaves: string[]; used: string[] };
+
+/** What a view's card is made from, in the caller's snapshot; `readable` as for forestView. */
+async function cardInput(q: Tx, leaves: string[], readable: (s: string) => boolean): Promise<CardInput> {
+  const f = await forestView(q, leaves, readable);
+  const roots = f.items.filter((i) => i.text !== null).map((i) => ({ id: i.node ? "node:" + i.node : "span:" + i.span, text: i.text! }));
+  const recent = leaves.slice(-RECENT).map((sp) => ({ id: "span:" + sp, text: f.leafText(sp) }));
+  return {
+    roots, recent: recent.filter((r) => r.text !== null) as { id: string; text: string }[],
+    complete: f.complete && recent.every((r) => r.text !== null), leaves, used: f.used,
+  };
+}
+const cardFp = (model: string, i: CardInput) => sha(JSON.stringify([CARD_VERSION, model, i.roots, i.recent]));
+
+/** cwd and time range of a source, from its own records (not import time). */
+async function cardMeta(q: Tx, source: string) {
+  const [m] = await q`select min(t) first_at, max(t) last_at, (array_agg(cwd) filter (where cwd is not null))[1] cwd from (
+                        select substring(b.raw from '"timestamp":"([0-9]{4}-[0-9T:.+Z-]+)"')::timestamptz t,
+                               coalesce(b.raw::jsonb->>'cwd', b.raw::jsonb->'payload'->>'cwd') cwd
+                        from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                        where r.source = ${source} and r.state = 'ok') x`;
+  return { cwd: m?.cwd ?? null, first_at: m?.first_at ?? null, last_at: m?.last_at ?? null };
+}
+
+export const CARD_SYSTEM =
+  "You write the card of one coding-agent session for a long-term memory index, from summaries of its parts " +
+  "in order (<part>) and of its most recent exchanges (<recent>). The card is read at the start of later " +
+  "sessions to recall what this one was about.\n" +
+  "Keep what the user wanted and decided, results that were verified, and what is still open. Do not add facts " +
+  "the summaries do not contain. Write in the language of the summaries.\n" +
+  'Return one JSON object: {"title": string (at most 80 bytes), "overview": string, "results": [string], ' +
+  `"open_threads": [string]}; overview at most ${CARD_MAX} UTF-8 bytes (Chinese characters are 3 bytes each), ` +
+  "results and open_threads at most 5 items of at most 200 bytes each.";
+
+/** Job `card` for one view: key JSON [source, tip]. */
+export async function runCard(db: Db, job: Job) {
+  const [source, tip] = JSON.parse(job.key) as [string, string];
+  const url = env("MEMEX_LLM_URL").replace(/\/+$/, "") + "/chat/completions";
+  const model = env("MEMEX_LLM_MODEL");
+  const key = env("MEMEX_LLM_KEY");
+  let problem = "";
+  for (let i = 0; i < MAX_TRIES; i++) {
+    const c = await snapshot(db, async (q) => {
+      const [v] = await q`select spans, closed_end from view where source = ${source} and tip = ${tip}`;
+      if (!v) return { ok: false as const, reason: "gone" };
+      const [pr] = await q`select deps from projected where source = ${source}`;
+      if (!pr || !(await unchanged(q, pr.deps))) return { ok: false as const, reason: "projection-stale" };
+      const input = await cardInput(q, leavesOf(v as any), () => true);
+      if (!input.complete) return { ok: false as const, reason: "not-ready" };
+      const fp = cardFp(model, input);
+      // Exact check of every text that is sent (nodes and leaves, down to their records), for the model.
+      const deps: Record<string, number> = { ...pr.deps };
+      for (const it of [...input.roots, ...input.recent]) {
+        const k: Kid = it.id.startsWith("node:") ? { node: it.id.slice(5) } : await leafKid(q, it.id.slice(5));
+        const r = await checkKid(q, k);
+        if (!r.ok) return r;
+        Object.assign(deps, r.deps);
+      }
+      const [old] = await q`select input_fp, deps from session_card where source = ${source} and tip = ${tip}`;
+      return { ok: true as const, input, fp, deps, current: old?.input_fp === fp, meta: await cardMeta(q, source) };
+    });
+    if (!c.ok) return skip(db, job, c.reason, (c as any).scopes ?? []);
+    const write = (card: object | null) => async (tx: Tx) => {
+      if (!(await tx`select 1 from view where source = ${source} and tip = ${tip}`).length) return;
+      if (card === null) await tx`update session_card set deps = ${c.deps} where source = ${source} and tip = ${tip} and input_fp = ${c.fp}`;
+      else
+        await tx`insert into session_card (source, tip, input_fp, card, model, prompt_v, deps)
+                 values (${source}, ${tip}, ${c.fp}, ${card as any}, ${model}, ${CARD_VERSION}, ${c.deps})
+                 on conflict (source, tip) do update set input_fp = excluded.input_fp, card = excluded.card, model = excluded.model,
+                   prompt_v = excluded.prompt_v, deps = excluded.deps, at = now()`;
+    };
+    if (c.current) return publish(db, job, c.deps, write(null));
+    const body = [...c.input.roots.map((r) => `<part>\n${r.text}\n</part>`), ...c.input.recent.map((r) => `<recent>\n${r.text}\n</recent>`)].join("\n");
+    const messages = [{ role: "system", content: CARD_SYSTEM }, { role: "user", content: body }];
+    if (problem) messages.push({ role: "user", content: "Your previous answer was invalid: " + problem + ". Return a corrected JSON object." });
+    const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
+    if (r === "stale") continue;
+    if (r.status !== 200) throw new Error(`llm http ${r.status}`);
+    let out: any;
+    try {
+      out = parseJson(r.json?.choices?.[0]?.message?.content ?? "");
+    } catch {}
+    const strs = (x: any) => Array.isArray(x) && x.every((y) => typeof y === "string") && x.length <= 5 && x.every((y: string) => Buffer.byteLength(y) <= 200);
+    if (!out || typeof out.title !== "string" || typeof out.overview !== "string" || !strs(out.results) || !strs(out.open_threads)) {
+      problem = "keys title, overview, results, open_threads with the stated types and limits";
+      continue;
+    }
+    if (Buffer.byteLength(out.overview) > CARD_MAX || Buffer.byteLength(out.title) > 80) {
+      problem = `overview at most ${CARD_MAX} bytes, title at most 80`;
+      continue;
+    }
+    const card = { title: out.title, overview: out.overview, results: out.results, open_threads: out.open_threads, ...c.meta,
+                   source_span_ids: c.input.leaves };
+    return publish(db, job, c.deps, write(card));
+  }
+  throw new Error(problem ? `card invalid after ${MAX_TRIES} tries` : "inputs kept changing");
+}
+
+/** A leaf's current identity (span, input, summary hash) for the exact check. */
+async function leafKid(q: Tx, span: string): Promise<Kid> {
+  const [r] = await q`select s.input_fp, ss.text_hash from span s join span_summary ss on ss.span = s.id and ss.input_fp = s.input_fp where s.id = ${span}`;
+  return { span, fp: r?.input_fp ?? "", hash: r?.text_hash ?? "" };
+}
+
+/** The card of a view for reading, in the caller's snapshot: the stored card if it was made from exactly what
+ *  the view shows this reader now, else a degraded card from the ready summaries. No model call. */
+export async function readCard(q: Tx, source: string, leaves: string[], tip: string, readable: (s: string) => boolean) {
+  const input = await cardInput(q, leaves, readable);
+  const meta = await cardMeta(q, source);
+  const [row] = await q`select card, input_fp from session_card where source = ${source} and tip = ${tip} and model = ${env("MEMEX_LLM_MODEL")} and prompt_v = ${CARD_VERSION}`;
+  if (row && row.input_fp === cardFp(env("MEMEX_LLM_MODEL"), input)) return { card: { ...row.card, ...meta }, degraded: false, used: input.used };
+  const overview = clipBytes(input.roots.map((r) => r.text).join("\n"), CARD_MAX);
+  return {
+    card: { title: null, overview, results: [], open_threads: [], ...meta, source_span_ids: leaves },
+    degraded: true, used: input.used,
+  };
 }

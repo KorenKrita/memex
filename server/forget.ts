@@ -71,6 +71,7 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     // Queued again: it may be made lawfully from what remains (another view closes it, other context).
     for (const r of await tx`delete from span_summary where deps ? ${"s:" + source} returning span`) await enqueue(tx, "summarize", r.span);
     await tx`delete from forest_access where source = ${source}`;
+    await tx`delete from session_card where source = ${source} or deps ? ${"s:" + source}`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
     // Lease rows are not touched: a commit holds its lease row before it waits for the barrier, so taking
