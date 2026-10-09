@@ -16,8 +16,8 @@
 // before it is written, so a forget or revoke that commits first is never answered from the old state.
 import { type Db, type Tx, addMigration } from "./db.ts";
 import { Guarded } from "./http.ts";
-import { HttpError } from "./sync.ts";
-import { EMBED_DIM, guardedPost, snapshot } from "./derive.ts";
+import { BARRIER, HttpError } from "./sync.ts";
+import { EMBED_DIM, guardedPost, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
 
 export const PURPOSES = new Set(["recall", "tool", "snapshot"]);
@@ -134,8 +134,12 @@ async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purpose" | 
     const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
     for (const id of r.inContext!) ctx.add(inherited.has(id) ? canonOf(src.harness, inherited.get(id)!) : `${r.source}:${id}`);
   }
-  const vd = (await q`select v from vis_version where key = 'd:memex'`)[0];
-  return { valid, ctx, dMemex: Number(vd?.v ?? 1) };
+  // The query's own basis, read with the checks above: its session's version (a forget of the querying
+  // session moves it, even if it never reached L0) and the read grant's destination.
+  const qk = ["s:" + r.source, "d:memex"];
+  const qv = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(qk, "text")})`).map((x: any) => [x.key, Number(x.v)]));
+  const qDeps = Object.fromEntries(qk.map((k) => [k, qv.get(k) ?? 1])) as Record<string, number>;
+  return { valid, ctx, dMemex: qDeps["d:memex"], qDeps };
 }
 
 /** Embed the query (guarded by the embedding destination's version), or say why not. */
@@ -144,9 +148,10 @@ async function embedQuery(db: Db, r: SearchReq): Promise<{ v?: number[]; skipped
   const url = process.env.MEMEX_EMBED_URL, model = process.env.MEMEX_EMBED_MODEL, key = process.env.MEMEX_EMBED_KEY;
   if (!url || !model || !key) return { skipped: "not-configured" };
   const c = await snapshot(db, async (q) => {
+    const b = await basis(q, r); // the query is still authorized and its session not forgotten
     if (!(await granted(q, r.scope, r.purpose, "embedding"))) return null;
     const [v] = await q`select v from vis_version where key = 'd:embedding'`;
-    return { "d:embedding": Number(v?.v ?? 1) };
+    return { ...b.qDeps, "d:embedding": Number(v?.v ?? 1) };
   });
   if (!c) return { skipped: "not-granted" };
   try {
@@ -365,11 +370,15 @@ async function pathLabel(q: Tx, source: string, keys: string[]) {
   return { label: on === keys.length ? "on-path" : on === 0 ? "off-path" : "mixed", basis, tip: v.tip as string };
 }
 
+export const searchHooks = { beforeTrace: async () => {} };
+
 export async function search(db: Db, body: unknown): Promise<Guarded> {
   const r = validate(body);
   await snapshot(db, (q) => basis(q, r)); // the query's own authorization, before its text goes anywhere
   const emb = await embedQuery(db, r);
+  let tries = 0;
   const run = async (): Promise<Guarded> => {
+    if (++tries > 3) throw new HttpError(503, "state kept changing; retry");
     const s = await snapshot(db, async (q) => {
       const b = await basis(q, r);
       const rc = await recall(q, r, b, emb.v);
@@ -392,7 +401,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
     const { b, rc, labels } = s;
     let rerankSkip = s.rerankSkip;
     // Every source carried by a candidate, plus the read grant's destination version.
-    const deps: Record<string, number> = { "d:memex": b.dMemex };
+    const deps: Record<string, number> = { ...b.qDeps };
     for (const c of rc.chosen) for (const x of c.sources) Object.assign(deps, b.valid.get(x)!.deps);
     let scores: (number | null)[] = rc.chosen.map(() => null);
     if (!rerankSkip && rc.chosen.length) {
@@ -444,8 +453,17 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       };
     });
     const trace = rc.chosen.map((c, i) => ({ key: c.key, ranks: c.ranks, fused: Number(c.fused.toFixed(5)), rerank: scores[i], final: final.findIndex((x) => x.c === c) + 1, attached: c.attach.length, incomplete: [...new Set(c.incomplete)] }));
-    const [t] = await db`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
-                         ${{ channels: rc.channels, embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null, candidates: trace }}) returning id`;
+    // The trace is published like any derived artefact: under the shared barrier, only while the query's
+    // basis and every candidate's still hold (a forget of the querying session deletes its traces).
+    await searchHooks.beforeTrace();
+    const t = await db.begin(async (tx: Tx) => {
+      await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
+      if (!(await unchanged(tx, deps))) return null;
+      const [row] = await tx`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
+                             ${{ channels: rc.channels, embedding_skipped: emb.skipped ?? null, rerank_skipped: rerankSkip ?? null, candidates: trace }}) returning id`;
+      return row;
+    });
+    if (!t) return run();
     return new Guarded(deps, {
       results,
       embedding_skipped: emb.skipped ?? null,

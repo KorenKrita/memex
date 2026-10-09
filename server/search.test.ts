@@ -6,7 +6,7 @@ import { connect, migrate, bump, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, Guarded, httpHooks, route, serve, transport } from "./http.ts";
-import { search, zoom, grep, GUARANTEED } from "./search.ts";
+import { search, zoom, grep, GUARANTEED, searchHooks } from "./search.ts";
 import { forgetSource } from "./forget.ts";
 import { drain } from "./worker.ts";
 import { sourceIdOf } from "../client/records.ts";
@@ -75,6 +75,8 @@ beforeEach(async () => {
   summaryOf = (input) => /kind="user">\n?([^<]*)/.exec(input.slice(input.indexOf("<input>")))?.[1]?.trim() ?? "s";
   httpHooks.beforeDeliver = async () => {};
   httpHooks.beforeGuard = async () => {};
+  searchHooks.beforeTrace = async () => {};
+  (await import("./derive.ts")).hooks.afterCheck = async () => {};
   key = await addApiKey(db, "t");
 });
 
@@ -663,4 +665,62 @@ test("forget concurrent with a real commit that holds its lease row: no deadlock
   const c = await commit(db, { leaseId: l, commitId: "dl1", length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
   expect(c).toMatchObject({ ok: false, reason: "forgotten" });
   expect((await db`select count(*)::int n from body where source = ${s}`)[0].n).toBe(0);
+});
+
+// ---------- the querying session's own lifecycle ----------
+
+test("forget the querying session before each send: no query text leaves, no trace, no answer", async () => {
+  const { hooks } = await import("./derive.ts");
+  await put("hist", linear("hist", [["alpha history", "ANSWER"]]));
+  const A = await put("asker", linear("asker", [["asking now", "r"]]));
+  await drain(db);
+  const forgetAsker = async () => void (await forgetSource(db, A));
+  // 1. Before the embedding request (and every later model request: each sees the moved version).
+  requests = [];
+  let n = 0;
+  hooks.afterCheck = async () => void (n++ === 0 && (await forgetAsker()));
+  await expect(search(db, Q("alpha secret-query-1"))).rejects.toThrow("forgotten");
+  expect(requests.filter((x) => JSON.stringify(x.body).includes("secret-query-1")).length).toBe(0);
+  expect((await db`select count(*)::int n from search_trace`)[0].n).toBe(0);
+});
+
+test("forget the querying session before rerank: rerank is not sent", async () => {
+  const { hooks } = await import("./derive.ts");
+  await put("hist2", linear("hist2", [["alpha history", "ANSWER"]]));
+  const A = await put("asker", linear("asker", [["asking now", "r"]]));
+  await drain(db);
+  requests = [];
+  let n = 0;
+  // The embedding request passes; the second guarded send (rerank) finds the query's session forgotten.
+  hooks.afterCheck = async () => void (n++ === 1 && (await forgetSource(db, A)));
+  await expect(search(db, Q("alpha secret-query-2"))).rejects.toThrow("forgotten");
+  expect(requests.filter((x) => x.path.endsWith("/rerank")).length).toBe(0);
+  expect((await db`select count(*)::int n from search_trace`)[0].n).toBe(0);
+});
+
+test("forget the querying session before its trace is written: no trace survives", async () => {
+  await put("hist3", linear("hist3", [["alpha history", "ANSWER"]]));
+  const A = await put("asker", linear("asker", [["asking now", "r"]]));
+  await drain(db);
+  searchHooks.beforeTrace = async () => {
+    searchHooks.beforeTrace = async () => {};
+    await forgetSource(db, A);
+  };
+  await expect(search(db, Q("alpha", { dests: [] }))).rejects.toThrow("forgotten");
+  expect((await db`select count(*)::int n from search_trace`)[0].n).toBe(0);
+});
+
+test("forget a querying session that never reached L0, before delivery: not answered", async () => {
+  await put("hist4", linear("hist4", [["alpha history-four", "ANSWER"]]));
+  await drain(db);
+  const A = sourceIdOf("pi", "never-synced");
+  let fired = 0;
+  httpHooks.beforeGuard = async () => {
+    if (fired++) return;
+    await forgetSource(db, A); // works for an unknown source: tomb + version move
+  };
+  const res = await fetch(`http://127.0.0.1:${api.port}/v1/search`, { method: "POST", headers: { authorization: `Bearer ${key}` },
+    body: JSON.stringify(Q("history-four", { source: A, dests: [] })) });
+  expect(res.status).toBe(410);
+  expect(await res.text()).not.toContain("history-four");
 });
