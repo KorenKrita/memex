@@ -1,0 +1,10 @@
+{
+  "name": "memex-protocol-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:up": "docker run -d --name memex-pg-test -e POSTGRES_PASSWORD=memex -e POSTGRES_DB=memex -p 127.0.0.1:55432:5432 --tmpfs /var/lib/postgresql/data postgres:17-alpine",
+    "db:down": "docker rm -f memex-pg-test",
+    "test": "bun test --timeout 30000"
+  }
+}
