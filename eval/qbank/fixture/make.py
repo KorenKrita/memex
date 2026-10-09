@@ -41,6 +41,7 @@ d = lambda i, par, t, role, text: M(i, par, f"2026-01-01T00:00:0{t}Z", role, tex
 w("pi/d/dist.jsonl", [{"type": "session", "version": 3, "id": "d", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/x"},
     d("d1", None, 1, "user", "start OLD0"), d("d2", "d1", 2, "assistant", "OLD1 claim"),
     d("d3", "d2", 3, "assistant", "x" * 12288 + " FIXADJ"), d("d4", "d3", 4, "assistant", "FIXFAR"),
+    M("e5", "d4", "2026-01-01T00:00:04.5Z", "user", "sibling user turn"), M("e6", "e5", "2026-01-01T00:00:04.6Z", "assistant", "SIBOLD"),
     d("d5", "d4", 5, "user", "one user turn"), d("d6", "d5", 6, "assistant", "FIXNEXT"),
     d("d7", "d6", 7, "user", "second user turn"), d("d8", "d7", 8, "assistant", "FIXLATER"),
     M("d9", "d8", "2026-01-01T00:00:20Z", "assistant", "after the cutoff")])
@@ -48,7 +49,10 @@ open(f"{C}/pi/d/dist.jsonl", "ab").write(b'{"type": "message", "id": "d10", "par
 w("codex/2026/01/01/rollout-dist.jsonl", [X(0, "2026-01-01T00:00:00Z", "session_meta", meta(source="cli", thread_source="user")),
     X(1, "2026-01-01T00:00:02Z", "response_item", msg("assistant", "codex OLD2")),
     X(2, "2026-01-01T00:00:03Z", "response_item", msg("user", "<svg> should be <canvas>; fix it")),
-    X(3, "2026-01-01T00:00:04Z", "response_item", msg("assistant", "codex FIX2"))])
+    X(3, "2026-01-01T00:00:04Z", "response_item", msg("assistant", "codex FIX2")),
+    X(4, "2026-01-01T00:00:05Z", "response_item", {**msg("user", "plain hook context"),
+        "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["hooks.additional_context"]}}),
+    X(5, "2026-01-01T00:00:06Z", "response_item", msg("assistant", "codex FIX3"))])
 files = {}
 for dp, _, fs in os.walk(C):
     for fn in fs:
@@ -70,8 +74,12 @@ cases = {
              Q("dn", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d6", "FIXNEXT", "correction")], typ="correction-next-exchange"),
              Q("dl", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d8", "FIXLATER", "correction")], typ="correction-later-turn"),
              Q("dc", [E(CD, "1", "OLD2", "old-claim"), E(CD, "3", "FIX2", "correction")], typ="correction-next-exchange"),
+             Q("dk", [E(CD, "3", "FIX2", "old-claim"), E(CD, "5", "FIX3", "correction")], typ="correction-same-span"),
+             Q("do", [E(DI, "d2", "OLD1", "old-claim"), E(CD, "3", "FIX2", "correction")], typ="state-update-other-session"),
              Q("de", [], hist=False, cut="2026-01-01T00:00:00Z")],
-    "distfar": [Q("df", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d4", "FIXFAR", "correction")], typ="correction-self-adjacent-span")],
+    "distsib": [Q("dz", [E(DI, "e6", "SIBOLD", "old-claim"), E(DI, "d8", "FIXLATER", "correction")], typ="correction-later-turn")],
+    "distfar": [Q("df", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d4", "FIXFAR", "correction")], typ="correction-self-adjacent-span"),
+                Q("dg", [E(DI, "d2", "OLD1", "old-claim"), E(DI, "d4", "FIXFAR", "correction")], typ="correction-nonadjacent-span")],
     "tie": [Q("t", [E(S1, "a3", "tie")])],
     "clockback": [Q("c", [E(S1, "a4", "clock")])],
     "codexlate": [Q("l", [E(MAIN, "3", "LATE")])],

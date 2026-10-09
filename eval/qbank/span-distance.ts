@@ -9,7 +9,7 @@
 //   later-turn           two or more such user records
 //   other-session        different file
 // The stated type must end with the relation. Different spans with no user record between that are not
-// adjacent fit no type and are reported as `nonadjacent-span`. A record mapped to no span, or an old claim
+// adjacent are reported as `nonadjacent-span` and always fail. A record mapped to no span, or an old claim
 // off the correction's path, is an error. Exits 1 on any error or disagreement. Prints record ids and span
 // ids only, no session text.
 //
@@ -38,8 +38,8 @@ for (const v of new Set(qs.map(view))) {
 }
 const rec = (f: string, id: string) => recs.get(`${realpathSync(f)}|${id}`);
 const show = (s: Set<string>) => [...s].sort().join(",");
-// Record ids on the path ending at `id`, root first.
-const pathTo = (f: string, id: string): string[] => {
+// Record ids on the path ending at `id`, root first; the format comes from the corpus-relative path.
+const pathTo = (f: string, codex: boolean, id: string): string[] => {
   const lines = readFileSync(f, "utf8").split("\n").flatMap((l) => {
     try {
       return [JSON.parse(l)];
@@ -47,7 +47,7 @@ const pathTo = (f: string, id: string): string[] => {
       return [];
     }
   });
-  if (!f.includes("/codex")) {
+  if (!codex) {
     const parent = new Map(lines.filter((d) => d.id).map((d) => [String(d.id), d.parentId as string | null]));
     const ids: string[] = [];
     for (let x: string | null | undefined = id; x; x = parent.get(x)) ids.push(x);
@@ -69,7 +69,7 @@ for (const q of qs) {
     let rel: string, between = -1;
     if (c.file !== o.file) rel = "other-session";
     else {
-      const p = pathTo(fc, c.entry);
+      const p = pathTo(fc, c.file.startsWith("codex"), c.entry);
       const i = p.indexOf(o.entry);
       if (i < 0) throw new Error(`${q.id}: old claim ${o.entry} is not on the correction's path`);
       const mid = p.slice(i + 1).map((id) => rec(fc, id)).filter((r) => r !== undefined);
@@ -79,7 +79,7 @@ for (const q of qs) {
       else if (between === 0) rel = mid.slice(0, -1).every(own) ? "self-adjacent-span" : "nonadjacent-span";
       else rel = between === 1 ? "next-exchange" : "later-turn";
     }
-    const ok = q.type.endsWith(rel);
+    const ok = rel !== "nonadjacent-span" && q.type.endsWith(rel);
     if (!ok) bad++;
     console.log([q.id, q.type, `${o.entry}${show(ro.spans)}`, `${c.entry}${show(rc.spans)}`, between, rel, ok ? "ok" : "MISMATCH"].join("\t"));
   } catch (e) {

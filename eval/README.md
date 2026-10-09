@@ -112,11 +112,13 @@ the tools, the format and a synthetic fixture.
 - `qbank/span-distance.ts OUTDIR` — correction distance on `dryRun()` spans of each question's cut view
   (below); exits 1 when a stated type disagrees or a record maps to no span.
 - `qbank/selftest.sh` — runs `build.py` and `span-distance.ts` on `qbank/fixture/` (synthetic, regenerated
-  by `fixture/make.py`): three builds must be accepted (one checked for the exact public schema, visible
-  map, cut views and 0700/0600 modes; one whose session copies only diverge after the cutoff; one with all
-  five distance relations, a Codex user message starting with `<`, an empty-history question whose cutoff
-  precedes every record, and a torn multibyte write after the cutoff), a nonadjacent self-correction must be
-  reported as a mismatch, and 15 cases must be rejected for their stated reason.
+  by `fixture/make.py`). Accepted builds: exact public schema, visible map, cut views and 0700/0600 modes;
+  session copies that only diverge after the cutoff; seven correction distances (same span in Pi and across
+  a Codex hook-context message, adjacent self-correction, next exchange with a sibling-branch user turn in
+  between in file order and with a Codex user message starting with `<`, later turn, other session); an
+  empty-history question with an empty visible map; a torn multibyte write after the cutoff. Must fail:
+  an old claim on a sibling branch, a nonadjacent self-correction under any label, and 15 build cases
+  (each for its stated reason, without printing session text).
 
 **Draft fields** (one JSON object per line): `id`, `task_cluster`, `split` (`tune`/`test`), `type`,
 `needs_history`, `origin` (`derived` from a real session or `synthetic`), `question`, `current_context`
@@ -160,9 +162,11 @@ several Pi branches has one span per view). In the same file the checker walks t
 (Pi `parentId` chain, Codex file order) back to the old claim and counts the indexer's `user` records on
 it: shared span = `same-span`; none and every record between in one of the two spans =
 `correction-self-adjacent-span` (the agent corrects itself); none but another span between =
-`nonadjacent-span`, which no type accepts; exactly one = `correction-next-exchange`; two or more =
+`nonadjacent-span`, which always fails; an old claim off the correction's path is an error; exactly one = `correction-next-exchange`; two or more =
 `correction-later-turn`; different file = `*-other-session`. On `bank-v8` all 14 correction questions agree
-with their type.
+with their type. Limit: adjacency is checked as "every record between belongs to one of the two spans";
+for a record on a prefix shared by several Pi branches (several spans) this is weaker than ordered
+adjacency on one navigation view.
 
 **Current local bank** (2026-10-09, `bank-v8`, questions sha256 `6820fde8…`, grading `4dc52a34…`): 82
 questions, 32 task clusters, 37 evidence files, 36 cutoffs. 57 need history, 25 do not (30%); 62 test /

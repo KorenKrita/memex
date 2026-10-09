@@ -18,9 +18,10 @@ got = {k: v[1] for k, v in vis["files"].items()}
 # s1: header + a1 a2 b2 (a3 is at the cutoff); main: meta + ordinals 1, 2 (ordinal 3 is at the cutoff);
 # s2: the two copies are identical before the cutoff, so the dry-run indexes one (q/) as a duplicate pair.
 # Not visible: Pi run-N and subagent transcript, Codex subagent/guardian/legacy, compressed files.
-# dist: header + d1..d8 (d9 is after the cutoff, then a torn write); rollout-dist: meta + ordinals 1..3 and the empty string after the last newline (whole file).
+# dist: header + d1..d4 e5 e6 d5..d8 (d9 is after the cutoff, then a torn write); rollout-dist: meta +
+# ordinals 1..5 and the empty string after the last newline (whole file).
 assert got == {"pi/p/s1.jsonl": 4, "codex/2026/01/01/rollout-main.jsonl": 3, "pi/q/s2.jsonl": 2,
-               "pi/d/dist.jsonl": 9, "codex/2026/01/01/rollout-dist.jsonl": 5}, got
+               "pi/d/dist.jsonl": 11, "codex/2026/01/01/rollout-dist.jsonl": 7}, got
 view = f"{out}/public/views/{qs[0]['visible'][8:-5]}"
 seen = {os.path.relpath(os.path.join(d, f), view) for d, _, fs in os.walk(view) for f in fs}
 assert "pi/p/s1/r1/run-0/session.jsonl" not in seen and "pi/p/s1.jsonl" in seen, seen
@@ -37,15 +38,30 @@ for d, ds, fs in os.walk(out):
         assert stat.S_IMODE(os.stat(os.path.join(d, f)).st_mode) == 0o600, f
 PY
 bun "$here/span-distance.ts" "$out" >/dev/null || { echo "FAIL: ok distance"; exit 1; }
-# Correction distances (same span, adjacent self-correction, next exchange, later turn, a Codex user message
-# starting with "<"), plus an empty-history question whose cutoff precedes every record; the Pi file ends in
-# a torn multibyte write after the cutoff.
+# Correction distances on the indexer's records: same span (Pi; Codex across a hook-context user message,
+# which is not a user turn), adjacent self-correction, next exchange (Pi with a sibling-branch user turn in
+# file order between; Codex user message starting with "<"), later turn, other session; plus an
+# empty-history question whose cutoff precedes every record (empty visible map). The Pi file ends in a torn
+# multibyte write after the cutoff. An old claim on a sibling branch is an error; a nonadjacent
+# self-correction fails under any label.
 uv run --no-project python "$here/build.py" "$out-dist" "$here/fixture/dist.jsonl" >/dev/null || { echo "FAIL: dist rejected"; exit 1; }
 d=$(bun "$here/span-distance.ts" "$out-dist") || { echo "FAIL: dist distances: $d"; exit 1; }
-[ "$(grep -c 'ok$' <<<"$d")" = 5 ] || { echo "FAIL: dist distances: $d"; exit 1; }
+for r in "ds"$'\t'".*same-span"$'\t'"ok" "da"$'\t'".*self-adjacent-span"$'\t'"ok" "dn"$'\t'".*"$'\t'"1"$'\t'"next-exchange"$'\t'"ok" \
+         "dl"$'\t'".*later-turn"$'\t'"ok" "dc"$'\t'".*"$'\t'"1"$'\t'"next-exchange"$'\t'"ok" "dk"$'\t'".*same-span"$'\t'"ok" \
+         "do"$'\t'".*other-session"$'\t'"ok"; do
+  grep -q "^$r$" <<<"$d" || { echo "FAIL: dist distances ($r): $d"; exit 1; }
+done
+uv run --no-project python - "$out-dist" <<'PY'
+import json, sys
+v = json.load(open(f"{sys.argv[1]}/public/visible/2026-01-01T000000Z.json"))
+assert v["files"] == {}, v["files"]
+PY
+uv run --no-project python "$here/build.py" "$out-distsib" "$here/fixture/distsib.jsonl" >/dev/null || { echo "FAIL: distsib rejected"; exit 1; }
+if d=$(bun "$here/span-distance.ts" "$out-distsib"); then echo "FAIL: old claim on a sibling branch passed"; exit 1; fi
+grep -q "not on the correction's path" <<<"$d" || { echo "FAIL: distsib: $d"; exit 1; }
 uv run --no-project python "$here/build.py" "$out-distfar" "$here/fixture/distfar.jsonl" >/dev/null || { echo "FAIL: distfar rejected"; exit 1; }
 if d=$(bun "$here/span-distance.ts" "$out-distfar"); then echo "FAIL: nonadjacent spans passed as self-adjacent"; exit 1; fi
-grep -q "nonadjacent-span"$'\t'"MISMATCH" <<<"$d" || { echo "FAIL: distfar: $d"; exit 1; }
+[ "$(grep -c "nonadjacent-span"$'\t'"MISMATCH" <<<"$d")" = 2 ] || { echo "FAIL: distfar (both labels must fail): $d"; exit 1; }
 # Accepted: a session copied twice whose copies only diverge after the cutoff is indexable at the cutoff.
 uv run --no-project python "$here/build.py" "$out-futurecopy" "$here/fixture/futurecopy.jsonl" >/dev/null \
   || { echo "FAIL: futurecopy rejected (later data decided indexability)"; exit 1; }
@@ -55,6 +71,7 @@ while read -r c want; do
     echo "FAIL: $c was accepted"; exit 1
   fi
   grep -q -- "$want" <<<"$msg" || { echo "FAIL: $c rejected for another reason: $msg"; exit 1; }
+  if grep -q "PURPLE" <<<"$msg"; then echo "FAIL: $c error prints session text"; exit 1; fi
   n=$((n + 1))
 done <<'CASES'
 tie outside the visible prefix
@@ -73,4 +90,4 @@ quote quote not in a2 of pi/p/s1.jsonl
 corrsame correction is not after the old claim
 corrother no correction in another file
 CASES
-echo "ok: 3 builds accepted (exact public schema, visible map and cut views; distances incl. Codex and empty history), nonadjacent distance caught, $n rejected for the expected reason"
+echo "ok: accepted builds (schema, visible map, cut views, future copies, 7 distances, empty history); sibling-branch and nonadjacent distances fail; $n rejected for the expected reason without session text"

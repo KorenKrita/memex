@@ -2,3 +2,5 @@
 {"timestamp": "2026-01-01T00:00:02Z", "ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex OLD2"}]}}
 {"timestamp": "2026-01-01T00:00:03Z", "ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<svg> should be <canvas>; fix it"}]}}
 {"timestamp": "2026-01-01T00:00:04Z", "ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex FIX2"}]}}
+{"timestamp": "2026-01-01T00:00:05Z", "ordinal": 4, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "plain hook context"}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["hooks.additional_context"]}}}
+{"timestamp": "2026-01-01T00:00:06Z", "ordinal": 5, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex FIX3"}]}}
