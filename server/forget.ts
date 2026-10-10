@@ -14,7 +14,7 @@
 //      it are refused at their barrier check (§5.5).
 // The host's own log files and existing backups are not touched.
 import { type Db, type Tx, bump, enqueue } from "./db.ts";
-import { BARRIER, copyTomb } from "./sync.ts";
+import { BARRIER, copyTomb, finishRound } from "./sync.ts";
 import { contentHash, isCopyTime } from "../dryrun/dryrun.ts";
 import "./project.ts";
 import "./derive.ts";
@@ -131,8 +131,12 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     await tx`update recall_block set text = '', state = 'withdrawn' where deps ? ${"s:" + source}`;
     await tx`update start_snapshot set blocks = (select coalesce(jsonb_agg(x), '[]') from jsonb_array_elements(blocks) x where not (x->'deps' ? ${"s:" + source}))
              where blocks @? ${'$[*].deps."s:' + source + '"'}::jsonpath`;
-    for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])
+    for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "projection", "record", "body"])
       await tx`delete from ${tx(t)} where source = ${source}`;
+    // Reconciliation items of this source are closed (its segments are refused from now on), so rounds finish.
+    const rounds = await tx`update scan_item set state = 'skipped', reason = 'forgotten' where source = ${source} and state = 'pending'
+                            returning round`;
+    for (const r of new Set<number>(rounds.map((x: any) => Number(x.round)))) await finishRound(tx, r);
     // Lease rows are not touched: a commit holds its lease row before it waits for the barrier, so taking
     // them here (after the barrier) would deadlock. Its commit finds the source tomb under the barrier.
     await tx`update source set meta = '{}' where id = ${source}`;

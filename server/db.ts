@@ -1,7 +1,7 @@
 // Schema and connection (DESIGN §4, §5, §7). One Postgres database holds every piece of state; migrations are
 // idempotent and run at start-up. Tables by layer:
 //   auth      api_key, grant_rule                 who may call, and which (scope, purpose, destination) is allowed
-//   L0        source, lease, commit_result, projection, body, record, scan_progress, tomb, vis_version
+//   L0        source, lease, commit_result, projection, body, record, scan_round/item, tomb, vis_version
 //   jobs      job                                 derived work, enqueued in the same transaction as its input
 // Derived layers (span, forest, statements) add their own tables in their modules' migrations.
 import { SQL } from "bun";
@@ -62,8 +62,17 @@ create table if not exists projection (source text not null, collector text not 
 create unique index if not exists projection_rec on projection (source, collector, rec);
 create table if not exists record (source text not null, rec text not null, state text not null, hash text,
                                    first_pos int not null, primary key (source, rec));
-create table if not exists scan_progress (source text not null, collector text not null, chunks bigint not null default 0,
-                                          primary key (source, collector));
+drop table if exists scan_progress;
+-- Reconciliation rounds (§5.2): per collector and kind (auto | import), a fixed set of files, each with the bound
+-- (size at open) the round checks up to and how far the accepted segments have checked it. key is a hash of
+-- the file's real path on that collector; source is filled by the first accepted segment.
+create table if not exists scan_round (id bigserial primary key, collector text not null, kind text not null,
+                                       opened_at timestamptz not null default now(), finished_at timestamptz);
+create index if not exists scan_round_by on scan_round (collector, kind, id);
+create table if not exists scan_item (round bigint not null references scan_round (id) on delete cascade, key text not null,
+                                      ord int not null, bound bigint not null, source text, done_recs int not null default 0,
+                                      done_bytes bigint not null default 0, state text not null default 'pending',
+                                      tries int not null default 0, reason text, primary key (round, key));
 create table if not exists collector_view (source text not null, collector text not null, leaf text, at timestamptz not null default now(),
                                            primary key (source, collector));
 

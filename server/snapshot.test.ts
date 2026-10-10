@@ -52,7 +52,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access,
+                   scan_round, scan_item, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access,
                    session_card, start_snapshot, snapshot_refresh restart identity cascade`);
   for (const [s, p, d] of [["personal", "sync", "memex"], ["personal", "derive", "llm"], ["personal", "derive", "embedding"], ["personal", "snapshot", "memex"],
                            ["work", "sync", "memex"], ["work", "derive", "llm"]])

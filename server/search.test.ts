@@ -78,7 +78,7 @@ const ALL = [
 beforeEach(async () => {
   stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
+                   scan_round, scan_item, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
                    forest_node, forest_access, session_card restart identity cascade`);
   for (const [s, p, d] of ALL) await db`insert into grant_rule values (${s}, ${p}, ${d})`;
   process.env.MEMEX_IDLE_CLOSE_MS = "0"; // every tail closes: everything is summarized

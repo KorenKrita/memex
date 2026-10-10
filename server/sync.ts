@@ -20,10 +20,14 @@ export const MAX_COMMIT_BYTES = 8 * 1024 * 1024;
 
 export type SourceDecl = { source: string; harness: Harness; nativeId: string; scope: string; parent?: string | null; meta?: object };
 export type Change = { pos: number; id: string; hash: string; raw: string };
-export type Commit = { leaseId: number; commitId: string; length: number; changes: Change[]; scanChunks?: number; leaf?: string | null };
+/** A reconciliation segment (§5.2): the commit checks records [fromRec, toRec) of the file, bytes [fromByte,
+ *  toByte). `prev`: hash of the file's record at fromRec - 1 (null at 0). `eof`: nothing complete follows. */
+export type ScanPart = { round: number; key: string; fromRec: number; toRec: number; fromByte: number; toByte: number; prev: string | null;
+                         eof: boolean; last?: boolean };
+export type Commit = { leaseId: number; commitId: string; length: number; changes: Change[]; scan?: ScanPart; leaf?: string | null };
 export type CommitResult =
-  | { ok: true; accepted: number; refused: number; length: number }
-  | { ok: false; reason: "lease" | "forgotten" | "not-granted" | "bad-request"; detail?: string };
+  | { ok: true; accepted: number; refused: number; length: number; scan?: { state: string; doneRecs: number } }
+  | { ok: false; reason: "lease" | "forgotten" | "not-granted" | "bad-request" | "scan-stale" | "scan-restart"; detail?: string };
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -85,6 +89,90 @@ async function validLease(db: Db, id: number) {
   const [l] = await db`select source, collector from lease where id = ${id} and granted_at is not null and not done
                        and expires_at > clock_timestamp()`;
   return l as { source: string; collector: string } | undefined;
+}
+
+// Reconciliation rounds (§5.2). A round fixes its files and each file's bound when it opens; files that appear
+// or grow later wait for the next round. Items are handed out in the round's order (newest mtime first), those
+// that failed more often later, so a file that keeps failing does not take every segment. Progress moves only
+// in an accepted commit (commit() above); a failure here only counts a try.
+export const scanConfig = { intervalMs: Number(process.env.MEMEX_SCAN_INTERVAL_MS ?? 3_600_000), maxFiles: 20_000 };
+const KINDS = new Set(["auto", "import"]);
+const isKey = (k: unknown) => typeof k === "string" && /^[0-9a-f]{64}$/.test(k);
+
+export async function finishRound(tx: Tx, round: number) {
+  await tx`update scan_round set finished_at = now() where id = ${round} and finished_at is null
+           and not exists (select 1 from scan_item where round = ${round} and state = 'pending')`;
+}
+
+/** The collector's open round of this kind, or a new one over `files` (auto: once the interval has passed). */
+export async function openRound(db: Db, b: any) {
+  const collector = b.collector, kind = b.kind ?? "auto";
+  if (typeof collector !== "string" || !collector || collector.length > 128 || !KINDS.has(kind)) throw new HttpError(400, "collector, kind");
+  const files = Array.isArray(b.files) ? b.files : [];
+  if (files.length > scanConfig.maxFiles) throw new HttpError(400, `at most ${scanConfig.maxFiles} files`);
+  for (const f of files)
+    if (!isKey(f?.key) || !Number.isSafeInteger(f.size) || f.size < 0 || typeof f.mtime !== "number") throw new HttpError(400, "files");
+  return db.begin(async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock(hashtext('scan'), hashtext(${kind + ":" + collector}))`;
+    const [cur] = await tx`select id from scan_round where collector = ${collector} and kind = ${kind} and finished_at is null`;
+    if (cur) return { round: Number(cur.id), opened: false };
+    const [last] = await tx`select finished_at from scan_round where collector = ${collector} and kind = ${kind} order by id desc limit 1`;
+    if (kind === "auto" && last && Date.now() - new Date(last.finished_at).getTime() < scanConfig.intervalMs)
+      return { round: null, next_at: new Date(new Date(last.finished_at).getTime() + scanConfig.intervalMs).toISOString() };
+    const [r] = await tx`insert into scan_round (collector, kind) values (${collector}, ${kind}) returning id`;
+    const seen = new Set<string>();
+    const rows = [...files].sort((x, y) => y.mtime - x.mtime).filter((f) => !seen.has(f.key) && seen.add(f.key))
+      .map((f, ord) => ({ round: r.id, key: f.key, ord, bound: f.size }));
+    for (let i = 0; i < rows.length; i += 1000) await tx`insert into scan_item ${tx(rows.slice(i, i + 1000))}`;
+    await finishRound(tx, Number(r.id));
+    return { round: Number(r.id), opened: true };
+  });
+}
+
+const counts = async (q: Db | Tx, round: number) => {
+  const [c] = await q`select count(*)::int total, (count(*) filter (where state = 'done'))::int done,
+                      (count(*) filter (where state = 'skipped'))::int skipped, (count(*) filter (where state = 'pending'))::int pending,
+                      (select finished_at from scan_round where id = ${round}) finished_at, (select opened_at from scan_round where id = ${round}) opened_at
+                      from scan_item where round = ${round}`;
+  return { round, total: c.total, done: c.done, skipped: c.skipped, pending: c.pending, finished: !!c.finished_at,
+           opened_at: c.opened_at, finished_at: c.finished_at };
+};
+
+/** Pending items of a round, in order, with where their accepted progress stands; and the round's counts. */
+export async function nextItems(db: Db, b: any) {
+  const round = Number(b.round), limit = Math.min(Math.max(Number.isInteger(b.limit) ? b.limit : 50, 0), 200);
+  if (!Number.isSafeInteger(round)) throw new HttpError(400, "round");
+  const items = await db`select key, bound, done_recs, done_bytes, tries from scan_item where round = ${round} and state = 'pending'
+                         order by tries, ord limit ${limit}`;
+  return { items: items.map((i: any) => ({ key: i.key, bound: Number(i.bound), doneRecs: i.done_recs, doneBytes: Number(i.done_bytes), tries: i.tries })),
+           ...(await counts(db, round)) };
+}
+
+/** skip: the file cannot be reconciled (not a session, Legacy, child thread, gone): the item is closed with
+ *  its reason. fail: a try that did not land (network, lease, a file changing under the read): it stays. */
+export async function markItem(db: Db, b: any, how: "skip" | "fail") {
+  const round = Number(b.round);
+  if (!Number.isSafeInteger(round) || !isKey(b.key)) throw new HttpError(400, "round, key");
+  const reason = String(b.reason ?? "").slice(0, 200);
+  return db.begin(async (tx: Tx) => {
+    if (how === "skip") {
+      await tx`update scan_item set state = 'skipped', reason = ${reason} where round = ${round} and key = ${b.key} and state = 'pending'`;
+      await finishRound(tx, round);
+    } else await tx`update scan_item set tries = tries + 1, reason = ${reason} where round = ${round} and key = ${b.key} and state = 'pending'`;
+    return { ok: true };
+  });
+}
+
+/** Per kind: the open round's progress and the last finished round (§5.2 `/memex status`). */
+export async function scanStatus(db: Db, collector: string) {
+  const out: Record<string, { current: object | null; last: object | null }> = {};
+  for (const kind of KINDS) {
+    const [cur] = await db`select id from scan_round where collector = ${collector} and kind = ${kind} and finished_at is null`;
+    const [last] = await db`select id from scan_round where collector = ${collector} and kind = ${kind} and finished_at is not null
+                            order by id desc limit 1`;
+    out[kind] = { current: cur ? await counts(db, Number(cur.id)) : null, last: last ? await counts(db, Number(last.id)) : null };
+  }
+  return out;
 }
 
 /** Manifest of one collector's copy (§5.1): block hashes in file order, plus the last block in full. */
@@ -165,6 +253,14 @@ export const copyTombsOf = (harness: string, anc: string[], rec: string, raw: st
 export async function commit(db: Db, c: Commit): Promise<CommitResult> {
   if (!Number.isInteger(c.length) || c.length < 0 || c.changes.length > MAX_COMMIT_RECORDS)
     return { ok: false, reason: "bad-request", detail: `at most ${MAX_COMMIT_RECORDS} changes` };
+  const s = c.scan;
+  if (s) {
+    const ints = [s.round, s.fromRec, s.toRec, s.fromByte, s.toByte];
+    if (!ints.every((x) => Number.isSafeInteger(x) && x >= 0) || typeof s.key !== "string" || !s.key || s.key.length > 64
+        || s.toRec < s.fromRec || s.toRec - s.fromRec > MAX_COMMIT_RECORDS || s.toByte < s.fromByte || c.length !== s.toRec
+        || (s.prev !== null && typeof s.prev !== "string") || typeof s.eof !== "boolean" || c.changes.some((ch) => ch.pos < s.fromRec))
+      return { ok: false, reason: "bad-request", detail: "scan range" };
+  }
   let bytes = 0;
   for (const ch of c.changes) {
     bytes += ch.raw.length;
@@ -199,6 +295,27 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       await tx`update lease set done = true where id = ${c.leaseId}`;
       return { ok: false, reason: "not-granted" } as const;
     }
+    // A scan segment counts only from where the item's accepted progress stands, and only while the record it
+    // continues from is still the one this collector's copy holds there; otherwise nothing is applied.
+    let item: any;
+    if (s) {
+      [item] = await tx`select i.state, i.done_recs, i.done_bytes, i.bound, i.source from scan_item i join scan_round r on r.id = i.round
+                        where i.round = ${s.round} and i.key = ${s.key} and r.collector = ${l.collector} for update of i`;
+      const stale = !item || item.state !== "pending" || item.done_recs !== s.fromRec || Number(item.done_bytes) !== s.fromByte;
+      let restart = false;
+      if (!stale && item.source && item.source !== l.source) restart = true;
+      else if (!stale && s.fromRec > 0) {
+        const [a] = await tx`select hash from projection where source = ${l.source} and collector = ${l.collector} and pos = ${s.fromRec - 1}`;
+        restart = !a || a.hash !== s.prev;
+      }
+      if (stale || restart) {
+        if (restart) await tx`update scan_item set done_recs = 0, done_bytes = 0, source = null where round = ${s.round} and key = ${s.key}`;
+        const result = { ok: false, reason: stale ? "scan-stale" : "scan-restart" } as const;
+        await tx`insert into commit_result (commit_id, result) values (${c.commitId}, ${result})`;
+        await tx`update lease set done = true where id = ${c.leaseId}`;
+        return result;
+      }
+    }
     // Refuse forgotten records: this source's own (`canon:source:rec`), and copies of a forgotten fork
     // ancestor's own records, by content (`copy:ancestor:rec:content hash`, forget.ts), so an import after the
     // forget cannot bring them back as this session's own. Only this lineage's tombs count: a session outside it
@@ -232,8 +349,9 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
     };
     const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !copyKeys(ch).some((k) => tombs.has(k)) || !maybeCopy(ch)));
     // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
-    const dropped = await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}
-                             returning rec`;
+    // A scan segment covers only its range: rows past it are the live tail's, unless the file ends there.
+    const dropped = s && !s.eof ? [] : await tx`delete from projection where source = ${l.source} and collector = ${l.collector}
+                                                 and pos >= ${c.length} returning rec`;
     const touched = new Set<string>(dropped.map((r: any) => r.rec));
     if (keep.length) {
       const ids = keep.map((ch) => ch.id);
@@ -274,13 +392,20 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       if (withdrawn) await bump(tx, "s:" + l.source);
       if (added || withdrawn) await enqueue(tx, "project", l.source);
     }
-    if (c.scanChunks)
-      await tx`insert into scan_progress values (${l.source}, ${l.collector}, ${c.scanChunks})
-               on conflict (source, collector) do update set chunks = scan_progress.chunks + excluded.chunks`;
+    let scan: { state: string; doneRecs: number } | undefined;
+    if (s) {
+      // Done when the checked range reaches the round's bound: the bound itself, nothing complete before it
+      // (`last`: it falls inside a line still being written), or the end of the file.
+      const state = s.toByte >= Number(item.bound) || s.last === true || s.eof ? "done" : "pending";
+      await tx`update scan_item set done_recs = ${s.toRec}, done_bytes = ${s.toByte}, source = ${l.source}, state = ${state}, reason = null
+               where round = ${s.round} and key = ${s.key}`;
+      if (state === "done") await finishRound(tx, s.round);
+      scan = { state, doneRecs: s.toRec };
+    }
     if (c.leaf !== undefined)
       await tx`insert into collector_view values (${l.source}, ${l.collector}, ${c.leaf}, now())
                on conflict (source, collector) do update set leaf = excluded.leaf, at = excluded.at`;
-    const result = { ok: true, accepted: keep.length, refused: c.changes.length - keep.length, length: c.length } as const;
+    const result = { ok: true, accepted: keep.length, refused: c.changes.length - keep.length, length: c.length, ...(scan ? { scan } : {}) } as const;
     await tx`insert into commit_result (commit_id, result) values (${c.commitId}, ${result})`;
     await tx`update lease set done = true where id = ${c.leaseId}`;
     return result;

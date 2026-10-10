@@ -11,7 +11,8 @@
 // in CHUNK pieces and is handed over when the stream is asked for more after the last piece; at most one
 // CHUNK can still be in Bun's buffer then. Past the deadline the stream errors and the connection closes.
 import type { Db, Tx } from "./db.ts";
-import { blockRecords, BARRIER, commit, HttpError, manifest, releaseLease, requestLease, tryGrant } from "./sync.ts";
+import { blockRecords, BARRIER, commit, HttpError, manifest, markItem, nextItems, openRound, releaseLease, requestLease, scanStatus,
+         tryGrant } from "./sync.ts";
 import { unchanged } from "./derive.ts";
 const CHUNK = 16 * 1024;
 
@@ -64,9 +65,15 @@ route("POST", /^\/v1\/sync\/lease\/(\d+)\/commit$/, async (db, b, p) =>
     commitId: str(b.commitId, "commitId", 64),
     length: b.length,
     changes: Array.isArray(b.changes) ? b.changes : [],
-    scanChunks: Number.isInteger(b.scanChunks) ? b.scanChunks : undefined,
+    scan: b.scan && typeof b.scan === "object" ? b.scan : undefined,
     leaf: b.leaf === undefined ? undefined : b.leaf === null ? null : String(b.leaf),
   }));
+
+route("POST", /^\/v1\/scan\/open$/, async (db, b) => openRound(db, b));
+route("POST", /^\/v1\/scan\/next$/, async (db, b) => nextItems(db, b));
+route("POST", /^\/v1\/scan\/skip$/, async (db, b) => markItem(db, b, "skip"));
+route("POST", /^\/v1\/scan\/fail$/, async (db, b) => markItem(db, b, "fail"));
+route("GET", /^\/v1\/scan\/status$/, async (db, _b, _p, url) => scanStatus(db, str(url.searchParams.get("collector"), "collector", 128)));
 
 route("POST", /^\/v1\/search$/, async (db, b) => (await import("./search.ts")).search(db, b));
 route("POST", /^\/v1\/zoom$/, async (db, b) => (await import("./search.ts")).zoom(db, b));

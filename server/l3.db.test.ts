@@ -67,7 +67,7 @@ afterAll(async () => {
 const DEFAULT_EXTRACT = extract, DEFAULT_JUDGE = judge;
 beforeEach(async () => {
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access,
+                   scan_round, scan_item, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access,
                    session_card, start_snapshot, snapshot_refresh, l3_stmt, l3_seen, l3_rel restart identity cascade`);
   for (const [s, p, d] of [["personal", "sync", "memex"], ["personal", "derive", "llm"], ["personal", "derive", "embedding"], ["personal", "snapshot", "memex"]])
     await db`insert into grant_rule values (${s}, ${p}, ${d})`;
@@ -170,7 +170,7 @@ test("every pair in a scope is judged; a later replacement wins; any import orde
   ];
   const results: string[][] = [];
   for (const order of [[0, 1, 2], [2, 1, 0], [1, 2, 0]]) {
-    await db.unsafe(`truncate source, vis_version, tomb, lease, commit_result, body, projection, record, scan_progress, collector_view, job, span, view,
+    await db.unsafe(`truncate source, vis_version, tomb, lease, commit_result, body, projection, record, scan_round, scan_item, collector_view, job, span, view,
                      projected, lexical, span_summary, derive_skip, forest_node, forest_access, session_card, l3_stmt, l3_seen, l3_rel restart identity cascade`);
     for (const i of order) {
       await put(...sessions[i]);

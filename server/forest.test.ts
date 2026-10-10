@@ -60,7 +60,7 @@ afterAll(async () => {
 beforeEach(async () => {
   stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
-                   scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access, session_card
+                   scan_round, scan_item, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access, session_card
                    restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('personal', 'derive', 'llm'), ('personal', 'derive', 'embedding')`;
   process.env.MEMEX_IDLE_CLOSE_MS = String(10 * 60_000);
