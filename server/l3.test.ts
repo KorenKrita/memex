@@ -82,3 +82,19 @@ test("the next boundary is the earliest time a statement becomes eligible after 
   expect(nextBoundary(S, D("2026-01-06T00:00:00Z"))).toBe(D("2026-01-12T15:00:00Z"));
   expect(nextBoundary(S.slice(0, 1), D("2026-01-06T00:00:00Z"))).toBeNull();
 });
+
+test("a retraction withdraws a decision not yet in effect: it never takes effect", () => {
+  const a = st("A", "2026-01-01T00:00:00Z");
+  const b = st("B", "2026-01-05T00:00:00Z", "2026-01-12T00:00:00Z"); // "from the 12th, B"
+  const r = { ...st("R", "2026-01-06T00:00:00Z"), retraction: true }; // "cancel that"
+  const rels = [orient(b, a, "replaces"), orient(r, b, "retracts"), orient(r, a, "unrelated")];
+  expect(rels[1]).toEqual({ a: "R", b: "B", kind: "retracts" });
+  expect(orient(b, r, "retracts")).toEqual({ a: "R", b: "B", kind: "retracts" }); // either argument order
+  expect(ids(viewAt([a, b, r], rels, D("2026-01-05T12:00:00Z")))).toEqual(["A"]);
+  expect(ids(viewAt([a, b, r], rels, D("2026-01-13T00:00:00Z")))).toEqual(["A"]);
+});
+
+test("a retraction said before what it would retract withdraws nothing", () => {
+  const r = { ...st("R", "2026-01-01T00:00:00Z"), retraction: true }, b = st("B", "2026-01-02T00:00:00Z");
+  expect(orient(r, b, "retracts").kind).toBe("contradicts");
+});

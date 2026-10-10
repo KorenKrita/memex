@@ -5,7 +5,8 @@
 //   ((effective_from ?? stated_at) ≤ t). Its effective time is its own: a retroactive "last week already B"
 //   is not in effect before it was said.
 // - Relations: replaces(a, b), retracts(a, b) (a newer statement withdraws b), contradicts, unrelated. The
-//   model judges the kind; the direction comes from effective times here (orient), equal times → contradicts.
+//   model judges the kind; the direction comes from code (orient): a replacement by effective times (equal →
+//   contradicts), a withdrawal from the retraction to what it withdraws, said before it took effect or after.
 // - A statement suppresses another (replaces / retracts) only while it has power: eligible, readable, and not
 //   itself retracted by a statement with power. Being replaced does not take power away, so A → B → C does not
 //   bring A back; a retraction of B does (B no longer stands, so what B replaced stands again).
@@ -20,12 +21,20 @@ const effective = (s: Stmt) => s.effective_from ?? s.stated_at;
 /** The first time `s` is eligible. */
 const eligibleFrom = (s: Stmt) => Math.max(s.stated_at, effective(s));
 
-/** A judged relation in its fixed form: replaces/retracts point from the later-effective statement to the
- *  earlier one (no order between them → contradicts); symmetric kinds keep the ids in sorted order. */
+/** A judged relation in its fixed form. A withdrawal keeps who withdraws whom: the statement marked as a
+ *  retraction (or, with neither or both marked, the one said later) retracts the other, provided it was said
+ *  after it — it may withdraw a decision not yet in effect, so its direction is not taken from effective
+ *  times. A replacement points from the later-effective statement to the earlier one. No order → contradicts;
+ *  symmetric kinds keep the ids in sorted order. */
 export function orient(x: Stmt, y: Stmt, kind: RelKind): Rel {
   if (kind === "replaces" || kind === "retracts") {
-    const ex = effective(x), ey = effective(y);
-    if (ex !== ey) return ex > ey ? { a: x.id, b: y.id, kind } : { a: y.id, b: x.id, kind };
+    if (!!x.retraction !== !!y.retraction || kind === "retracts") {
+      const [r, t] = !!x.retraction !== !!y.retraction ? (x.retraction ? [x, y] : [y, x]) : x.stated_at > y.stated_at ? [x, y] : [y, x];
+      if (r.stated_at > t.stated_at) return { a: r.id, b: t.id, kind: "retracts" };
+    } else {
+      const ex = effective(x), ey = effective(y);
+      if (ex !== ey) return ex > ey ? { a: x.id, b: y.id, kind } : { a: y.id, b: x.id, kind };
+    }
     kind = "contradicts";
   }
   return x.id < y.id ? { a: x.id, b: y.id, kind } : { a: y.id, b: x.id, kind };
@@ -308,13 +317,8 @@ export async function runL3Pair(db: Db, job: Job) {
     if (!kinds.includes(s?.relation)) problems.push("relation not one of " + kinds.join(", "));
     if (problems.length) continue;
     const [p, q2] = c.rows.map(asStmt);
-    let kind: RelKind = s.same_object ? s.relation : "unrelated";
-    let rel = orient(p, q2, kind);
-    // The kind of suppression follows the later statement: a retraction retracts, anything else replaces.
-    if (rel.kind === "replaces" || rel.kind === "retracts") {
-      const later = rel.a === p.id ? p : q2;
-      rel = { ...rel, kind: later.retraction ? "retracts" : "replaces" };
-    }
+    const kind: RelKind = s.same_object ? s.relation : "unrelated";
+    const rel = orient(p, q2, kind);
     return publish(db, job, c.deps, async (tx) => {
       if ((await tx`select count(*)::int n from l3_stmt where id = any(${tx.array([x, y], "text")})`)[0].n !== 2) return;
       await tx`insert into l3_rel (key, a, b, kind, model, prompt_v) values (${job.key}, ${rel.a}, ${rel.b}, ${rel.kind}, ${model}, ${PAIR_VERSION})
