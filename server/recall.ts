@@ -21,6 +21,9 @@ import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
+import { canonOf } from "./project.ts";
+import { copyTomb } from "./forget.ts";
+import { contentHash } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
 const TAU = () => (process.env.MEMEX_RECALL_TAU ? Number(process.env.MEMEX_RECALL_TAU) : NaN); // [待标定] unset: not ready
@@ -51,7 +54,14 @@ export const tokens = (s: string) => Buffer.byteLength(s);
 export const queryOf = (input: string, prevUser: string, prevAssistant: string) =>
   [input, prevUser ? "previous user: " + prevUser : "", prevAssistant ? "previous reply: " + clip(prevAssistant, PREV_ASSISTANT) : ""].filter(Boolean).join("\n");
 
-type Req = { source: string; scope: string; user_rec: string; input: string; prev_user: string; prev_assistant: string; dests: string[]; leaf?: string; inContext?: string[] };
+type Ref = { rec: string; hash: string };
+type Req = { source: string; scope: string; user_rec: string; input: string; prev_user: string; prev_assistant: string; prev_user_ref: Ref | null; prev_assistant_ref: Ref | null;
+             dests: string[]; leaf?: string; inContext?: string[] };
+const refOf = (v: any, n: string): Ref | null => {
+  if (v === undefined || v === null) return null;
+  if (typeof v?.rec !== "string" || !v.rec || v.rec.length > 256 || typeof v?.hash !== "string" || !/^[0-9a-f]{64}$/.test(v.hash)) throw new HttpError(400, `${n} must be { rec, hash }`);
+  return { rec: v.rec, hash: v.hash };
+};
 function validate(b: any): Req {
   const s = (v: unknown, n: string, max: number, empty = false) => {
     if (v === undefined && empty) return "";
@@ -61,6 +71,7 @@ function validate(b: any): Req {
   return {
     source: s(b?.source, "source", 64), scope: s(b?.scope, "scope", 64), user_rec: s(b?.user_rec, "user_rec", 256),
     input: s(b?.input, "input", 8192, true), prev_user: s(b?.prev_user, "prev_user", 8192, true), prev_assistant: s(b?.prev_assistant, "prev_assistant", 65536, true),
+    prev_user_ref: refOf(b?.prev_user_ref, "prev_user_ref"), prev_assistant_ref: refOf(b?.prev_assistant_ref, "prev_assistant_ref"),
     dests: Array.isArray(b?.dests) ? b.dests : [],
     leaf: typeof b?.leaf === "string" ? b.leaf : undefined,
     inContext: Array.isArray(b?.inContext) ? b.inContext : undefined,
@@ -93,13 +104,16 @@ const readable = async (q: Tx, b: Awaited<ReturnType<typeof basis>>, row: any) =
 const out = (row: any, visible: boolean) =>
   visible && row.state !== "legacy" ? { state: row.state, text: row.text, query_hash: row.query_hash } : { state: "withdrawn", text: "", query_hash: row.query_hash };
 
-/** POST /v1/recall: { source, scope, user_rec, input, prev_user?, prev_assistant?, dests, leaf?, inContext? }. */
+/** POST /v1/recall: { source, scope, user_rec, input, prev_user?, prev_user_ref?, prev_assistant?, prev_assistant_ref?, dests, leaf?, inContext? }
+ *  (a ref = { rec: the host record id, hash: sha256 of the line as uploaded }). */
 export async function recall(db: Db, body: any): Promise<Guarded | object> {
   const until = Date.now() + BUDGET_MS();
   const r = validate(body);
   const input = r.input.trim();
   if (!input || input.startsWith("/")) return { state: "skipped" };
-  const query = queryOf(input, r.prev_user, r.prev_assistant);
+  // The previous exchange only with its reference (the record id and the hash of the line the host uploaded):
+  // text the server cannot tie to a current record is never sent (a host may still hold a withdrawn version).
+  const query = queryOf(input, r.prev_user_ref ? r.prev_user : "", r.prev_assistant_ref ? r.prev_assistant : "");
   const qh = sha(query);
   const q0 = { source: r.source, scope: r.scope, purpose: "recall", inContext: r.inContext };
   // An existing decision for this binding is the answer (a retry, a host replay): no search, no model.
@@ -114,7 +128,27 @@ export async function recall(db: Db, body: any): Promise<Guarded | object> {
       const keys = anc.map((x: any) => "s:" + x.id);
       const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((x: any) => [x.key, Number(x.v)]));
       const pin: Record<string, number> = { ...b.qDeps, ...Object.fromEntries(keys.map((k: string) => [k, vs.get(k) ?? 1])) };
-      if (!row) return { found: null, pin };
+      if (!row) {
+        // Each referenced record of the previous exchange: its canonical record (an inherited one is its fork
+        // ancestor's) still holds the referenced line, nothing of it tombed. Else the query is not of this state.
+        for (const ref of [r.prev_user_ref, r.prev_assistant_ref]) {
+          if (!ref) continue;
+          // The line as this session uploaded it, still its current record; then its canonical record (an
+          // inherited copy's is its fork ancestor's) not tombed, the ancestor in the pin.
+          const [cur] = await q`select b.raw, s.harness from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                                join source s on s.id = r.source where r.source = ${r.source} and r.rec = ${ref.rec} and r.state = 'ok' and r.hash = ${ref.hash}`;
+          if (!cur) return { found: null, pin, stale: true };
+          const [p] = await q`select keys from projected where source = ${r.source}`;
+          const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
+          const k = `${ref.rec}:${contentHash(JSON.parse(cur.raw))}`;
+          const canon = inherited.has(k) ? canonOf(cur.harness, inherited.get(k)!) : `${r.source}:${ref.rec}`;
+          const src = canon.slice(0, canon.indexOf(":"));
+          if (src !== r.source && !keys.includes("s:" + src)) return { found: null, pin, stale: true };
+          const tombed = await q`select 1 from tomb where key = any(${q.array(["source:" + src, "canon:" + canon, copyTomb(ref.rec, cur.raw)], "text")}) limit 1`;
+          if (tombed.length) return { found: null, pin, stale: true };
+        }
+        return { found: null, pin };
+      }
       if (row.query_hash !== qh) throw new HttpError(409, "this user record was recalled for another query");
       const v = await readable(q, b, row);
       return { found: { deps: v ? (row.deps as Record<string, number>) : b.qDeps, body: out(row, v) }, pin };
@@ -127,6 +161,7 @@ export async function recall(db: Db, body: any): Promise<Guarded | object> {
     throw e;
   }
   const found = first.found;
+  if (!found && "stale" in first) return { state: "query-stale" }; // nothing sent
   if (found) return new Guarded(found.deps, found.body, async () => (await recall(db, body)) as Guarded);
   const tau = TAU();
   if (!Number.isFinite(tau)) return { state: "not-ready" }; // τ not calibrated: no automatic injection, nothing stored

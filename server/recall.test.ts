@@ -109,6 +109,8 @@ async function putRaw(native: string, lines: string[], leaf?: string, parent: st
   return decl.source;
 }
 const me = sourceIdOf("pi", "me");
+/** A previous-exchange reference as the host sends it: the record id and the hash of the line it uploaded. */
+const ref = (raw: string) => ({ rec: JSON.parse(raw).id, hash: sha(raw) });
 const R = (user_rec: string, input: string, x: object = {}) => ({ source: me, scope: "personal", user_rec, input, dests: ["embedding", "rerank"], ...x });
 const ask = async (b: object) => {
   const r = await recall(db, b);
@@ -388,7 +390,8 @@ test("the querying session revised while its query embedding is out: nothing fro
     embedHook = null;
     await put("me", [["revised question", "old reply"]]);
   };
-  const d = await ask(R("u9", "zx-7781", { prev_user: "old question", prev_assistant: "old reply" }));
+  const d = await ask(R("u9", "zx-7781", { prev_user: "old question", prev_assistant: "old reply",
+    prev_user_ref: ref(msg("user", "u0", null, "old question")), prev_assistant_ref: ref(msg("assistant", "a0", "u0", "old reply")) }));
   expect(d.state).toBe("query-stale");
   expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
 });
@@ -598,7 +601,7 @@ test("the querying session revised before the search starts: refused at its firs
   };
   try {
     const k = calls.length;
-    expect((await ask(R("u9", "zx-7781", { prev_user: "old question" }))).state).toBe("query-stale");
+    expect((await ask(R("u9", "zx-7781", { prev_user: "old question", prev_user_ref: ref(msg("user", "u0", null, "old question")) }))).state).toBe("query-stale");
     expect(calls.length).toBe(k);
   } finally {
     rh.beforeSearch = async () => {};
@@ -618,9 +621,9 @@ async function forkMe() {
 
 test("a fork child's recall with an unchanged inherited context succeeds", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
-  await forkMe();
+  const { pl } = await forkMe();
   await drain(db);
-  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply" }));
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply", prev_user_ref: ref(pl[1]), prev_assistant_ref: ref(pl[2]) }));
   expect(d.state).toBe("shown");
 });
 
@@ -632,7 +635,7 @@ test("the fork ancestor holding the inherited context revised during the call: n
     embedHook = null;
     await putRaw("fpar", [pl[0], msg("user", "p0", null, "parent question revised"), pl[2]]);
   };
-  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply" }));
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply", prev_user_ref: ref(pl[1]), prev_assistant_ref: ref(pl[2]) }));
   expect(d.state).toBe("query-stale");
   expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
 });
@@ -716,4 +719,51 @@ test("saved in time but the answer blocked: the call times out, the decision sta
     rh.afterSave = async () => {};
     await one.close();
   }
+});
+
+// ---------- review stage 3: the previous exchange's provenance ----------
+
+const outbound = () => calls.map((c) => JSON.stringify(c.body)).join("\n");
+
+test("the previous exchange is used only with a reference that matches its current record", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const { pl } = await forkMe();
+  await drain(db);
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply", prev_user_ref: ref(pl[1]), prev_assistant_ref: ref(pl[2]) }));
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("parent question");
+  expect(outbound()).toContain("parent reply");
+});
+
+test("a previous exchange without a reference is not sent anywhere", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await forkMe();
+  await drain(db);
+  await ask(R("u9", "zx-7781", { prev_user: "UNPROVEN_TEXT", prev_assistant: "UNPROVEN_REPLY" }));
+  expect(outbound()).not.toContain("UNPROVEN");
+});
+
+test("the fork parent forgotten before the recall: its inherited exchange is not sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const { P, pl } = await forkMe();
+  await drain(db);
+  await forgetSource(db, P);
+  await drain(db);
+  calls = [];
+  await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply", prev_user_ref: ref(pl[1]), prev_assistant_ref: ref(pl[2]) }));
+  expect(outbound()).not.toContain("parent question");
+  expect(outbound()).not.toContain("parent reply");
+});
+
+test("the session's own previous exchange revised before the recall: the host's old text is not sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["OLD_QUESTION", "old reply"]]);
+  await drain(db);
+  const old = msg("user", "u0", null, "OLD_QUESTION");
+  await put("me", [["new question", "old reply"]]);
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u9", "zx-7781", { prev_user: "OLD_QUESTION", prev_user_ref: ref(old) }))).state).toBe("query-stale");
+  expect(outbound()).not.toContain("OLD_QUESTION");
+  expect(calls.length).toBe(0);
 });
