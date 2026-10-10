@@ -5,7 +5,8 @@
 // Policy file (~/.config/memex/policy.json, or MEMEX_POLICY):
 //   { "scopes": [ { "name": "personal", "paths": ["/Users/me/.pi/agent/sessions/--Users-me-Coding--"],
 //                   "allow": { "sync": ["memex"], "snapshot": ["memex"], "recall": ["memex", "embedding", "rerank"],
-//                              "tool": ["memex", "embedding", "rerank"] } } ] }
+//                              "tool": ["memex", "embedding", "rerank"], "import": ["memex"] } } ] }
+// "import": the scope may be imported by `memex import` (history, §5.4); live sync needs only "sync".
 // A session belongs to the first scope one of whose `paths` is a prefix of the session file's real path.
 // "memex" = the memex server itself; "embedding" / "rerank" = the external models the server would send the
 // query text to (the server checks these again on its own grant table; the client only narrows).
@@ -13,7 +14,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 
-export type Purpose = "sync" | "snapshot" | "recall" | "tool";
+export type Purpose = "sync" | "import" | "snapshot" | "recall" | "tool";
 export type Dest = "memex" | "llm" | "embedding" | "rerank";
 export type Scope = { name: string; paths: string[]; allow: Partial<Record<Purpose, Dest[]>> };
 export type Policy = { scopes: Scope[] };
