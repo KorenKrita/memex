@@ -1093,6 +1093,30 @@ test("a synced, readable input id with another text: refused; with its own text:
   expect((await ask(R("u7", "zx-7781 not yet synced"))).state).toBe("shown");
 });
 
+// ---------- review round 6 (N3): a content tomb does not override the child's own record ----------
+
+test("a child's own exchange with a forgotten parent's very ids and content: still the previous exchange for recall", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const P = sourceIdOf("pi", "npar");
+  const u0 = msg("user", "u0", null, "n root"), a0 = msg("assistant", "a0", "u0", "n root reply");
+  const own = (raw: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: "2026-02-01T00:00:00Z" }); // after the fork
+  const z1 = own(msg("user", "z1", "a0", "same-own-q")), z2 = own(msg("assistant", "z2", "z1", "same-own-r"));
+  await putRaw("npar", [header("npar"), u0, a0, z1, z2]);
+  await drain(db);
+  const kid = [JSON.stringify({ ...JSON.parse(header("me", { parentSession: "/x/npar.jsonl" })), timestamp: "2026-01-15T00:00:00Z" }), u0, a0, z1, z2];
+  await putRaw("me", kid, undefined, P);
+  await drain(db);
+  const owners = async () => ((await db`select keys from projected where source = ${me}`)[0].keys as [string, string][]).filter(([m]) => m.startsWith("z")).map(([, k]) => k.split("/")[0]);
+  expect(await owners()).toEqual(["me", "me"]);
+  await forgetSource(db, P); // its z1, z2 leave `copy:` content tombs that match the child's own entries
+  await drain(db);
+  expect((await db`select count(*)::int n from tomb where key like 'copy:z%'`)[0].n).toBe(2);
+  expect(await owners()).toEqual(["me", "me"]);
+  const req = R("u9", "zx-7781", { prev_user: "same-own-q", prev_user_ref: ref(z1), prev_assistant: "same-own-r", prev_assistant_ref: ref(z2) });
+  expect((await ask(req)).state).toBe("shown");
+  expect(outbound()).toContain("same-own-r");
+});
+
 test("a collector conflict on the parent link of an entry on the path: no trusted path, refused", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   const base = [header("me"), msg("user", "u0", null, "pc question"), msg("assistant", "a0", "u0", "pc reply"), msg("assistant", "a9", "u0", "pc other")];

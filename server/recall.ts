@@ -172,7 +172,11 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
             const same = (x: string) => (cur.harness === "pi" ? looseOf(JSON.parse(x)) : contentHash(JSON.parse(x)));
             if (!anc || same(anc.raw) !== same(cur.raw)) return { found: null, pin, stale: true };
           }
-          const tombed = await q`select 1 from tomb where key = any(${q.array(["source:" + src, "canon:" + canon, copyTomb(ref.rec, cur.raw)], "text")}) limit 1`;
+          // A content tomb (`copy:`) speaks only of copies: a Pi record the current projection holds as this session's
+          // own is not one (DESIGN §4.1: newer than the fork), whatever content a forgotten session had.
+          const own = cur.harness === "pi" && src === r.source;
+          const tk = ["source:" + src, "canon:" + canon, ...(own ? [] : [copyTomb(ref.rec, cur.raw)])];
+          const tombed = await q`select 1 from tomb where key = any(${q.array(tk, "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };
         }
         // The text sent is the referenced records' own, and they are the most recent exchange of the querying
