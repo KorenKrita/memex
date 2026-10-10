@@ -76,6 +76,11 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     // Start snapshots: the source's own, and every block made from it in anyone else's (text and all).
     await tx`delete from start_snapshot where source = ${source}`;
     await tx`delete from snapshot_refresh where source = ${source}`;
+    // Frozen recall: the source's own decisions and state; in other sessions, blocks made from it lose their
+    // text (their vectors keep s:<source>, so the bump below moves each holder's generation).
+    await tx`delete from recall_block where source = ${source}`;
+    await tx`delete from recall_state where source = ${source}`;
+    await tx`update recall_block set text = '', state = 'withdrawn' where deps ? ${"s:" + source}`;
     await tx`update start_snapshot set blocks = (select coalesce(jsonb_agg(x), '[]') from jsonb_array_elements(blocks) x where not (x->'deps' ? ${"s:" + source}))
              where blocks @? ${'$[*].deps."s:' + source + '"'}::jsonpath`;
     for (const t of ["lexical", "view", "projected", "span", "search_trace", "collector_view", "scan_progress", "projection", "record", "body"])

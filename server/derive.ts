@@ -155,21 +155,24 @@ export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isola
 type Reply = { status: number; json: any };
 /** POST `body` to `url` only if `deps` still hold: compare and hand to the transport under the shared barrier,
  *  wait for the reply outside it. "stale" = nothing was sent. */
-export async function guardedPost(db: Db, deps: Record<string, number>, url: string, key: string, body: object): Promise<Reply | "stale"> {
+export async function guardedPost(db: Db, deps: Record<string, number>, url: string, key: string, body: object, until?: number): Promise<Reply | "stale"> {
+  // `until` (epoch ms): an overall deadline the caller has to meet; every wait below ends by then.
+  const left = (cap: number) => (until === undefined ? cap : Math.max(1, Math.min(cap, until - Date.now())));
+  if (until !== undefined && Date.now() >= until) throw new Error("deadline passed");
   const u = new URL(url);
   const data = Buffer.from(JSON.stringify(body));
   await hooks.afterCheck();
   let reply!: Promise<Reply>;
   const sent = await db.begin(async (tx: Tx) => {
     // The whole held interval is bounded: waiting for the lock, the comparison, and the send below.
-    await tx`select set_config('lock_timeout', ${SEND_DEADLINE_MS + "ms"}, true), set_config('statement_timeout', ${SEND_DEADLINE_MS + "ms"}, true)`;
+    await tx`select set_config('lock_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true), set_config('statement_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
     if (!(await unchanged(tx, deps))) return false;
     const req = (u.protocol === "https:" ? https : http).request(u, {
       method: "POST",
       headers: { "content-type": "application/json", "content-length": data.length, authorization: "Bearer " + key },
     });
-    const deadline = setTimeout(() => req.destroy(new Error("response timeout")), RESPONSE_MS());
+    const deadline = setTimeout(() => req.destroy(new Error("response timeout")), left(RESPONSE_MS()));
     reply = new Promise<Reply>((ok, bad) => {
       req.on("response", (r) => {
         const parts: Buffer[] = [];
@@ -190,7 +193,7 @@ export async function guardedPost(db: Db, deps: Record<string, number>, url: str
     // Handed to the transport once the body is in the socket; past the send deadline we give up holding
     // the barrier (the request may still have reached the model, which counts as sent).
     await new Promise<void>((ok, bad) => {
-      const t = setTimeout(() => (req.destroy(new Error("send deadline")), bad(new Error("model send deadline"))), SEND_DEADLINE_MS);
+      const t = setTimeout(() => (req.destroy(new Error("send deadline")), bad(new Error("model send deadline"))), left(SEND_DEADLINE_MS));
       req.on("error", () => (clearTimeout(t), bad(new Error("model send failed"))));
       req.end(data, () => (clearTimeout(t), ok()));
     });

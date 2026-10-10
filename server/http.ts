@@ -69,6 +69,8 @@ route("POST", /^\/v1\/search$/, async (db, b) => (await import("./search.ts")).s
 route("POST", /^\/v1\/zoom$/, async (db, b) => (await import("./search.ts")).zoom(db, b));
 route("POST", /^\/v1\/grep$/, async (db, b) => (await import("./search.ts")).grep(db, b));
 route("POST", /^\/v1\/snapshot$/, async (db, b) => (await import("./snapshot.ts")).startSnapshot(db, b));
+route("POST", /^\/v1\/recall$/, async (db, b) => (await import("./recall.ts")).recall(db, b));
+route("POST", /^\/v1\/recall\/blocks$/, async (db, b) => (await import("./recall.ts")).blocks(db, b));
 route("POST", /^\/v1\/forget$/, async (db, b) =>
   (await import("./forget.ts")).forgetSource(db, str(b.source, "source", 64)));
 

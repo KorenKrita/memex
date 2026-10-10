@@ -153,7 +153,7 @@ export async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purp
 }
 
 /** Embed the query (guarded by the embedding destination's version), or say why not. */
-async function embedQuery(db: Db, r: SearchReq): Promise<{ v?: number[]; skipped?: string }> {
+async function embedQuery(db: Db, r: SearchReq, until?: number): Promise<{ v?: number[]; skipped?: string; dv?: number }> {
   if (!r.dests.includes("embedding")) return { skipped: "not-requested" };
   const url = process.env.MEMEX_EMBED_URL, model = process.env.MEMEX_EMBED_MODEL, key = process.env.MEMEX_EMBED_KEY;
   if (!url || !model || !key) return { skipped: "not-configured" };
@@ -165,11 +165,12 @@ async function embedQuery(db: Db, r: SearchReq): Promise<{ v?: number[]; skipped
   });
   if (!c) return { skipped: "not-granted" };
   try {
-    const res = await guardedPost(db, c, url.replace(/\/+$/, "") + "/embeddings", key, { model, input: [r.query], dimensions: EMBED_DIM, encoding_format: "float" });
+    const res = await guardedPost(db, c, url.replace(/\/+$/, "") + "/embeddings", key, { model, input: [r.query], dimensions: EMBED_DIM, encoding_format: "float" }, until);
     if (res === "stale") return { skipped: "revoked" };
     const v = res.json?.data?.[0]?.embedding;
     if (res.status !== 200 || !Array.isArray(v) || v.length !== EMBED_DIM) return { skipped: `endpoint-${res.status}` };
-    return { v };
+    // The destination version the query text was sent under (a frozen recall depends on it).
+    return { v, dv: c["d:embedding"] };
   } catch {
     return { skipped: "endpoint-error" };
   }
@@ -459,15 +460,18 @@ export function mergeLabels(ls: string[]): string {
 
 export const searchHooks = { beforeTrace: async () => {} };
 
-export async function search(db: Db, body: unknown): Promise<Guarded> {
+/** `until` (epoch ms, optional): an overall deadline; past it the search fails instead of finishing late. */
+export async function search(db: Db, body: unknown, until?: number): Promise<Guarded> {
   const r = validate(body);
+  const late = () => until !== undefined && Date.now() >= until;
   await snapshot(db, (q) => basis(q, r)); // the query's own authorization, before its text goes anywhere
   const t0 = performance.now();
-  const emb = await embedQuery(db, r);
+  const emb = await embedQuery(db, r, until);
   const tEmbed = performance.now() - t0;
   let tries = 0;
   const run = async (): Promise<Guarded> => {
     if (++tries > 3) throw new HttpError(503, "state kept changing; retry");
+    if (late()) throw new HttpError(504, "deadline");
     const t1 = performance.now();
     const s = await snapshot(db, async (q) => {
       const b = await basis(q, r);
@@ -522,7 +526,7 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
             model: process.env.MEMEX_RERANK_MODEL,
             query: "Find records that state the specific fact, decision, step or event needed to answer: " + r.query,
             documents: docs,
-          });
+          }, until);
           const out = res === "stale" ? null : res.status === 200 ? (res.json?.results ?? res.json?.data) : null;
           if (!Array.isArray(out)) rerankSkip = res === "stale" ? "state-changed" : `endpoint-${res.status}`;
           else for (const x of out) if (Number.isInteger(x.index) && x.index < scores.length) scores[x.index] = Number(x.relevance_score ?? x.score);
@@ -533,6 +537,10 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
       }
     }
     const tRerank = performance.now() - t2;
+    // The destinations the query text actually went to, at the versions it was sent under: a result that used
+    // their output depends on them (a later revoke withdraws a frozen recall made with them).
+    if (!rerankSkip) deps["d:rerank"] = s.dRerank;
+    if (emb.v) deps["d:embedding"] = emb.dv!;
     // After rerank: off-path evidence and a session's consecutive places are down-weighted (§6.3).
     const base = rc.chosen.map((c, i) => ({ c, i, score: rerankSkip ? c.fused : scores[i]! }));
     base.sort((x, y) => y.score - x.score || x.i - y.i);
@@ -559,6 +567,8 @@ export async function search(db: Db, body: unknown): Promise<Guarded> {
         attachments: c.attach,
         incomplete: [...new Set(c.incomplete)],
         injectable: !rerankSkip && !c.incomplete.length,
+        // Versions of every source this result carries (no text): what a frozen use of it depends on.
+        deps: Object.assign({}, ...[...c.sources].map((x) => b.valid.get(x)!.deps)) as Record<string, number>,
         // Historical statements, not the current state (§6.3).
         stated: true,
       };
