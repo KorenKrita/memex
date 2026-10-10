@@ -20,7 +20,7 @@ import { type Db, type Tx } from "./db.ts";
 import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
-import { basis, search } from "./search.ts";
+import { basis, search, targetView } from "./search.ts";
 import { canonOf } from "./project.ts";
 import { copyTomb } from "./forget.ts";
 import { contentHash } from "../dryrun/dryrun.ts";
@@ -158,38 +158,32 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const tombed = await q`select 1 from tomb where key = any(${q.array(["source:" + src, "canon:" + canon, copyTomb(ref.rec, cur.raw)], "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };
         }
-        // The text sent is the referenced records' own (the current projection's lexical text for those keys), with
-        // the referenced roles, the reply following the message on one of the session's views — not merely a
-        // string that came with a valid reference.
-        const [p] = await q`select keys from projected where source = ${r.source} and status = 'ok'`;
-        const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
-        const keyOf = async (ref: Ref) => {
-          const [cur] = await q`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
-                                where r.source = ${r.source} and r.rec = ${ref.rec} and r.hash = ${ref.hash}`;
-          const k = `${ref.rec}:${contentHash(JSON.parse(cur.raw))}`;
-          return (inherited.get(k) ?? `${(await q`select native_id from source where id = ${r.source}`)[0].native_id}/${k}`) + "#";
-        };
-        const textOf = async (prefix: string, kind: string) => {
-          // An inherited record's text is indexed under the fork ancestor that owns it (the key names it).
+        // The text sent is the referenced records' own, and they are the most recent exchange of the querying
+        // branch: the view of `leaf` (else the session's inferred tail), up to the current input if already
+        // synced. Keys come from that view as projected (harness-specific), never rebuilt here.
+        if (r.prev_user_ref || r.prev_assistant_ref) {
+          const t = await targetView(q, r.source, r.leaf ? { tip: r.leaf, at: null } : undefined);
+          if (!t.v) return { found: null, pin, stale: true };
+          const [vr] = await q`select recs from view where source = ${r.source} and tip = ${t.v.tip}`;
+          const all = (vr?.recs ?? []) as { key: string; id: string; kind: string }[];
+          const at = all.findIndex((x) => x.id === r.user_rec);
+          const recs = at < 0 ? all : all.slice(0, at);
+          const u = recs.findLastIndex((x) => x.kind === "user");
+          const a = recs.findLastIndex((x) => x.kind === "assistant");
+          const lastUser = u >= 0 ? recs[u].id : null;
+          const reply = a > u && u >= 0 ? recs[a].id : null;
+          if (r.prev_user_ref && r.prev_user_ref.rec !== lastUser) return { found: null, pin, stale: true };
+          if (r.prev_assistant_ref && r.prev_assistant_ref.rec !== reply) return { found: null, pin, stale: true };
+          // An inherited record's text is indexed under the fork ancestor that owns it.
           const owners = [r.source, ...keys.map((k: string) => k.slice(2))];
-          const rows = await q`select string_agg(text, '' order by key, part) t from lexical where source = any(${q.array(owners, "text")})
-                               and key like ${prefix + "%"} and kind = ${kind} group by source limit 1`;
-          return rows[0]?.t as string | null;
-        };
-        const uk = r.prev_user_ref ? await keyOf(r.prev_user_ref) : null;
-        const ak = r.prev_assistant_ref ? await keyOf(r.prev_assistant_ref) : null;
-        if (uk && (await textOf(uk, "user")) !== r.prev_user) return { found: null, pin, stale: true };
-        if (ak && (await textOf(ak, "assistant")) !== r.prev_assistant) return { found: null, pin, stale: true };
-        if (uk && ak) {
-          // On some view of this session, the reply is the assistant record right after the message's last part.
-          const views = await q`select recs from view where source = ${r.source}`;
-          const follows = views.some((v: any) => {
-            const recs = v.recs as { key: string; kind: string }[];
-            const i = recs.findLastIndex((x) => x.key.startsWith(uk));
-            const j = recs.findIndex((x) => x.key.startsWith(ak));
-            return i >= 0 && j > i && recs.slice(i + 1, j).every((x) => x.kind !== "user" && x.kind !== "assistant");
-          });
-          if (!follows) return { found: null, pin, stale: true };
+          const textOf = async (id: string, kind: string) => {
+            const ks = [...new Set(recs.filter((x) => x.id === id && x.kind === kind).map((x) => x.key))];
+            const rows = await q`select key, text from lexical where source = any(${q.array(owners, "text")}) and key = any(${q.array(ks, "text")})
+                                 and kind = ${kind} order by part`;
+            return ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
+          };
+          if (r.prev_user_ref && (await textOf(lastUser!, "user")) !== r.prev_user) return { found: null, pin, stale: true };
+          if (r.prev_assistant_ref && (await textOf(reply!, "assistant")) !== r.prev_assistant) return { found: null, pin, stale: true };
         }
         return { found: null, pin };
       }

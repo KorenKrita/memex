@@ -910,5 +910,68 @@ test("references of the wrong role, or an assistant reply not following the refe
   const u0 = msg("user", "u0", null, "first"), a0 = msg("assistant", "a0", "u0", "reply one"), a1 = msg("assistant", "a1", "u1", "reply two");
   expect((await ask(R("u9", "zx-7781", { prev_user: "reply one", prev_user_ref: ref(a0) }))).state).toBe("query-stale");
   expect((await ask(R("u8", "zx-7781", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply two", prev_assistant_ref: ref(a1) }))).state).toBe("query-stale");
-  expect((await ask(R("u7", "zx-7781", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("shown");
+  // An earlier exchange of the same branch is not the previous one; the most recent is.
+  expect((await ask(R("u7", "zx-7781", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("query-stale");
+  expect((await ask(R("u7", "zx-7781", { prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("query-stale");
+  const u1 = msg("user", "u1", "a0", "second");
+  calls = [];
+  expect((await ask(R("u6", "zx-7781", { prev_user: "second", prev_user_ref: ref(u1), prev_assistant: "reply two", prev_assistant_ref: ref(a1) }))).state).toBe("shown");
+  expect(outbound()).toContain("second");
+  expect(outbound()).toContain("reply two");
+});
+
+// ---------- review round 3: the previous exchange is the querying branch's most recent ----------
+
+test("a previous exchange from another branch than the request's leaf: refused, one reference or two", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  // Branch L: u0 → a0 → u1 → a1; branch R: u0 → a0 → u2 → a2.
+  const L = [header("me"), msg("user", "u0", null, "root"), msg("assistant", "a0", "u0", "root reply"),
+    msg("user", "u1", "a0", "OFF_BRANCH_QUESTION"), msg("assistant", "a1", "u1", "OFF_BRANCH_REPLY"),
+    msg("user", "u2", "a0", "right question"), msg("assistant", "a2", "u2", "right reply")];
+  await putRaw("me", L, "a2");
+  await drain(db);
+  calls = [];
+  for (const x of [
+    { prev_user: "OFF_BRANCH_QUESTION", prev_user_ref: ref(L[3]), prev_assistant: "OFF_BRANCH_REPLY", prev_assistant_ref: ref(L[4]) },
+    { prev_user: "OFF_BRANCH_QUESTION", prev_user_ref: ref(L[3]) },
+    { prev_assistant: "OFF_BRANCH_REPLY", prev_assistant_ref: ref(L[4]) },
+  ])
+    expect((await ask(R("u9" + Object.keys(x).length, "zx-7781", { leaf: "a2", ...x }))).state).toBe("query-stale");
+  expect(outbound()).not.toContain("OFF_BRANCH");
+  // The leaf's own most recent exchange is used.
+  const d = await ask(R("u8", "zx-7781", { leaf: "a2", prev_user: "right question", prev_user_ref: ref(L[5]), prev_assistant: "right reply", prev_assistant_ref: ref(L[6]) }));
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("right reply");
+  // A leaf the projection does not know: no branch, nothing sent.
+  calls = [];
+  expect((await ask(R("u7", "zx-7781", { leaf: "nope", prev_user: "right question", prev_user_ref: ref(L[5]) }))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
+test("the current input already synced: the previous exchange is the one before it, not the input itself", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["first", "reply one"], ["zx-7781 now", "pending"]]);
+  await drain(db);
+  const u0 = msg("user", "u0", null, "first"), a0 = msg("assistant", "a0", "u0", "reply one");
+  expect((await ask(R("u1", "zx-7781 now", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("shown");
+});
+
+test("a Codex session's previous exchange with valid references: sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const cid = "22222222-2222-2222-2222-222222222222";
+  const cm = (ordinal: number, role: string, text: string) =>
+    JSON.stringify({ timestamp: T, ordinal, type: "response_item", payload: { type: "message", role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text }] } });
+  const lines = [JSON.stringify({ timestamp: T, ordinal: 0, type: "session_meta", payload: { id: cid, history_mode: "paginated", source: "cli", cwd: "/x" } }),
+    cm(1, "user", "CODEX_PREV_QUESTION"), cm(2, "assistant", "CODEX_PREV_REPLY")];
+  const decl = { source: sourceIdOf("codex", cid), harness: "codex" as const, nativeId: cid, scope: "personal", parent: null };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  expect((await commit(db, { leaseId: l, commitId: `r${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: String(pos), hash: sha(raw), raw })) })).ok).toBe(true);
+  await drain(db);
+  calls = [];
+  const cref = (raw: string) => ({ rec: String(JSON.parse(raw).ordinal), hash: sha(raw) });
+  const d = await ask({ ...R("9", "zx-7781"), source: decl.source, prev_user: "CODEX_PREV_QUESTION", prev_user_ref: cref(lines[1]), prev_assistant: "CODEX_PREV_REPLY", prev_assistant_ref: cref(lines[2]) });
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("CODEX_PREV_QUESTION");
+  expect(outbound()).toContain("CODEX_PREV_REPLY");
 });
