@@ -623,3 +623,48 @@ test("the user card over a revoked scope stays dropped when it is granted again"
   expect((await snap()).text).not.toContain("work rule");
   expect((await snap({ refresh_id: "r" })).text).toContain("work rule");
 });
+
+// ---------- re-review ----------
+
+test("a revision that moves the version in sync only (the header): the statement is readable again after projection", async () => {
+  const s = await put("a", [["PREF TOPICpm use pnpm", "ok", T0], ["later", "ok", T1]]);
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICpm use pnpm"]);
+  // The same session with another cwd in its header: sync withdraws the old header line.
+  const lines = [...s.lines];
+  lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: "/elsewhere" });
+  const l = await requestLease(db, { source: s.source, harness: "pi" as const, nativeId: "a", scope: "personal", parent: null, meta: { repo: "repo-a" } }, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: `h${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICpm use pnpm"]);
+});
+
+test("a pair job meeting a statement whose vector is only stale waits and is judged after renewal", async () => {
+  const turns: [string, string, string][] = [["PREF TOPICpm use npm", "ok", T0], ["PREF TOPICpm NEW use pnpm", "ok", T1], ["last", "ok", T2]];
+  await put("a", turns);
+  await drain(db, ["project", "summarize", "embed", "l3"]); // the pair is queued, not judged
+  expect((await db`select count(*)::int n from job where kind = 'l3pair' and state = 'queued'`)[0].n).toBe(1);
+  await put("a", [turns[0], turns[1], ["last revised", "ok", T2]]); // unrelated revision: versions move
+  await drain(db, ["l3pair"]); // before projection renewed them
+  expect((await db`select count(*)::int n from job where kind = 'l3pair' and state = 'queued'`)[0].n).toBe(1); // waits, not done
+  await drain(db);
+  await db`update job set not_before = now() where state = 'queued'`; // its retry is due
+  await drain(db);
+  expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(1);
+  expect(await texts()).toEqual(["PREF TOPICpm NEW use pnpm"]);
+});
+
+test("an upgrade from statements without generation data: they are read again, not stranded", async () => {
+  await put("a", [["PREF TOPICpm use pnpm", "ok", T0]]);
+  await drain(db);
+  // As stored before generation data existed.
+  await db`update l3_stmt set input_fp = '', deps = '{}', scopes = '{}'`;
+  await db`update l3_seen set span = '', input_fp = ''`;
+  await db`delete from job where kind like 'l3%'`;
+  expect(await texts()).toEqual([]);
+  await migrate(db);
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICpm use pnpm"]);
+  expect((await db`select count(*)::int n from l3_stmt`)[0].n).toBe(1);
+});

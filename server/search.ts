@@ -804,7 +804,7 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         // Paged by leaf index (`offset`): a continuation needs the view key it was given (a revised view is refused).
         if (offset > 0 && !vkIn) throw new HttpError(400, "a continuation needs view_key");
         const f = await forestView(q, leaves, (x) => b.valid.has(x), sel ?? undefined, offset);
-        let room = ZOOM_PAGE, next: number | null = null;
+        let room = limit, next: number | null = null; // the requested page (bytes), at least one item for progress
         const page: typeof f.items = [];
         for (const x of f.items) {
           const cost = Buffer.byteLength(x.text ?? "") + 64;

@@ -111,6 +111,11 @@ alter table l3_stmt add column if not exists input_fp text not null default '';
 alter table l3_stmt add column if not exists scopes text[] not null default '{}';
 alter table l3_seen add column if not exists span text not null default '';
 alter table l3_seen add column if not exists input_fp text not null default '';
+-- Statements and claims stored before generation data existed cannot be shown to hold: they go (their text is
+-- never stamped with today's provenance), and their spans are read again by the backfill below.
+delete from l3_rel r using l3_stmt s where s.input_fp = '' and (r.a = s.id or r.b = s.id);
+delete from l3_stmt where input_fp = '';
+delete from l3_seen where span = '';
 -- Spans closed before L3 existed (or whose extraction was lost): queue them, once (idempotent on every start).
 insert into job (kind, key)
   select 'l3', s.id from span s
@@ -312,10 +317,11 @@ async function dropStale(tx: Tx, src: string, rec: string) {
 async function unreadable(q: Tx, s: any, purpose: string, dest: string): Promise<string | null> {
   if ((await q`select 1 from tomb where key = any(${q.array(["source:" + s.src, `canon:${s.src}:${s.rec}`], "text")}) limit 1`).length) return "forgotten";
   if (!(await q`select 1 from record where source = ${s.src} and rec = ${s.rec} and state = 'ok' and hash = ${s.rec_hash}`).length) return "record-changed";
-  const [sp] = await q`select sp.source, p.deps from span sp join projected p on p.source = sp.source and p.status = 'ok'
+  const [sp] = await q`select sp.source, p.deps from span sp left join projected p on p.source = sp.source and p.status = 'ok'
                        where sp.id = ${s.span} and sp.input_fp = ${s.input_fp}`;
-  if (!sp || !(await unchanged(q, sp.deps))) return "input-changed";
-  if (!(await unchanged(q, sDeps(s.deps)))) return "input-changed";
+  if (!sp) return "input-changed"; // for good: that input is no more
+  // Possibly for a while only: a projection not caught up, or a version moved elsewhere (renewed if the input holds).
+  if (!sp.deps || !(await unchanged(q, sp.deps)) || !(await unchanged(q, sDeps(s.deps)))) return "stale";
   const scopes: string[] = s.scopes?.length ? s.scopes : [s.auth_scope];
   if ((await q`select count(*)::int n from grant_rule where scope = any(${q.array(scopes, "text")}) and purpose = ${purpose} and dest = ${dest}`)[0].n !== scopes.length)
     return `not-granted:${dest}`;
@@ -342,6 +348,7 @@ export async function runL3Pair(db: Db, job: Job) {
       for (const r of rows) {
         const why = await unreadable(q, r, "derive", "llm");
         if (why === "forgotten" || why === "input-changed" || why === "record-changed") return { ok: false as const, gone: true }; // for good
+        if (why === "stale") return { ok: false as const, later: true };
         if (why) return { ok: false as const, reason: why, scopes: [...new Set<string>(rows.flatMap((r: any) => (r.scopes?.length ? r.scopes : [r.auth_scope])))] };
       }
       const keys: string[] = [...new Set<string>(rows.flatMap((r: any) => ["s:" + r.src, ...Object.keys(sDeps(r.deps))])), "d:llm"];
@@ -350,6 +357,12 @@ export async function runL3Pair(db: Db, job: Job) {
     });
     if (!c.ok) {
       if ("gone" in c) return db.begin((tx: Tx) => finishJob(tx, job)); // forgotten, or judged already
+      if ("later" in c)
+        return db.begin(async (tx: Tx) => {
+          const fin = await finishJob(tx, job);
+          if (fin === "done") await enqueue(tx, job.kind, job.key, {}, 2_000); // after the renewal has had its turn
+          return fin;
+        });
       return skip(db, job, c.reason!, c.scopes as string[]);
     }
     const show = (r: any, n: number) =>

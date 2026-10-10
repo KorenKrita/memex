@@ -26,7 +26,7 @@ export class Guarded {
               readonly until?: number, readonly late?: object) {}
 }
 /** Test seam: runs after the comparison, before the body is written (where a writer must wait). */
-export const httpHooks = { beforeGuard: async () => {}, beforeDeliver: async () => {} };
+export const httpHooks = { beforeGuard: async () => {}, beforeDeliver: async () => {}, beforePiece: async () => {} };
 export type Route = (db: Db, body: any, params: string[], url: URL) => Promise<unknown>;
 const routes: [string, RegExp, Route][] = [];
 export function route(method: string, pattern: RegExp, fn: Route) {
@@ -120,7 +120,13 @@ async function deliver(db: Db, g: Guarded): Promise<Response> {
         }, Math.max(1, until - Date.now()));
         const body = new ReadableStream<Uint8Array>({
           start: (c) => void (ctl = c),
-          pull: (c) => {
+          pull: async (c) => {
+            await httpHooks.beforePiece();
+            // The deadline is checked on every piece, not left to a timer (a stalled event loop runs pulls first).
+            if (Date.now() >= until) {
+              try { c.error(new Error("deliver deadline")); } catch {}
+              return stop(new Error("deliver deadline"));
+            }
             if (at >= data.length) {
               clearTimeout(timer);
               c.close();

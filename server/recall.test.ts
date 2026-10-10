@@ -824,3 +824,36 @@ test("over HTTP, a decision delivered past the recall deadline is not shown; a r
     await api.stop();
   }
 });
+
+test("over HTTP, an event-loop stall after the response is prepared: no recall content past the deadline", async () => {
+  process.env.MEMEX_RECALL_MS = "800";
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  const api = await serve(db, { port: 0 });
+  const key = await addApiKey(db, "t");
+  let t0 = 0;
+  httpHooks.beforePiece = async () => {
+    httpHooks.beforePiece = async () => {};
+    while (Date.now() - t0 < 900) {} // a synchronous stall past the deadline
+  };
+  try {
+    t0 = Date.now();
+    // Past the deadline the stream is broken off: the client gets an error or a cut body, never the content.
+    const text = await fetch(`http://127.0.0.1:${api.port}/v1/recall`, { method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" }, body: JSON.stringify(R("u1", "zx-7781")) })
+      .then((res) => res.text()).catch(() => "");
+    expect(text).not.toContain("zx-7781");
+  } finally {
+    httpHooks.beforePiece = async () => {};
+    await api.stop();
+  }
+});
+
+test("the fork parent's inherited record revised before the recall, the child not projected again yet: its copy is not sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const { pl } = await forkMe();
+  await drain(db);
+  await putRaw("fpar", [pl[0], msg("user", "p0", null, "PARENT_REVISED"), pl[2]]); // committed, not projected
+  calls = [];
+  await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_user_ref: ref(pl[1]) }));
+  expect(outbound()).not.toContain("parent question");
+});

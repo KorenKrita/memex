@@ -141,12 +141,20 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const [cur] = await q`select b.raw, s.harness from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                                 join source s on s.id = r.source where r.source = ${r.source} and r.rec = ${ref.rec} and r.state = 'ok' and r.hash = ${ref.hash}`;
           if (!cur) return { found: null, pin, stale: true };
-          const [p] = await q`select keys from projected where source = ${r.source}`;
+          // The mapping from a projection that is current (its vector, the fork parent's included, still holds).
+          const [p] = await q`select keys, deps from projected where source = ${r.source} and status = 'ok'`;
+          if (!p || !(await unchanged(q, p.deps))) return { found: null, pin, stale: true };
           const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
           const k = `${ref.rec}:${contentHash(JSON.parse(cur.raw))}`;
           const canon = inherited.has(k) ? canonOf(cur.harness, inherited.get(k)!) : `${r.source}:${ref.rec}`;
           const src = canon.slice(0, canon.indexOf(":"));
           if (src !== r.source && !keys.includes("s:" + src)) return { found: null, pin, stale: true };
+          if (src !== r.source) {
+            // An inherited copy: the ancestor's own record still holds the same content now.
+            const [anc] = await q`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                                  where r.source = ${src} and r.rec = ${ref.rec} and r.state = 'ok'`;
+            if (!anc || contentHash(JSON.parse(anc.raw)) !== contentHash(JSON.parse(cur.raw))) return { found: null, pin, stale: true };
+          }
           const tombed = await q`select 1 from tomb where key = any(${q.array(["source:" + src, "canon:" + canon, copyTomb(ref.rec, cur.raw)], "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };
         }

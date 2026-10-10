@@ -269,18 +269,19 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     const remapped = !!before && (before.status !== a.status || (before.keys === null) !== (a.keys === null)
       || [...oldMap].some(([k, v]) => newMap.get(k) !== v));
     const grown = !!before && newMap.size > oldMap.size;
-    if (withdrawn || remapped) {
-      await bump(tx, "s:" + source);
-      // L3 statements whose vector holds this source: looked at again (renewed if their input is the same,
-      // read again otherwise) — a version moved by a change elsewhere must not hide them for good.
-      for (const r of await tx`select distinct span from l3_stmt where deps ? ${"s:" + source}`) await enqueue(tx, "l3", r.span);
-    }
+    if (withdrawn || remapped) await bump(tx, "s:" + source);
     // Read-side validity (search.ts): what this projection was built from. It holds while every entry is
     // current; any later commit, forget or parent change makes it stale until the next projection.
     const [sv] = await tx`select v from vis_version where key = ${"s:" + source}`;
     const deps: Record<string, number> = { ["s:" + source]: Number(sv?.v ?? 1) };
     if (a.parentId) Object.assign(deps, (await tx`select deps from projected where source = ${a.parentId}`)[0]?.deps ?? {});
     await tx`update projected set deps = ${deps} where source = ${source}`;
+    // L3 statements whose vector holds an older version of this source (moved here or already in sync): looked
+    // at again — renewed if their input is the same, read again otherwise; a version moved by a change elsewhere
+    // must not hide them for good.
+    for (const r of await tx`select distinct span from l3_stmt where (deps->>${"s:" + source})::bigint is distinct from ${deps["s:" + source]}::bigint
+                             and deps ? ${"s:" + source}`)
+      await enqueue(tx, "l3", r.span);
     const same = (x: any, y: any) => JSON.stringify(Object.entries(x ?? {}).sort()) === JSON.stringify(Object.entries(y ?? {}).sort());
     // Children that fork from this source re-project when its projection, its basis or its map changes
     // (new parent records can take over records a child had as its own: the child's remap moves its version).

@@ -1587,3 +1587,21 @@ test("a continuation needs the view key; a revised view refuses it", async () =>
   await drain(db);
   await expect(zoom(db, T0({ id: "session:" + s, view_key: p1.view_key, offset: 2 }))).rejects.toThrow();
 });
+
+test("forest pages follow the requested limit (one item at least, for progress)", async () => {
+  const words = Array.from({ length: 16 }, (_, i) => `v${i}` + "x".repeat(600));
+  summaryOf = (input) => (/kind="user">\n?([^<]*)/.exec(input.slice(input.indexOf("<input>")))?.[1]?.trim() ?? "s").slice(0, 590);
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1";
+  let s: string;
+  try {
+    s = await put("pl", lin("pl", [...words, "tail"]));
+    await drain(db);
+  } finally {
+    process.env.MEMEX_FOREST_HOT_DAYS = "100000";
+  }
+  const p = await zb({ id: "session:" + s, limit: 1024 });
+  expect(p.items.length).toBeLessThanOrEqual(2);
+  expect(p.more).toBe(true);
+  const one = await zb({ id: "session:" + s, limit: 10 });
+  expect(one.items.length).toBe(1);
+});
