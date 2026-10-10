@@ -857,3 +857,26 @@ test("the fork parent's inherited record revised before the recall, the child no
   await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_user_ref: ref(pl[1]) }));
   expect(outbound()).not.toContain("parent question");
 });
+
+// ---------- re-review 2: the sent text is the referenced record's ----------
+
+test("a valid reference paired with other text: the text is not sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["current question", "current reply"]]);
+  await drain(db);
+  calls = [];
+  const d = await ask(R("u9", "zx-7781", { prev_user: "WITHDRAWN_OTHER_TEXT", prev_user_ref: ref(msg("user", "u0", null, "current question")) }));
+  expect(d.state).toBe("query-stale");
+  expect(outbound()).not.toContain("WITHDRAWN_OTHER_TEXT");
+  expect(calls.length).toBe(0);
+});
+
+test("references of the wrong role, or an assistant reply not following the referenced user message: refused", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["first", "reply one"], ["second", "reply two"]]);
+  await drain(db);
+  const u0 = msg("user", "u0", null, "first"), a0 = msg("assistant", "a0", "u0", "reply one"), a1 = msg("assistant", "a1", "u1", "reply two");
+  expect((await ask(R("u9", "zx-7781", { prev_user: "reply one", prev_user_ref: ref(a0) }))).state).toBe("query-stale");
+  expect((await ask(R("u8", "zx-7781", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply two", prev_assistant_ref: ref(a1) }))).state).toBe("query-stale");
+  expect((await ask(R("u7", "zx-7781", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("shown");
+});
