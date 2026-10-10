@@ -62,6 +62,27 @@ insert into job (kind, key)
     and not exists (select 1 from tomb t where t.key = 'source:' || p.source);
 create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
+-- One-time semantic migrations, each applied once (its mark inserted with it).
+create table if not exists migration_mark (key text primary key, at timestamptz not null default now());
+-- fork-copy-v2 (DESIGN §4.1): projections from before a Pi fork child's copy of a revised parent version was
+-- withdrawn may hold that copy as the child's own. Every Pi fork child's version moves now, in this transaction
+-- (its old projection, summaries, statements and frozen blocks stop counting as current before any worker
+-- runs), and it is projected again. Once: a later start moves nothing.
+do $$
+begin
+  if exists (select 1 from migration_mark where key = 'fork-copy-v2') then return; end if;
+  insert into migration_mark values ('fork-copy-v2');
+  insert into vis_version select 's:' || s.id, 2 from source s where s.harness = 'pi' and s.parent_id is not null
+    on conflict (key) do update set v = vis_version.v + 1;
+  if to_regclass('recall_block') is not null then
+    insert into vis_version select distinct 'r:' || b.source, 2 from recall_block b, source s
+      where s.harness = 'pi' and s.parent_id is not null and b.deps ? ('s:' || s.id)
+      on conflict (key) do update set v = vis_version.v + 1;
+  end if;
+  insert into job (kind, key) select 'project', s.id from source s
+    where s.harness = 'pi' and s.parent_id is not null and not exists (select 1 from tomb t where t.key = 'source:' || s.id)
+  on conflict (kind, key) where state in ('queued', 'running') do nothing;
+end $$;
 `);
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");

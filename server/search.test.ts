@@ -939,6 +939,30 @@ test("an upgraded database (columns added later, empty): migrate re-projects, se
   expect(JSON.stringify(((await search(db, Q("upgrade-token", { dests: [] }))).body as any).results)).toContain("upgrade-token");
 });
 
+test("an upgrade from projections that kept a revised parent's copy as the child's own: unreadable at migrate, before any worker", async () => {
+  const P = sourceIdOf("pi", "upp");
+  const u0 = msg("user", "u0", null, "q"), a0 = msg("assistant", "a0", "u0", "upgrade-old-copy");
+  await put("upp", [header("upp"), u0, msg("assistant", "a0", "u0", "upgrade-revised")]);
+  await drain(db);
+  const late = (raw: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: "2026-01-02T00:00:00Z" });
+  const C = await put("upk", [header("upk", { parentSession: "/x/upp.jsonl" }), u0, a0, late(msg("user", "k1", "a0", "upgrade-kid-own"))], "personal", P);
+  await drain(db);
+  // As the previous version left it: the copy indexed as the child's own, the projection current.
+  const [k] = await db`select key from lexical where source = ${C} order by key limit 1`;
+  await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
+  expect(k).toBeDefined();
+  expect(await hasText("upgrade-old-copy")).toBe(true);
+  await db`delete from migration_mark where key = 'fork-copy-v2'`;
+  await migrate(db);
+  expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
+  const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
+  await migrate(db); // once only
+  expect((await db`select v from vis_version where key = ${"s:" + C}`)[0].v).toBe(v);
+  await drain(db);
+  expect(await hasText("upgrade-old-copy")).toBe(false);
+  expect(await hasText("upgrade-kid-own")).toBe(true);
+});
+
 test("a fresh database: the entry point creates every table before serving", async () => {
   const { start } = await import("./main.ts");
   const name = "memex_fresh_" + Date.now();
