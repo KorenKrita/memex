@@ -37,17 +37,22 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     // Otherwise: records S inherited are those its projection maps ("id:content hash") to an ancestor's key (S's own
     // keys start with its native id); a version the projection does not map (e.g. a superseded revision) counts as
     // S's own: that can only tomb more of S.
-    const headRaw = versions.find((r: any) => r.rec === "header")?.raw;
+    // The fork time is the current header's, as projection reads it (body keeps every header version ever received).
+    // No single current header (absent, in conflict, unreadable): every version counts as S's own — a forget
+    // removes more, never less.
+    const [cur] = await tx`select r.state, b.raw from record r left join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                           where r.source = ${source} and r.rec = 'header'`;
     let sHead: any;
     try {
-      sHead = headRaw ? JSON.parse(headRaw) : undefined;
+      sHead = cur?.state === "ok" && cur.raw ? JSON.parse(cur.raw) : undefined;
     } catch {}
+    const headKnown = sHead?.type === "session" || (cur?.state === "ok" && !!cur.raw);
     const piFork = sHead?.type === "session" && !!sHead.parentSession;
     const [pr] = await tx`select keys from projected where source = ${source}`;
     const [src] = await tx`select native_id from source where id = ${source}`;
     const inherited = new Set<string>(((pr?.keys ?? []) as [string, string][]).filter(([, k]) => !k.startsWith(src.native_id + "/")).map(([m]) => m));
-    const own = versions.filter((r: any) => r.rec !== "header" &&
-      (piFork ? !isCopyTime(JSON.parse(r.raw), sHead) : !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`)));
+    const own = versions.filter((r: any) => r.rec !== "header" && (!headKnown ||
+      (piFork ? !isCopyTime(JSON.parse(r.raw), sHead) : !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`))));
     const tombs = [...new Set<string>(own.map((r: any) => copyTomb(source, r.rec, r.raw)))];
     if (tombs.length) await tx`insert into tomb select x from unnest(${tx.array(tombs, "text")}::text[]) x on conflict do nothing`;
     const match = new Set(tombs);

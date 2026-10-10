@@ -830,6 +830,25 @@ test("an unlinked fork is no usable parent: its own entry stays readable in it, 
   expect(recs).toContain("c");
 });
 
+for (const dir of ["earlier", "later"])
+  test(`forget of a fork whose header was revised (fork time moved ${dir}): the current header decides which versions were its own`, async () => {
+    const A = sourceIdOf("pi", "fa"), B = sourceIdOf("pi", "fb");
+    const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+    const e = at(msg("user", "e", null, "fh-entry"), "2026-01-03T00:00:00Z");
+    await put("fa", [header("fa"), e]);
+    await drain(db);
+    const h = (ts: string) => JSON.stringify({ type: "session", version: 3, id: "fb", timestamp: ts, cwd: "/x", parentSession: "/x/fa.jsonl" });
+    // First header, then the revised one: e is a copy under the first, B's own under the second, or the other way round.
+    const [first, now] = dir === "earlier" ? ["2026-01-04T00:00:00Z", "2026-01-02T00:00:00Z"] : ["2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"];
+    await put("fb", [h(first), e], "personal", A);
+    await drain(db);
+    await put("fb", [h(now), e], "personal", A);
+    await drain(db);
+    const ownNow = dir === "earlier"; // e (Jan 3) newer than the current fork time (Jan 2): B's own
+    await forgetSource(db, B);
+    expect((await db`select count(*)::int n from tomb where key like ${"copy:" + B + ":e:%"}`)[0].n).toBe(ownNow ? 1 : 0);
+  });
+
 for (const parentSynced of [false, true])
   test(`a fork whose header names a parent the collector did not link (parent ${parentSynced ? "synced in another scope" : "absent"}): copies withdrawn, its own kept`, async () => {
     const u0 = msg("user", "u0", null, "unlinked-copy-q"), a0 = msg("assistant", "a0", "u0", "unlinked-copy-r");
