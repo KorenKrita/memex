@@ -40,7 +40,7 @@ const stamp = (...k: unknown[]) => {
   return stampOf.get(key)!;
 };
 const header = (id: string, parentSession?: string) =>
-  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? stamp("fork", id, parentSession) : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
 const user = (id: string, parent: string | null, text: string) =>
   JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp("user", id, parent, text), message: { role: "user", content: [{ type: "text", text }] } });
 const asst = (id: string, parent: string | null, text: string) =>

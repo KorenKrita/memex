@@ -59,7 +59,7 @@ beforeEach(async () => {
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
 const header = (id: string, parentSession?: string) =>
-  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? stamp("fork", id, parentSession) : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
 // Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
 // again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
 // after it are the child's own.

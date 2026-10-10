@@ -84,7 +84,7 @@ const stamp = (...k: unknown[]) => {
   return stampOf.get(key)!;
 };
 const header = (id: string, parentSession?: string) =>
-  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? stamp("fork", id, parentSession) : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
 const msg = (role: string, id: string, parent: string | null, text: string) =>
   JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp(role, id, parent, text), message: { role, content: [{ type: "text", text }] } });
 let commitN = 0;
