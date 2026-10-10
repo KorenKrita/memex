@@ -19,7 +19,8 @@ create extension if not exists pg_trgm;
 
 create table if not exists api_key (hash text primary key, name text not null, created_at timestamptz not null default now(),
                                     revoked bool not null default false);
--- purpose: sync | snapshot | recall | tool ; dest: memex | llm | embedding | rerank. Default: nothing allowed.
+create unique index if not exists api_key_name on api_key (name);
+-- purpose: sync | snapshot | recall | tool | derive ; dest: memex | llm | embedding | rerank. Default: nothing allowed.
 create table if not exists grant_rule (scope text not null, purpose text not null, dest text not null,
                                        primary key (scope, purpose, dest));
 
