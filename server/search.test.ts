@@ -814,6 +814,22 @@ for (const order of ["C before the forget", "C after the forget"])
     expect(await hasText("r3-b-own")).toBe(false);
   });
 
+test("an unlinked fork is no usable parent: its own entry stays readable in it, its fork's copy of that entry is withdrawn", async () => {
+  // B's header names a parent the collector never linked (parent: null); b is B's own (newer than B's fork).
+  const u0 = msg("user", "u0", null, "ul-root");
+  const B = await put("ub", [header("ub", { parentSession: "/x/absent.jsonl" }), u0, msg("user", "b", "u0", "ul-b-own")], "personal", null);
+  await drain(db);
+  expect(await hasText("ul-b-own")).toBe(true);
+  expect((await db`select res from projected where source = ${B}`)[0].res.parent_ok).toBe(false);
+  // C forks B after b: b is a copy in C, B no usable parent — withdrawn, not inherited, not C's own.
+  const C = await put("uc", [header("uc", { parentSession: "/x/ub.jsonl" }), u0, msg("user", "b", "u0", "ul-b-own"), msg("user", "c", "b", "ul-c-own")], "personal", B);
+  await drain(db);
+  const recs = (await db`select recs from view where source = ${C}`).flatMap((v: any) => (v.recs as { id: string }[]).map((x) => x.id));
+  expect(recs).not.toContain("b");
+  expect(recs).not.toContain("u0");
+  expect(recs).toContain("c");
+});
+
 for (const parentSynced of [false, true])
   test(`a fork whose header names a parent the collector did not link (parent ${parentSynced ? "synced in another scope" : "absent"}): copies withdrawn, its own kept`, async () => {
     const u0 = msg("user", "u0", null, "unlinked-copy-q"), a0 = msg("assistant", "a0", "u0", "unlinked-copy-r");
@@ -1143,9 +1159,9 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
   expect(k).toBeDefined();
   expect(await hasText("upgrade-old-copy")).toBe(true);
-  // A database that already ran fork-copy-v2..v4 (their marks only): v5 still runs, once.
-  await db`delete from migration_mark where key = 'fork-copy-v5'`;
-  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing`;
+  // A database that already ran fork-copy-v2..v5 (their marks only): v6 still runs, once.
+  await db`delete from migration_mark where key = 'fork-copy-v6'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing`;
   await migrate(db);
   expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
   const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
@@ -1156,16 +1172,19 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   expect(await hasText("upgrade-kid-own")).toBe(true);
 });
 
-test("an upgrade from projections that kept an unlinked fork's copy as its own (v4 already ran): unreadable at migrate, before any worker", async () => {
+test("an upgrade from projections that kept an unlinked fork's copy as its own (v5 already ran; the header key escaped): unreadable at migrate, before any worker", async () => {
   const u0 = msg("user", "u0", null, "q"), a0 = msg("assistant", "a0", "u0", "unlinked-old-copy");
   // A fork whose parent file the collector did not link (parent: null), its header naming the parent.
-  const C = await put("ulk", [header("ulk", { parentSession: "/x/absent.jsonl" }), u0, a0, msg("user", "k1", "a0", "unlinked-kid-own")], "personal", null);
+  // Its header spells the key with a JSON escape: the same "parentSession" to any JSON reader.
+  const h = header("ulk", { parentSession: "/x/absent.jsonl" }).replace('"parentSession"', '"parent\\u0053ession"');
+  expect(JSON.parse(h).parentSession).toBe("/x/absent.jsonl");
+  const C = await put("ulk", [h, u0, a0, msg("user", "k1", "a0", "unlinked-kid-own")], "personal", null);
   await drain(db);
   // As the previous version left it: the copy indexed as the child's own.
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"ulk/a0:old#0"}, 0, 'a0', 'assistant', 'unlinked-old-copy', ${C + ":a0"})`;
   expect(await hasText("unlinked-old-copy")).toBe(true);
-  await db`delete from migration_mark where key = 'fork-copy-v5'`;
-  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing`;
+  await db`delete from migration_mark where key = 'fork-copy-v6'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing`;
   // A root session (no parent named) is not moved.
   const R = await put("ulr", [header("ulr"), msg("user", "r0", null, "root-text")]);
   await drain(db);

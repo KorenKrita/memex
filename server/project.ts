@@ -64,22 +64,22 @@ create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
 -- One-time semantic migrations, each applied once (its mark inserted with it).
 create table if not exists migration_mark (key text primary key, at timestamptz not null default now());
--- fork-copy-v5 (DESIGN §4.1; v2-v4 before it): projections from before the Pi fork copy rule (a copy told by its
+-- fork-copy-v6 (DESIGN §4.1; v2-v5 before it): projections from before the Pi fork copy rule (a copy told by its
 -- own time against the child's fork time, whatever the ancestors hold; a fork is one whose header names a parent,
--- linked or not) may hold a withdrawn copy as the child's own, or a newer own entry as inherited or quarantined.
--- Every Pi fork child's version moves now — a declared parent, or a header naming one (v4 missed the latter) —
--- in this transaction (its old projection, summaries, statements and frozen blocks stop counting as current
--- before any worker runs), and it is projected again. Once: a later start moves nothing (a database that ran
--- v2-v4 runs v5 once more).
+-- linked or not; an unlinked fork is no usable parent) may hold a withdrawn copy as the child's own, or a newer
+-- own entry as inherited or quarantined. Every Pi fork child's version moves now — a declared parent, or a
+-- current header naming one, told from the parsed JSON (any spelling of the key; v4 missed header-only forks, v5
+-- escaped keys) — in this transaction (its old projection, summaries, statements and frozen blocks stop counting
+-- as current before any worker runs), and it is projected again. Once: a later start moves nothing (a database
+-- that ran v2-v5 runs v6 once more).
 do $$
 begin
-  if exists (select 1 from migration_mark where key = 'fork-copy-v5') then return; end if;
-  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing;
+  if exists (select 1 from migration_mark where key = 'fork-copy-v6') then return; end if;
+  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5'), ('fork-copy-v6') on conflict do nothing;
   create temporary table fork_child on commit drop as
     select s.id from source s where s.harness = 'pi' and (s.parent_id is not null or exists (
       select 1 from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
-      where r.source = s.id and r.rec = 'header' and b.raw like '%parentSession%' and b.raw is json object
-        and (b.raw::jsonb ->> 'parentSession') is not null));
+      where r.source = s.id and r.rec = 'header' and b.raw is json object and (b.raw::jsonb ->> 'parentSession') is not null));
   insert into vis_version select 's:' || id, 2 from fork_child on conflict (key) do update set v = vis_version.v + 1;
   if to_regclass('recall_block') is not null then
     insert into vis_version select distinct 'r:' || b.source, 2 from recall_block b, fork_child f where b.deps ? ('s:' || f.id)
@@ -150,7 +150,7 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // A fork child: it declared a parent (living or forgotten), or its own header names one (a parent file the
   // collector did not link: absent, or outside this scope). Its copies are told by their own times either way.
   const [decl] = await q`select parent_id from source where id = ${source}`;
-  let forked = !!decl?.parent_id;
+  const forked = !!decl?.parent_id;
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
   const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
@@ -159,12 +159,16 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    forked ||= !!lines[0].parentSession;
-    // No living ancestor known: copies (by their times) have nothing to be inherited from — withdrawn; the
-    // child's own entries stay. No parent declared nor named: a root session.
+    // Declared ancestors all forgotten: copies (by their times) have nothing to be inherited from — withdrawn; the
+    // child's own entries stay, and it can be a parent of its own forks (what they inherit is only its own).
+    // A header naming a parent the collector never linked: the ancestry is unknown — copies withdrawn, its own
+    // entries stay, but it is no usable parent (as in the dry-run: parent not given). Neither: a root session.
     if (!src.parent_id && forked) {
       lines[0].parentSession = "/memex/forgotten";
       parent = parentInfo([], [], spanIdOf, new Map());
+    } else if (!src.parent_id && lines[0].parentSession) {
+      lines[0].parentSession = "/memex/unlinked";
+      parent = undefined;
     } else if (!src.parent_id) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
