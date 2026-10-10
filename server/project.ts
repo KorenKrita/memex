@@ -101,7 +101,7 @@ export const inputFpOf = (s: { records: SpanRecord[]; context: SpanRecord[] }) =
 type Loaded = { lines: Record<string, any>[]; blocked?: string; idle: boolean; idleMs: number };
 
 /** L0 of a source as JSONL objects in file order: ok records parsed, conflicts as placeholders. */
-async function load(q: Tx, source: string, harness: string): Promise<Loaded> {
+export async function load(q: Tx, source: string, harness: string): Promise<Loaded> {
   const rows = await q`select r.rec, r.state, b.raw, extract(epoch from (now() - (select max(received_at) from body where source = ${source}))) * 1000 as idle_ms
                        from record r left join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                        where r.source = ${source} order by r.first_pos`;

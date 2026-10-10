@@ -1021,6 +1021,41 @@ test("the current input already synced on another branch than the leaf: refused,
   expect((await ask(R("u3", "zx-7781 on L", { prev_user: "LEFT_Q", prev_user_ref: ref(L[3]), prev_assistant: "LEFT_R", prev_assistant_ref: ref(L[4]) }))).state).toBe("shown");
 });
 
+/** Upload `lines` from a second collector (another machine's copy of the same session). */
+async function putOther(native: string, lines: string[]) {
+  const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent: null };
+  const l = await requestLease(db, decl, "m2");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  expect((await commit(db, { leaseId: l, commitId: `o${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
+}
+
+test("a collector conflict on a label between the previous exchange and the synced input: the path holds, recall works", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const label = (v: string, parent = "a0") => JSON.stringify({ type: "label", id: "lx", parentId: parent, timestamp: T, targetId: "u0", label: v });
+  const base = [header("me"), msg("user", "u0", null, "conf question"), msg("assistant", "a0", "u0", "conf reply")];
+  const tail = msg("user", "u1", "lx", "zx-7781 after label");
+  await putRaw("me", [...base, label("one"), tail]);
+  await putOther("me", [...base, label("two"), tail]); // the label's value differs, its parent agrees
+  await drain(db);
+  expect((await db`select state from record where source = ${me} and rec = 'lx'`)[0].state).toBe("conflict");
+  calls = [];
+  const d = await ask(R("u1", "zx-7781 after label", { prev_user: "conf question", prev_user_ref: ref(base[1]), prev_assistant: "conf reply", prev_assistant_ref: ref(base[2]) }));
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("conf reply");
+  expect(outbound()).not.toContain("one");
+});
+
+test("a collector conflict on the parent link of an entry on the path: no trusted path, refused", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const base = [header("me"), msg("user", "u0", null, "pc question"), msg("assistant", "a0", "u0", "pc reply"), msg("assistant", "a9", "u0", "pc other")];
+  await putRaw("me", [...base, msg("user", "u1", "a0", "zx-7781 pc")]);
+  await putOther("me", [...base, msg("user", "u1", "a9", "zx-7781 pc")]); // where u1 hangs is in dispute
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u1", "zx-7781 pc", { prev_user: "pc question", prev_user_ref: ref(base[1]), prev_assistant: "pc reply", prev_assistant_ref: ref(base[2]) }))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
 test("a Codex session's previous exchange with valid references: sent", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   const cid = "22222222-2222-2222-2222-222222222222";

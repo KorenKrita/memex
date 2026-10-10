@@ -21,7 +21,7 @@ import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
-import { canonOf } from "./project.ts";
+import { canonOf, load } from "./project.ts";
 import { copyTomb } from "./forget.ts";
 import { contentHash, looseOf } from "../dryrun/dryrun.ts";
 
@@ -172,23 +172,30 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const views: VRec[][] = (await q`select recs from view where source = ${r.source} order by ord`).map((v: any) => v.recs as VRec[]);
           let recs: { key: string; id: string; kind: string }[] = [];
           if (hs?.harness === "pi") {
-            const chain = async (start: string) =>
-              (await q`with recursive p(rec, parent, d) as (
-                         select r.rec, (b.raw::jsonb)->>'parentId', 0 from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
-                         where r.source = ${r.source} and r.rec = ${start} and r.rec <> 'header'
-                         union all
-                         select r.rec, (b.raw::jsonb)->>'parentId', p.d + 1 from p join record r on r.source = ${r.source} and r.rec = p.parent
-                         join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash where p.d < 1000000)
-                       select rec, parent from p order by d`) as { rec: string; parent: string | null }[];
-            const input = await chain(r.user_rec);
-            let path: string[];
-            if (input.length) {
-              path = input.slice(1).map((x) => x.rec);
-              if (r.leaf && r.leaf !== r.user_rec && !path.includes(r.leaf)) return { found: null, pin, stale: true };
+            // The tree as projection reads it (load(): a conflicted entry is a textless node where every version
+            // agrees on its parent; a disputed parent link blocks the source — no trusted path then).
+            const lo = await load(q, r.source, "pi");
+            if (lo.blocked) return { found: null, pin, stale: true };
+            const parentOf = new Map<string, string | null>(lo.lines.slice(1).map((e: any) => [e.id as string, (e.parentId ?? null) as string | null]));
+            const chain = (start: string) => {
+              const out: string[] = [];
+              for (let x: string | null = start; x !== null && parentOf.has(x); x = parentOf.get(x)!) {
+                if (out.includes(x)) return null; // a cycle: no path
+                out.push(x);
+              }
+              return out;
+            };
+            let path: string[] | null;
+            if (parentOf.has(r.user_rec)) {
+              // The input is synced: the previous exchange is on its path, before it.
+              path = chain(r.user_rec)?.slice(1) ?? null;
+              if (!path || (r.leaf && r.leaf !== r.user_rec && !path.includes(r.leaf))) return { found: null, pin, stale: true };
+            } else if ((await q`select 1 from record where source = ${r.source} and rec = ${r.user_rec}`).length) {
+              return { found: null, pin, stale: true }; // synced but not readable (quarantined): not "not yet synced"
             } else {
               const [last] = r.leaf ? [{ rec: r.leaf }] : await q`select rec from record where source = ${r.source} and rec <> 'header' order by first_pos desc limit 1`;
-              path = last ? (await chain(last.rec)).map((x) => x.rec) : [];
-              if (!path.length) return { found: null, pin, stale: true }; // an unknown leaf: no branch
+              path = last ? chain(last.rec) : null;
+              if (!path?.length) return { found: null, pin, stale: true }; // an unknown leaf: no branch
             }
             const on = new Set(path);
             const deepest = path.find((id) => views.some((v) => v.some((x) => x.id === id)));
