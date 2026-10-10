@@ -168,6 +168,8 @@ export async function guardedPost(db: Db, deps: Record<string, number>, url: str
     await tx`select set_config('lock_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true), set_config('statement_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
     if (!(await unchanged(tx, deps))) return false;
+    // Past the caller's deadline by the time we may send (the lock or the check took it): nothing is sent.
+    if (until !== undefined && Date.now() >= until) throw new Error("deadline passed");
     const req = (u.protocol === "https:" ? https : http).request(u, {
       method: "POST",
       headers: { "content-type": "application/json", "content-length": data.length, authorization: "Bearer " + key },

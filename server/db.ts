@@ -27,13 +27,16 @@ create table if not exists source (id text primary key, harness text not null, n
                                    parent_id text, meta jsonb not null default '{}', created_at timestamptz not null default now());
 create table if not exists vis_version (key text primary key, v bigint not null default 1);
 -- Frozen recall decisions (§6.2), one per real user input of a session, written once. recall_state orders a
--- session's decisions (seq, assigned under its row lock, so commit order = seq order) and counts withdrawals
--- that hide some of them (gen): bump() moves gen in the withdrawing transaction itself.
-create table if not exists recall_state (source text primary key, seq bigint not null default 0, gen bigint not null default 0);
+-- session's decisions (seq, assigned under its row lock, so commit order = seq order). Withdrawals that hide
+-- some of a session's blocks move its version 'r:<session>' (bump() does it in the withdrawing transaction),
+-- which every replay response depends on — an empty increment included.
+create table if not exists recall_state (source text primary key, seq bigint not null default 0);
 create table if not exists recall_block (source text not null, user_rec text not null, query_hash text not null, seq bigint not null,
                                          state text not null, text text not null, deps jsonb not null, sources text[] not null,
-                                         at timestamptz not null default now(), primary key (source, user_rec));
+                                         refs jsonb not null default '[]', at timestamptz not null default now(), primary key (source, user_rec));
 create index if not exists recall_block_deps on recall_block using gin (deps);
+alter table recall_block add column if not exists refs jsonb not null default '[]';
+alter table recall_state drop column if exists gen;
 create table if not exists tomb (key text primary key, at timestamptz not null default now());   -- 'source:S' | 'canon:C'
 
 create table if not exists lease (id bigserial primary key, source text not null, collector text not null, ttl_ms int not null,
@@ -88,7 +91,9 @@ export async function migrate(db: Db) {
  *  Sessions holding a frozen recall block made under that key learn of it in the same transaction. */
 export const bump = async (tx: Tx, key: string) => {
   await tx`insert into vis_version values (${key}, 2) on conflict (key) do update set v = vis_version.v + 1`;
-  await tx`update recall_state set gen = gen + 1 where source in (select source from recall_block where deps ? ${key})`;
+  if (!key.startsWith("r:"))
+    await tx`insert into vis_version select 'r:' || source, 2 from (select distinct source from recall_block where deps ? ${key}) x
+             on conflict (key) do update set v = vis_version.v + 1`;
 };
 
 /** Enqueue derived work once: a pending job with the same (kind, key) absorbs the request, and a running one

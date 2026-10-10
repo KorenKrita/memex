@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { connect, migrate, type Db } from "./db.ts";
 import { commit, requestLease, tryGrant } from "./sync.ts";
 import { EMBED_DIM, revokeGrant } from "./derive.ts";
-import { Guarded } from "./http.ts";
+import { Guarded, serve, addApiKey, httpHooks, transport } from "./http.ts";
 import { recall, blocks, recallHooks, tokens, TOKEN_BUDGET, FRAMING, queryOf, clip } from "./recall.ts";
 import { zoom } from "./search.ts";
 import { forgetSource } from "./forget.ts";
@@ -18,6 +18,7 @@ let embedDelay = 0;
 let rerankStatus = 200;
 let score = (d: string): number => (d.includes("ANSWER") ? 0.9 : 0.1);
 let srv: ReturnType<typeof Bun.serve>;
+let embedHook: null | (() => Promise<void>) = null;
 beforeAll(async () => {
   db = connect();
   await migrate(db);
@@ -28,6 +29,7 @@ beforeAll(async () => {
       const body = await req.json();
       calls.push({ path, body });
       if (path.endsWith("/embeddings") && embedDelay) await Bun.sleep(embedDelay);
+      if (path.endsWith("/embeddings") && embedHook) await embedHook();
       if (path.endsWith("/rerank")) {
         if (rerankDelay) await Bun.sleep(rerankDelay);
         if (rerankStatus !== 200) return new Response("no", { status: rerankStatus });
@@ -73,6 +75,7 @@ beforeEach(async () => {
   rerankStatus = 200;
   score = (d) => (d.includes("ANSWER") ? 0.9 : 0.1);
   recallHooks.beforeSave = async () => {};
+  embedHook = null;
 });
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -165,10 +168,11 @@ test("no rerank (failed, not granted) → nothing injected, never a fallback sco
   await put("a", [["q", "ANSWER zx-7781"]]);
   await drain(db);
   rerankStatus = 500;
-  expect((await ask(R("u1", "zx-7781"))).state).toBe("empty");
+  expect(await ask(R("u1", "zx-7781"))).toEqual({ state: "unavailable", reason: "endpoint-500" });
   rerankStatus = 200;
   await db`delete from grant_rule where purpose = 'recall' and dest = 'rerank'`;
-  expect((await ask(R("u2", "zx-7781"))).state).toBe("empty");
+  expect(await ask(R("u2", "zx-7781"))).toEqual({ state: "unavailable", reason: "not-granted" });
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0); // not decisions: a later retry may decide
 });
 
 test("a non-finite score or one under τ is not injected", async () => {
@@ -177,7 +181,7 @@ test("a non-finite score or one under τ is not injected", async () => {
   score = () => 0.49;
   expect((await ask(R("u1", "zx-7781"))).state).toBe("empty");
   score = () => NaN; // JSON turns it into null: the rerank result is incomplete
-  expect((await ask(R("u2", "zx-7781"))).state).toBe("empty");
+  expect((await ask(R("u2", "zx-7781"))).state).toBe("unavailable");
 });
 
 test("at most 3 hint lines, block within the token budget framing included; each handle opens with mem_zoom", async () => {
@@ -186,7 +190,7 @@ test("at most 3 hint lines, block within the token budget framing included; each
   const d = await ask(R("u1", "zx-7781"));
   expect(d.state).toBe("shown");
   expect(d.text.startsWith(FRAMING)).toBe(true);
-  const lines = d.text.split("\n").filter((l: string) => /^\[(span|record):/.test(l));
+  const lines = d.text.split("\n").filter((l: string) => /^\[hint:\d+\.\d+\] /.test(l));
   expect(lines.length).toBe(d.text.split("\n").length - 3); // framing (2 lines) and the end tag, the rest hints
   expect(lines.length).toBeGreaterThan(0);
   expect(lines.length).toBeLessThanOrEqual(3);
@@ -194,7 +198,9 @@ test("at most 3 hint lines, block within the token budget framing included; each
   for (const l of lines) {
     const id = /^\[([^\]]+)\]/.exec(l)![1];
     const z = (await zoom(db, { source: me, scope: "personal", purpose: "tool", id })).body as any;
-    expect(z).toBeTruthy();
+    // The frozen result: the hint's own summary text is in what the handle opens.
+    const shown = l.split(" · ")[1].replace(" → mem_zoom", "").slice(0, 30);
+    expect(JSON.stringify(z)).toContain(shown);
   }
 });
 
@@ -215,11 +221,11 @@ test("lines that would pass the token budget are left out (budget over the whole
   // Three passing hints of ~240 bytes of CJK each (~160 tokens): with the framing, over 800 only past ~4.
   for (let i = 0; i < 3; i++) await put("s" + i, [[`ANSWER zx-7781 ${i} ${"长".repeat(150)}`, `reply ${i}`]]);
   await drain(db);
-  process.env.MEMEX_RECALL_TOKENS = "300"; // a small budget: room for the framing and one line only
+  process.env.MEMEX_RECALL_TOKENS = "500"; // a small budget: room for the framing and one line only
   try {
     const d = await ask(R("u1", "zx-7781"));
-    expect(tokens(d.text)).toBeLessThanOrEqual(300);
-    expect(d.text.split("\n").filter((l: string) => /^\[(span|record):/.test(l)).length).toBe(1);
+    expect(Buffer.byteLength(d.text)).toBeLessThanOrEqual(500);
+    expect(d.text.split("\n").filter((l: string) => /^\[hint:\d+\.\d+\] /.test(l)).length).toBe(1);
   } finally {
     delete process.env.MEMEX_RECALL_TOKENS;
   }
@@ -245,10 +251,10 @@ test("forget while a holder's block shows it: the holder's generation moves even
   const a = await put("a", [["q", "ANSWER zx-7781"]]);
   await drain(db);
   await ask(R("u1", "zx-7781"));
-  const [g0] = await db`select gen from recall_state where source = ${me}`;
+  const v = async () => Number((await db`select v from vis_version where key = ${"r:" + me}`)[0]?.v ?? 1);
+  const g0 = await v();
   await forgetSource(db, a);
-  const [g1] = await db`select gen from recall_state where source = ${me}`;
-  expect(Number(g1.gen)).toBeGreaterThan(Number(g0.gen));
+  expect(await v()).toBeGreaterThan(g0);
 });
 
 // ---------- withdrawal and the cursor ----------
@@ -337,6 +343,46 @@ test("concurrent retries of one binding save one decision", async () => {
   expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(1);
 });
 
+test("an incremental replay read just before a withdrawal is not delivered as 'nothing changed'", async () => {
+  const a = await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  await ask(R("u1", "zx-7781"));
+  const r1 = await replay();
+  const api = await serve(db, { port: 0 });
+  const key = await addApiKey(db, "t");
+  let fired = 0;
+  httpHooks.beforeGuard = async () => {
+    if (fired++) return;
+    await put("a", [["q changed", "ANSWER zx-7781"]]); // after the empty increment was computed, before delivery
+  };
+  try {
+    const r = await transport(`http://127.0.0.1:${api.port}`, key)("POST", "/v1/recall/blocks", { source: me, scope: "personal", cursor: r1.cursor });
+    expect(fired).toBeGreaterThan(1); // recomputed
+    expect(r.replace).toBe(true);
+    expect(r.blocks).toEqual([]);
+  } finally {
+    httpHooks.beforeGuard = async () => {};
+    await api.stop();
+  }
+  void a;
+});
+
+test("the querying session revised while its query embedding is out: nothing frozen from the old query", async () => {
+  // The query's context is the session's last exchange; revising it moves s:me while the embedding is out.
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["old question", "old reply"]]);
+  await drain(db);
+  embedHook = async () => {
+    embedHook = null;
+    await put("me", [["revised question", "old reply"]]);
+  };
+  const before = calls.filter((c) => c.path.endsWith("/embeddings")).length;
+  await ask(R("u9", "zx-7781", { prev_user: "old question", prev_assistant: "old reply" }));
+  expect(calls.filter((c) => c.path.endsWith("/embeddings")).length - before).toBe(2); // embedded again after the revision
+  const [cur] = await db`select v from vis_version where key = ${"s:" + me}`;
+  for (const row of await db`select deps from recall_block`) expect(row.deps["s:" + me]).toBe(Number(cur.v)); // never the old version
+});
+
 // ---------- the deadline ----------
 
 test("past the budget: no decision, nothing stored, the next input unaffected", async () => {
@@ -375,6 +421,87 @@ test("the save waiting for the barrier past the deadline: rolled back, nothing s
   expect((await ask(R("u1", "zx-7781"))).state).toBe("timeout");
   await blocker;
   expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+});
+
+test("an expired request is never sent: the endpoint receives nothing", async () => {
+  const { guardedPost } = await import("./derive.ts");
+  const k = calls.length;
+  await expect(guardedPost(db, {}, process.env.MEMEX_RERANK_URL!, "k", { x: 1 }, Date.now() - 1)).rejects.toThrow("deadline");
+  // Expired while waiting for the barrier: still nothing sent.
+  const { BARRIER } = await import("./sync.ts");
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let holding!: () => void;
+  const isHeld = new Promise<void>((r) => (holding = r));
+  const blocker = db.begin(async (tx: any) => {
+    await tx`select pg_advisory_xact_lock(${BARRIER})`;
+    holding();
+    await held;
+  });
+  await isHeld;
+  const p = guardedPost(db, {}, process.env.MEMEX_RERANK_URL!, "k", { x: 1 }, Date.now() + 200);
+  setTimeout(release, 400);
+  await expect(p).rejects.toThrow();
+  await blocker;
+  await Bun.sleep(100);
+  expect(calls.length).toBe(k);
+});
+
+test("trace publication waiting for the barrier is bounded by the deadline", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  process.env.MEMEX_RECALL_MS = "600";
+  const { searchHooks } = await import("./search.ts");
+  const { BARRIER } = await import("./sync.ts");
+  let blocker: Promise<unknown> = Promise.resolve();
+  searchHooks.beforeTrace = async () => {
+    let holding!: () => void;
+    const isHeld = new Promise<void>((r) => (holding = r));
+    blocker = db.begin(async (tx: any) => {
+      await tx`select pg_advisory_xact_lock(${BARRIER})`;
+      holding();
+      await Bun.sleep(1000);
+    });
+    await isHeld;
+  };
+  try {
+    const t = Date.now();
+    expect((await ask(R("u1", "zx-7781"))).state).toBe("timeout");
+    expect(Date.now() - t).toBeLessThan(900);
+    await blocker;
+    await Bun.sleep(50);
+    expect((await db`select count(*)::int n from search_trace`)[0].n).toBe(0);
+    expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+  } finally {
+    searchHooks.beforeTrace = async () => {};
+  }
+});
+
+test("long inputs: the composed query stays within what search accepts", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  const d = await ask(R("u1", "zx-7781 " + "x".repeat(5900), { prev_user: "y".repeat(8000), prev_assistant: "z".repeat(60000) }));
+  expect(["shown", "empty"]).toContain(d.state);
+});
+
+test("a hint opens the frozen evidence on the frozen view after the session moves on", async () => {
+  // The evidence in a fork child that later branches elsewhere: the hint keeps the view it was found under.
+  const a = await put("a", [["ANSWER zx-7781 first", "r0"], ["second", "r1"]]);
+  await drain(db);
+  const d = await ask(R("u1", "zx-7781"));
+  expect(d.state).toBe("shown");
+  const l = d.text.split("\n").find((x: string) => x.startsWith("[hint:"))!;
+  const id = /^\[([^\]]+)\]/.exec(l)![1];
+  const [row] = await db`select refs from recall_block`;
+  const z1 = (await zoom(db, { source: me, scope: "personal", purpose: "tool", id })).body as any;
+  const { at: _at, ...frozen } = row.refs[0].view_key;
+  expect(z1.view_key).toMatchObject(frozen);
+  expect(JSON.stringify(z1)).toContain("ANSWER zx-7781 first");
+  // The source revised: the frozen view key no longer holds — refused, never answered with the new text.
+  await put("a", [["ANSWER zx-7781 first", "r0"], ["second changed", "r1"]]);
+  await drain(db);
+  await expect(zoom(db, { source: me, scope: "personal", purpose: "tool", id })).rejects.toThrow();
+  void a;
 });
 
 test("the deadline passing during save: nothing stored", async () => {

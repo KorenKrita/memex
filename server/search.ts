@@ -153,7 +153,7 @@ export async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purp
 }
 
 /** Embed the query (guarded by the embedding destination's version), or say why not. */
-async function embedQuery(db: Db, r: SearchReq, until?: number): Promise<{ v?: number[]; skipped?: string; dv?: number }> {
+async function embedQuery(db: Db, r: SearchReq, until?: number): Promise<{ v?: number[]; skipped?: string; deps?: Record<string, number> }> {
   if (!r.dests.includes("embedding")) return { skipped: "not-requested" };
   const url = process.env.MEMEX_EMBED_URL, model = process.env.MEMEX_EMBED_MODEL, key = process.env.MEMEX_EMBED_KEY;
   if (!url || !model || !key) return { skipped: "not-configured" };
@@ -169,8 +169,9 @@ async function embedQuery(db: Db, r: SearchReq, until?: number): Promise<{ v?: n
     if (res === "stale") return { skipped: "revoked" };
     const v = res.json?.data?.[0]?.embedding;
     if (res.status !== 200 || !Array.isArray(v) || v.length !== EMBED_DIM) return { skipped: `endpoint-${res.status}` };
-    // The destination version the query text was sent under (a frozen recall depends on it).
-    return { v, dv: c["d:embedding"] };
+    // The whole vector the query text was sent under (its session's version, the read grant, the embedding
+    // destination): a result made from this vector depends on all of it.
+    return { v, deps: c };
   } catch {
     return { skipped: "endpoint-error" };
   }
@@ -466,7 +467,7 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
   const late = () => until !== undefined && Date.now() >= until;
   await snapshot(db, (q) => basis(q, r)); // the query's own authorization, before its text goes anywhere
   const t0 = performance.now();
-  const emb = await embedQuery(db, r, until);
+  let emb = await embedQuery(db, r, until);
   const tEmbed = performance.now() - t0;
   let tries = 0;
   const run = async (): Promise<Guarded> => {
@@ -474,6 +475,7 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     if (late()) throw new HttpError(504, "deadline");
     const t1 = performance.now();
     const s = await snapshot(db, async (q) => {
+      if (until !== undefined) await q`select set_config('statement_timeout', ${Math.max(1, until - Date.now()) + "ms"}, true)`;
       const b = await basis(q, r);
       const rc = await recall(q, r, b, emb.v);
       const scopes = (c: Cand) => [...c.sources].map((x) => b.valid.get(x)!.scope);
@@ -516,6 +518,12 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     // Every source carried by a candidate, plus the read grant's destination version.
     const deps: Record<string, number> = { ...b.qDeps };
     for (const c of rc.chosen) for (const x of c.sources) Object.assign(deps, b.valid.get(x)!.deps);
+    // The query vector was made under the versions it was sent with; if one of them is not what this recall
+    // read (the querying session revised while it was out), it belongs to another state: embed again.
+    if (emb.v && Object.entries(emb.deps!).some(([k, v]) => k in deps && deps[k] !== v)) {
+      emb = await embedQuery(db, r, until);
+      return run();
+    }
     let scores: (number | null)[] = rc.chosen.map(() => null);
     if (!rerankSkip && rc.chosen.length) {
       const docs = fit(rc.chosen);
@@ -540,7 +548,7 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     // The destinations the query text actually went to, at the versions it was sent under: a result that used
     // their output depends on them (a later revoke withdraws a frozen recall made with them).
     if (!rerankSkip) deps["d:rerank"] = s.dRerank;
-    if (emb.v) deps["d:embedding"] = emb.dv!;
+    if (emb.v) Object.assign(deps, emb.deps);
     // After rerank: off-path evidence and a session's consecutive places are down-weighted (§6.3).
     const base = rc.chosen.map((c, i) => ({ c, i, score: rerankSkip ? c.fused : scores[i]! }));
     base.sort((x, y) => y.score - x.score || x.i - y.i);
@@ -587,6 +595,11 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     // basis and every candidate's still hold (a forget of the querying session deletes its traces).
     await searchHooks.beforeTrace();
     const t = await db.begin(async (tx: Tx) => {
+      if (until !== undefined) {
+        const left = until - Date.now();
+        if (left <= 0) throw new HttpError(504, "deadline");
+        await tx`select set_config('lock_timeout', ${left + "ms"}, true), set_config('transaction_timeout', ${left + "ms"}, true)`;
+      }
       await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
       if (!(await unchanged(tx, deps))) return null;
       const [row] = await tx`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
@@ -678,6 +691,15 @@ function page(recs: { key: string; buf: Buffer }[], offset: number, limit: numbe
 /** mem_zoom: a span (or unit, or record) with its records' text, paged, and its neighbours on a view. */
 export async function zoom(db: Db, body: any): Promise<Guarded> {
   const r = toolReq(body);
+  // A recall hint (`hint:<seq>.<i>`): the result frozen in this session's recall block, opened with the view key
+  // it was found under — the same evidence and view, or 409 view-stale, never a re-chosen copy.
+  if (typeof body.id === "string" && body.id.startsWith("hint:")) {
+    const m = /^hint:(\d+)\.(\d+)$/.exec(body.id);
+    const [row] = m ? await db`select refs from recall_block where source = ${r.source} and seq = ${Number(m[1])} and state = 'shown'` : [];
+    const ref = row?.refs?.[Number(m?.[2])];
+    if (!ref) throw new HttpError(404, "not found or not readable");
+    body = { ...body, id: ref.id, view_key: ref.view_key, ...(ref.in ? { in: ref.in } : {}) };
+  }
   const id = typeof body.id === "string" ? body.id : "";
   const offset = Number.isInteger(body.offset) && body.offset >= 0 ? body.offset : 0;
   const limit = Number.isInteger(body.limit) && body.limit > 0 ? Math.min(body.limit, ZOOM_PAGE) : ZOOM_PAGE;
