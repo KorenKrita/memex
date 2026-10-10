@@ -298,3 +298,121 @@ test("not the same object: unrelated, whatever relation the judge names", async 
   expect((await db`select kind from l3_rel`).map((r: any) => r.kind)).toEqual(["unrelated"]);
   expect(await texts()).toEqual(["PREF TOPICed use vim", "PREF TOPICpm use npm"]);
 });
+
+// ---------- user card in the start snapshot ----------
+import { startSnapshot, BUDGET, FRAMING } from "./snapshot.ts";
+import { USER_MAX } from "./l3.ts";
+const snap = async (x: object = {}) => (await startSnapshot(db, { source: sourceIdOf("pi", "me"), scope: "personal", repo: "repo-a", ...x })).body as any;
+
+test("the snapshot carries the user card after the framing: global statements in effect now, each with its source", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  const b = await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
+  await put("c", [["PREF REPO TOPICfmt tabs here", "ok", T1]]);
+  await drain(db);
+  const k = requests.length;
+  const s = await snap();
+  expect(requests.length).toBe(k); // a read never calls a model
+  expect(s.text.startsWith(FRAMING + "\n\n## About the user")).toBe(true);
+  const [rec] = await db`select rec from l3_stmt where src = ${b.source}`;
+  expect(s.text).toContain(`- PREF TOPICpm NEW use pnpm [record:${b.source}:${rec.rec}]`);
+  expect(s.text).not.toContain("use npm"); // replaced
+  expect(s.text).not.toContain("tabs here"); // a repo statement: not on the user card
+});
+
+test("no statement in effect: no user card block", async () => {
+  await put("a", [["hello", "ok", T0]]);
+  await drain(db);
+  expect((await snap()).text).not.toContain("About the user");
+});
+
+test("frozen: a new statement does not change a stored snapshot; a refresh takes it in", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db);
+  const s1 = await snap();
+  await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
+  await drain(db);
+  expect((await snap()).text).toBe(s1.text);
+  const r = await snap({ refresh_id: "r1" });
+  expect(r.text).toContain("use pnpm");
+  expect(r.text).not.toContain("use npm");
+});
+
+test("forgetting a statement's source drops the user card block as a whole", async () => {
+  const a = await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await put("e", [["PREF TOPICed use vim", "ok", T1]]);
+  await drain(db);
+  expect((await snap()).text).toContain("use npm");
+  await forgetSource(db, a.source);
+  const s = await snap();
+  expect(s.text).not.toContain("About the user");
+  expect(JSON.stringify(await db`select blocks from start_snapshot`)).not.toContain("use npm");
+});
+
+test("forgetting the source of a statement that suppresses another drops the block too (what it hid would be stale)", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  const b = await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
+  await put("e", [["PREF TOPICed use vim", "ok", T1]]);
+  await drain(db);
+  expect((await snap()).text).toContain("use pnpm");
+  await forgetSource(db, b.source);
+  expect((await snap()).text).not.toContain("About the user");
+});
+
+test("a statement whose scope is not readable for snapshots is not on the card; revoking it later drops the block", async () => {
+  await db`insert into grant_rule values ('work', 'sync', 'memex'), ('work', 'derive', 'llm')`;
+  const decl = { source: sourceIdOf("pi", "w"), harness: "pi" as const, nativeId: "w", scope: "work", parent: null, meta: { repo: "repo-a" } };
+  const lines = [header("w"), msg("user", "wu0", null, "PREF TOPICsec work secret rule", T0), msg("assistant", "wa0", "wu0", "ok", T0)];
+  const l = await requestLease(db, decl, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "w1", length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db);
+  expect((await snap()).text).not.toContain("work secret");
+  await db`insert into grant_rule values ('work', 'snapshot', 'memex')`;
+  expect((await snap({ refresh_id: "r1" })).text).toContain("work secret");
+  await db`delete from grant_rule where scope = 'work' and purpose = 'snapshot'`;
+  expect((await snap()).text).not.toContain("work secret");
+});
+
+test("the user card stays within its budget, whole lines only, newest first", async () => {
+  const turns: [string, string, string][] = Array.from({ length: 12 }, (_, i) => [`PREF TOPICt${i} ${"中".repeat(80)} item${i}`, "ok", `2026-01-0${1 + (i % 9)}T0${i % 10}:00:00Z`]);
+  for (let i = 0; i < 12; i++) await put("u" + i, [turns[i]]);
+  await drain(db);
+  const s = await snap();
+  const block = s.text.split("\n\n").find((x: string) => x.startsWith("## About the user"))!;
+  expect(Buffer.byteLength(block)).toBeLessThanOrEqual(USER_MAX);
+  expect(Buffer.from(block).toString()).toBe(block);
+  const lines = block.split("\n").slice(1);
+  expect(lines.length).toBeGreaterThan(1);
+  expect(lines.length).toBeLessThan(12);
+  expect(lines.every((l: string) => /^- PREF .* \[record:[0-9a-f]+:[^\]]+\]$/.test(l))).toBe(true);
+  expect(s.bytes).toBeLessThanOrEqual(BUDGET);
+});
+
+test("forgetting a retraction (shown nowhere, yet hiding a statement) drops the user card block", async () => {
+  await put("b", [["PREF TOPICpm use pnpm", "ok", T0]]);
+  const r = await put("r", [["PREF RETRACT TOPICpm forget the pnpm thing", "ok", T1]]);
+  await put("e", [["PREF TOPICed use vim", "ok", T1]]);
+  await drain(db);
+  const s1 = await snap();
+  expect(s1.text).toContain("use vim");
+  expect(s1.text).not.toContain("use pnpm");
+  await forgetSource(db, r.source);
+  expect((await snap()).text).not.toContain("About the user"); // its text would hide pnpm wrongly now
+});
+
+test("user card lines are newest first", async () => {
+  await put("a", [["PREF TOPICx1 first", "ok", T0]]);
+  await put("b", [["PREF TOPICx2 third", "ok", T2]]);
+  await put("c", [["PREF TOPICx3 second", "ok", T1]]);
+  await drain(db);
+  const block = (await snap()).text.split("\n\n").find((x: string) => x.startsWith("## About the user"))!;
+  expect(block.split("\n").slice(1).map((l: string) => l.split(" ")[3])).toEqual(["third", "second", "first"]);
+});
+
+test("a revised record's statement is not on a freshly built card", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db, ["project", "summarize", "embed", "l3"]);
+  await put("a", [["something else", "ok", T0]]); // revised, not drained: no re-extraction yet
+  expect((await snap()).text).not.toContain("use npm");
+});

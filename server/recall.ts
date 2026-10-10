@@ -3,13 +3,16 @@
 //
 // - Binding: (source, user_rec) is unique and keeps the query hash it was made for; the same binding with
 //   another query is refused (409), a retry of the same one returns the stored decision without a model call.
-// - A decision is "shown" (hint lines) or "empty" (nothing passed the bar) — both stored. A search that did
-//   not finish within the budget, or a configuration without a calibrated τ, stores nothing ("timeout",
-//   "not-ready"): the caller must not tell the model there is no history.
+// - A decision is "shown" (hint lines, each with a `hint:<seq>.<i>` handle mem_zoom opens as frozen) or
+//   "empty" (nothing passed the bar) — both stored. Nothing is stored, and the caller must not tell the model
+//   there is no history, for "timeout" (not decided within the 2.5 s deadline), "not-ready" (τ not calibrated),
+//   "unavailable" (rerank failed or not granted, with its reason) and "query-stale" (the session or a fork
+//   ancestor moved after the query was built from it).
 // - Injection bar: rerank succeeded, the candidate's rerank input complete, its rerank score finite and ≥ τ;
-//   at most 3, within a token estimate of the block (framing included). No rerank → never injected.
+//   at most 3, within the block's byte bound (framing included, see below). No rerank → never injected.
 // - Saved under the shared publish barrier, only while every version it was made from holds, and only before
-//   the deadline. Withdrawals (bump) move the holding session's recall generation in their own transaction.
+//   the deadline. Withdrawals (bump) move the holding session's recall generation (r:<source>) in their own
+//   transaction.
 // - Replay: POST /v1/recall/blocks with an opaque cursor "seq.gen". A cursor from another generation, or none,
 //   gets every readable block and `replace: true`; otherwise only blocks after its seq.
 import { createHash } from "node:crypto";

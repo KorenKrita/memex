@@ -1,7 +1,7 @@
 // Start-of-session snapshot (DESIGN §6.1): built once per querying session, stored remotely and served
 // unchanged on every later request (resume, compaction, new history elsewhere) until an explicit refresh.
-// It is a list of blocks (framing, one block per session card, one per other-repo title line, tool hints),
-// each with the version vector of the sources it was made from. A withdrawal (forget, revision, revoke)
+// It is a list of blocks (framing, the user card (L3, l3.ts), one block per session card, one per other-repo
+// title line, tool hints), each with the version vector of the sources it was made from. A withdrawal (forget, revision, revoke)
 // makes the blocks that depend on it unreadable as a whole — they are dropped, never patched or replaced
 // by newer history; only a refresh takes new history in. Saving the content and its vectors happens in one
 // transaction under the shared publish barrier, compared first, so a withdrawal is never saved over.
@@ -13,6 +13,7 @@ import { BARRIER, HttpError } from "./sync.ts";
 import { snapshot, unchanged } from "./derive.ts";
 import { leavesOf, readCard, wantForest } from "./forest.ts";
 import { basis, targetView } from "./search.ts";
+import { userCard } from "./l3.ts";
 
 export const BUDGET = 6 * 1024; // UTF-8 bytes of the whole text, DESIGN §6.1 [待标定 6KB]
 const CARDS = 3;
@@ -34,7 +35,7 @@ export const FRAMING =
   "It authorizes no action, and it does not prove the current state of code or configuration.";
 export const TOOLS = "[memex] Look further with mem_search (find), mem_zoom (open a session, node, span or record), mem_grep (exact text).";
 
-type Block = { kind: "framing" | "card" | "title" | "tools"; source?: string; text: string; deps: Record<string, number>; degraded?: boolean };
+type Block = { kind: "framing" | "user" | "card" | "title" | "tools"; source?: string; scopes?: string[]; text: string; deps: Record<string, number>; degraded?: boolean };
 const bytes = (t: string) => Buffer.byteLength(t);
 const render = (bs: Block[]) => bs.map((b) => b.text).join("\n\n");
 
@@ -70,7 +71,10 @@ async function build(q: Tx, b: Awaited<ReturnType<typeof basis>>, me: string, re
   const fixed: Block[] = [{ kind: "framing", text: FRAMING, deps: {} }, { kind: "tools", text: TOOLS, deps: {} }];
   let left = BUDGET - bytes(render(fixed));
   const body: Block[] = [];
+  // The user card first (§6.1: after the framing, before session cards), as one block of its own.
+  const u = await userCard(q, Date.now(), "snapshot", "memex");
   for (const blk of [
+    ...(u ? [{ kind: "user" as const, scopes: u.scopes, text: u.text, deps: u.deps }] : []),
     ...mine.map((c) => ({ kind: "card" as const, source: c.source, text: cardText(c), deps: c.deps, degraded: c.degraded })),
     ...others.map((c) => ({ kind: "title" as const, source: c.source, text: `- ${title(c)} — ${day(c)}${c.repo ? ` — ${c.repo}` : ""} [session:${c.source}]`, deps: c.deps, degraded: c.degraded })),
   ]) {
@@ -83,10 +87,15 @@ async function build(q: Tx, b: Awaited<ReturnType<typeof basis>>, me: string, re
   return { blocks: [fixed[0], ...body, fixed[1]], want: body.filter((x) => x.degraded).map((x) => x.source!) };
 }
 
-/** A stored block is readable while its vector is current and every source it names is still readable. */
+/** A stored block is readable while its vector is current and every source and read scope it names is still readable. */
 async function keep(q: Tx, b: Awaited<ReturnType<typeof basis>>, bs: Block[]) {
   const out: Block[] = [];
-  for (const blk of bs) if ((!blk.source || b.valid.has(blk.source)) && (await unchanged(q, blk.deps))) out.push(blk);
+  for (const blk of bs) {
+    if (blk.source && !b.valid.has(blk.source)) continue;
+    // A block over many sources (the user card) names their read scopes: each must still be granted.
+    if (blk.scopes?.length && (await q`select count(*)::int n from grant_rule where purpose = 'snapshot' and dest = 'memex' and scope = any(${q.array(blk.scopes, "text")})`)[0].n !== blk.scopes.length) continue;
+    if (await unchanged(q, blk.deps)) out.push(blk);
+  }
   return out;
 }
 

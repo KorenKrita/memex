@@ -334,3 +334,32 @@ export async function l3View(q: Tx, t: number, purpose: string, dest: string) {
   const byId = new Map(rows.map((r: any) => [r.id, r]));
   return { view: viewAt(stmts, rels, t, (s: Stmt) => ok.has(s.id)).map((s) => byId.get(s.id)), next: nextBoundary(stmts.filter((s: Stmt) => ok.has(s.id)), t) };
 }
+
+// ---------- user card (DESIGN §4.5, §6.1) ----------
+
+export const USER_MAX = 2048; // UTF-8 bytes of the block [待标定 ≤2KB]
+
+/** The user card at `t` for a snapshot reader: global statements in effect, newest first, whole lines within
+ *  USER_MAX, each naming its evidence (`record:<canonical id>` opens it). Compiled by code, no model call.
+ *  Its vector holds s:<source> of every readable global statement — those shown and those that could hide one
+ *  (a suppressor withdrawn would make the card stale), so a forget or revision drops the block as a whole. */
+export async function userCard(q: Tx, t: number, purpose: string, dest: string): Promise<{ text: string; deps: Record<string, number>; scopes: string[]; next: number | null } | null> {
+  const rows = await q`select * from l3_stmt where scope = 'global' order by id`;
+  const readable: any[] = [];
+  for (const r of rows) if (!(await unreadable(q, r, purpose, dest))) readable.push(r);
+  if (!readable.length) return null;
+  const rels = (await q`select a, b, kind from l3_rel`) as Rel[];
+  const shown = viewAt(readable.map(asStmt), rels, t);
+  if (!shown.length) return null;
+  const byId = new Map(readable.map((r) => [r.id, r]));
+  const lines = shown
+    .map((s) => byId.get(s.id))
+    .sort((a, z) => +new Date(z.stated_at) - +new Date(a.stated_at) || (a.id < z.id ? -1 : 1))
+    .map((r) => `- ${r.text.replace(/\s+/g, " ")} [record:${r.src}:${r.rec}]`);
+  let text = "## About the user (what they said, newest first)";
+  for (const l of lines) if (bytes(text + "\n" + l) <= USER_MAX) text += "\n" + l;
+  const keys = [...new Set<string>(readable.map((r) => "s:" + r.src))];
+  const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((r: any) => [r.key, Number(r.v)]));
+  const scopes = [...new Set<string>(readable.map((r) => r.auth_scope))].sort();
+  return { text, deps: Object.fromEntries(keys.map((k) => [k, vs.get(k) ?? 1])), scopes, next: nextBoundary(readable.map(asStmt), t) };
+}
