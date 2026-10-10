@@ -10,7 +10,7 @@
 import type { Db, Tx } from "./db.ts";
 import { bump, enqueue } from "./db.ts";
 import { blockHashes, CHUNK, sourceIdOf, type Harness } from "../client/records.ts";
-import { contentHash } from "../dryrun/dryrun.ts";
+import { contentHash, isCopyTime } from "../dryrun/dryrun.ts";
 
 export const BARRIER = 1; // global visibility barrier and merge serializer (advisory lock, one-key form)
 const COMMIT_NS = 0x6d656d78; // two-key namespace for commit ids
@@ -165,7 +165,24 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
     };
     const cand = c.changes.flatMap((ch) => [`canon:${l.source}:${ch.id}`, ...(ch.id === "header" ? [] : [copyKey(ch)])]);
     const tombs = new Set<string>((await tx`select key from tomb where key = any(${tx.array(cand, "text")})`).map((r: any) => r.key));
-    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !tombs.has(copyKey(ch))));
+    // Pi: only a possible copy (not newer than this file's fork time, DESIGN §4.1) is refused as one; an own
+    // entry that happens to carry a forgotten record's id and content is accepted.
+    const headRaw = c.changes.find((ch) => ch.id === "header")?.raw
+      ?? (await tx`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                   where r.source = ${l.source} and r.rec = 'header'`)[0]?.raw;
+    let head: any;
+    try {
+      head = headRaw ? JSON.parse(headRaw) : undefined;
+    } catch {}
+    const maybeCopy = (ch: Change) => {
+      if (head?.type !== "session") return true;
+      try {
+        return isCopyTime(JSON.parse(ch.raw), head);
+      } catch {
+        return true;
+      }
+    };
+    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !tombs.has(copyKey(ch)) || !maybeCopy(ch)));
     // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
     const dropped = await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}
                              returning rec`;

@@ -694,6 +694,83 @@ test("a child's copy of a parent version the server never held, then the parent 
   expect(await hasText("kid-new-entry")).toBe(true);
 });
 
+// ---------- review round 5: copy identity through the whole ancestry ----------
+
+/** A → B → C where A holds only the revised u0/a0, B a matching copy of it, C a copy of the old version.
+ *  Copies keep the parent's times (T); each child's own entries are newer than its fork (its header's time). */
+async function threeGen(order: "c-before" | "c-after") {
+  const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+  const u0 = msg("user", "u0", null, "q"), a0new = msg("assistant", "a0", "u0", "gen-revised"), a0old = msg("assistant", "a0", "u0", "gen-old-copy");
+  const A = await put("ga", [header("ga"), u0, a0new]);
+  await drain(db);
+  const B = await put("gb", [header("gb", { parentSession: "/x/ga.jsonl", timestamp: "2026-01-02T00:00:00Z" }), u0, a0new,
+    at(msg("user", "b1", "a0", "gen-b-own"), "2026-01-02T01:00:00Z")], "personal", A);
+  await drain(db);
+  const cl = [header("gc", { parentSession: "/x/gb.jsonl", timestamp: "2026-01-03T00:00:00Z" }), u0, a0old, at(msg("user", "c1", "a0", "gen-c-own"), "2026-01-03T01:00:00Z")];
+  if (order === "c-before") {
+    await put("gc", cl, "personal", B);
+    await drain(db);
+    expect(await hasText("gen-old-copy")).toBe(false);
+  }
+  await forgetSource(db, A);
+  await drain(db);
+  if (order === "c-after") {
+    await put("gc", cl, "personal", B);
+    await drain(db);
+  }
+  return { A, B };
+}
+
+for (const order of ["c-before", "c-after"] as const)
+  test(`a grandparent forgotten (${order === "c-before" ? "grandchild imported before" : "after"}): the grandchild's withdrawn copy stays withdrawn`, async () => {
+    await threeGen(order);
+    expect(await hasText("gen-old-copy")).toBe(false);
+    expect(await hasText("gen-revised")).toBe(false);
+    expect(await hasText("gen-b-own")).toBe(true);
+    expect(await hasText("gen-c-own")).toBe(true);
+  });
+
+test("only the middle fork forgotten: the living grandparent's evidence and the grandchild's own stay", async () => {
+  const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+  const u0 = msg("user", "u0", null, "mid-root-q"), a0 = msg("assistant", "a0", "u0", "mid-root-reply");
+  const A = await put("ma", [header("ma"), u0, a0]);
+  await drain(db);
+  const B = await put("mb", [header("mb", { parentSession: "/x/ma.jsonl", timestamp: "2026-01-02T00:00:00Z" }), u0, a0, at(msg("user", "b1", "a0", "mid-b-own"), "2026-01-02T01:00:00Z")], "personal", A);
+  await drain(db);
+  await put("mc", [header("mc", { parentSession: "/x/mb.jsonl", timestamp: "2026-01-03T00:00:00Z" }), u0, a0, at(msg("user", "c1", "a0", "mid-c-own"), "2026-01-03T01:00:00Z")], "personal", B);
+  await drain(db);
+  await forgetSource(db, B);
+  await drain(db);
+  expect(await hasText("mid-root-reply")).toBe(true); // A's own, alive
+  expect(await hasText("mid-b-own")).toBe(false);
+  expect(await hasText("mid-c-own")).toBe(true);
+});
+
+test("a child's own entry newer than the fork with the same id and content as a parent entry: its own through projection, forget and sync", async () => {
+  const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+  const P = sourceIdOf("pi", "xp");
+  const u0 = msg("user", "u0", null, "xq"), a0 = msg("assistant", "a0", "u0", "xr");
+  const same = at(msg("user", "z9", "a0", "exact-same-own"), "2026-01-05T00:00:00Z");
+  await put("xp", [header("xp"), u0, a0]);
+  await drain(db);
+  const kl = [header("xk", { parentSession: "/x/xp.jsonl", timestamp: "2026-01-02T00:00:00Z" }), u0, a0, same];
+  const K = await put("xk", kl, "personal", P);
+  await drain(db);
+  await put("xp", [header("xp"), u0, a0, same]); // the parent later holds the very same entry
+  await drain(db);
+  const own = async () => ((await db`select keys from projected where source = ${K}`)[0].keys as [string, string][]).filter(([m]) => m.startsWith("z9:")).map(([, k]) => k.split("/")[0]);
+  expect(await own()).toEqual(["xk"]);
+  await forgetSource(db, P);
+  await drain(db);
+  expect(await hasText("exact-same-own")).toBe(true);
+  const l = await requestLease(db, { source: K, harness: "pi", nativeId: "xk", scope: "personal", parent: P }, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "xk-again", length: kl.length, changes: kl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  expect(await hasText("exact-same-own")).toBe(true);
+  expect(await own()).toEqual(["xk"]);
+});
+
 test("a Pi fork that drops a label re-chains the next entry's parent: that copy is still inherited, not withdrawn", async () => {
   const P = sourceIdOf("pi", "lbp");
   const u0 = msg("user", "u0", null, "lbl-question"), lb = JSON.stringify({ type: "label", id: "l1", parentId: "u0", timestamp: T, targetId: "u0", label: "x" });
@@ -952,7 +1029,9 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
   expect(k).toBeDefined();
   expect(await hasText("upgrade-old-copy")).toBe(true);
-  await db`delete from migration_mark where key = 'fork-copy-v2'`;
+  // A database that already ran fork-copy-v2 (only its mark): v3 still runs, once.
+  await db`delete from migration_mark where key = 'fork-copy-v3'`;
+  await db`insert into migration_mark values ('fork-copy-v2') on conflict do nothing`;
   await migrate(db);
   expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
   const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;

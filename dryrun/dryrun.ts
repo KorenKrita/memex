@@ -570,10 +570,16 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
 // content without the parent link (Pi re-chains a copied entry past a dropped label) → canonical record key.
 type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; ids: Set<string>; loose: Map<string, string> };
 const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e)}`;
-const looseOf = (e: Record<string, any>) => {
+/** Pi content equivalence of a copy and its original: everything but the parent link (Pi re-chains a copied
+ *  entry past a dropped label). The one rule for projection, recall, forget and sync. */
+export const looseOf = (e: Record<string, any>) => {
   const { parentId: _, ...rest } = e;
   return `${e.id}:${contentHash(rest)}`;
 };
+/** A Pi entry that may be a fork copy: not newer than the fork (its file's header time); an unreadable time
+ *  counts as possibly a copy (DESIGN §4.1). */
+export const isCopyTime = (e: Record<string, any>, header: Record<string, any> | undefined) =>
+  !(Date.parse(e?.timestamp) > Date.parse(header?.timestamp));
 /** `loose` of entries whose match keys `keys` maps. */
 export function looseKeys(entries: Record<string, any>[], keys: Map<string, string>) {
   const m = new Map<string, string>();
@@ -655,13 +661,14 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
       navOf.set(e.id, []);
       continue;
     }
-    // A copy (DESIGN §4.1): Pi copies the parent's entries with their ids and times, so an entry is one when the
-    // parent has held its id (any version, forgotten ancestors too) and it is not newer than the fork (the
-    // header's time; an unreadable time counts as a copy). Inherited while the parent still has its content —
-    // its parent link aside, which Pi re-chains past dropped labels — else withdrawn with the parent's old
-    // version, never this file's own record. A newer entry that only reuses an id is this file's own.
-    const copied = !!from?.ids.has(e.id) && !(Date.parse(e.timestamp) > Date.parse(header.timestamp));
-    const inheritedKey = from?.keys.get(m) ?? (copied ? from?.loose.get(looseOf(e)) : undefined);
+    // A copy (DESIGN §4.1): Pi copies the parent's entries with their ids and times, so an entry is one when an
+    // ancestor has held its id (any version, forgotten ancestors too) and it is not newer than the fork (the
+    // header's time; an unreadable time counts as a copy). A copy is inherited while the parent still has its
+    // content — its parent link aside, which Pi re-chains past dropped labels — else withdrawn with the old
+    // version, never this file's own record. Any other entry (newer, or an id no ancestor held) is this file's
+    // own, even with the very content of a parent entry.
+    const copied = !!from?.ids.has(e.id) && isCopyTime(e, header);
+    const inheritedKey = copied ? (from?.keys.get(m) ?? from?.loose.get(looseOf(e))) : undefined;
     if (!inheritedKey && copied) {
       res.unresolved++;
       navOf.set(e.id, []);

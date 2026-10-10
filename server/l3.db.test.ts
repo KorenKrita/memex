@@ -79,8 +79,9 @@ beforeEach(async () => {
 });
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+// A fork child's header time is when Pi forked it: after the copied prefix (the latest time of a fixture).
 const header = (id: string, parentSession?: string) =>
-  JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-01-01T00:00:00Z", cwd: "/w/" + id, ...(parentSession ? { parentSession } : {}) });
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? "2026-12-31T00:00:00Z" : "2026-01-01T00:00:00Z", cwd: "/w/" + id, ...(parentSession ? { parentSession } : {}) });
 const msg = (role: string, id: string, parent: string | null, text: string, ts: string) =>
   JSON.stringify({ type: "message", id, parentId: parent, timestamp: ts, message: { role, content: [{ type: "text", text }] } });
 let n = 0;

@@ -14,7 +14,7 @@
 // The host's own log files and existing backups are not touched.
 import { type Db, type Tx, bump, enqueue } from "./db.ts";
 import { BARRIER } from "./sync.ts";
-import { contentHash } from "../dryrun/dryrun.ts";
+import { contentHash, isCopyTime } from "../dryrun/dryrun.ts";
 import "./project.ts";
 import "./derive.ts";
 import "./search.ts";
@@ -48,7 +48,13 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     let copies = 0;
     for (const { id } of desc) {
       const rows = await tx`select rec, hash, raw from body where source = ${id} and rec <> 'header'`;
-      const hit = rows.filter((r: any) => match.has(copyTomb(r.rec, r.raw)));
+      // Only a copy (Pi: not newer than the descendant's fork time, DESIGN §4.1) goes: an own entry that happens
+      // to have a forgotten record's id and content stays.
+      const [hd] = await tx`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                            where r.source = ${id} and r.rec = 'header'`;
+      const head = hd ? JSON.parse(hd.raw) : undefined;
+      const pi = head?.type === "session";
+      const hit = rows.filter((r: any) => match.has(copyTomb(r.rec, r.raw)) && (!pi || isCopyTime(JSON.parse(r.raw), head)));
       if (hit.length) {
         copies += new Set(hit.map((r: any) => r.rec)).size;
         for (const r of hit) {
