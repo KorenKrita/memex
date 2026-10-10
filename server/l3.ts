@@ -93,6 +93,7 @@ export function nextBoundary(stmts: Stmt[], now: number): number | null {
 import { type Db, type Job, type Tx, addMigration, enqueue, finishJob } from "./db.ts";
 import { checkSpan, env, guardedPost, parseJson, publish, sameDeps, skip, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
+import { timeOf } from "../dryrun/dryrun.ts";
 
 addMigration(`
 create table if not exists l3_stmt (id text primary key, src text not null, rec text not null, rec_hash text not null, text text not null,
@@ -173,7 +174,7 @@ async function candidates(q: Tx, harness: string, records: any[]) {
     const [row] = await q`select r.hash, b.raw, s.scope, s.meta->>'repo' repo from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                           join source s on s.id = r.source where r.source = ${src} and r.rec = ${rec} and r.state = 'ok'`;
     if (!row) continue;
-    const ts = Date.parse(JSON.parse(row.raw).timestamp ?? "");
+    const ts = timeOf(JSON.parse(row.raw).timestamp);
     if (!Number.isFinite(ts)) continue; // no time it was said: nothing it could be in effect from
     const seen = (await q`select 1 from l3_seen l join span sp on sp.id = l.span and sp.input_fp = l.input_fp
                           where l.src = ${src} and l.rec = ${rec} and l.rec_hash = ${row.hash}`).length > 0;

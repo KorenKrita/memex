@@ -876,6 +876,20 @@ test("forget of a parent whose descendant's stored header is unreadable (an olde
   expect((await db`select count(*)::int n from record where source = ${D} and rec = 'e'`)[0].n).toBe(0);
 });
 
+test("forget of a parent whose descendant's header time is not a string: completes, the copies go", async () => {
+  const P = sourceIdOf("pi", "tP"), D = sourceIdOf("pi", "tD");
+  const e = msg("user", "e", null, "th-entry");
+  await put("tP", [header("tP"), e]);
+  await drain(db);
+  // A JSON object as the time (no primitive conversion): an unreadable fork time, every match a copy.
+  const h = JSON.stringify({ type: "session", version: 3, id: "tD", timestamp: { toString: null, valueOf: null }, cwd: "/x", parentSession: "/x/tP.jsonl" });
+  await put("tD", [h, e], "personal", P);
+  await drain(db);
+  await forgetSource(db, P);
+  expect((await db`select 1 from tomb where key = ${"source:" + P}`).length).toBe(1);
+  expect((await db`select count(*)::int n from record where source = ${D} and rec = 'e'`)[0].n).toBe(0);
+});
+
 test("sync refuses a record that is not one JSON object", async () => {
   const decl = { source: sourceIdOf("pi", "nj"), harness: "pi" as const, nativeId: "nj", scope: "personal", parent: null };
   const l = await requestLease(db, decl, "m1");

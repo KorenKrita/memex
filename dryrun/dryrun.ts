@@ -578,7 +578,9 @@ export const looseOf = (e: Record<string, any>) => {
 /** A Pi entry that may be a fork copy: not newer than the fork (its file's header time); an unreadable time
  *  counts as possibly a copy (DESIGN §4.1). */
 export const isCopyTime = (e: Record<string, any>, header: Record<string, any> | undefined) =>
-  !(Date.parse(e?.timestamp) > Date.parse(header?.timestamp));
+  !(timeOf(e?.timestamp) > timeOf(header?.timestamp));
+/** A record's time in ms, NaN unless a string Date.parse reads (any other JSON value, never thrown on). */
+export const timeOf = (v: unknown) => (typeof v === "string" ? Date.parse(v) : NaN);
 /** `loose` of entries whose match keys `keys` maps. */
 export function looseKeys(entries: Record<string, any>[], keys: Map<string, string>) {
   const m = new Map<string, string>();
