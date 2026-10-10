@@ -103,12 +103,15 @@ const readable = async (q: Tx, b: Awaited<ReturnType<typeof basis>>, row: any) =
 const out = (row: any, visible: boolean) =>
   visible && row.state !== "legacy" ? { state: row.state, text: row.text, query_hash: row.query_hash } : { state: "withdrawn", text: "", query_hash: row.query_hash };
 
-/** POST /v1/recall: { source, scope, user_rec, input, prev_user?, prev_user_ref?, prev_assistant?, prev_assistant_ref?, dests, leaf?, inContext? }
+/** POST /v1/recall: { source, scope, user_rec, input, prev_user?, prev_user_ref?, prev_assistant?, prev_assistant_ref?, dests, leaf?, inContext?, budget_ms? }
  *  (a ref = { rec: the host record id, hash: sha256 of the line as uploaded }). */
 export async function recall(db: Db, body: any, until0?: number): Promise<Guarded | object> {
   // One absolute deadline for the whole answer: the search, the save and the hand-over (a recomputation after a
   // withdrawal keeps it, never starting a new budget).
-  const until = until0 ?? Date.now() + BUDGET_MS();
+  // The host's remaining budget (`budget_ms`) when shorter: a decision the host has stopped waiting for is
+  // never saved, so no later replay shows it.
+  const hostMs = Number.isInteger(body?.budget_ms) && body.budget_ms > 0 ? body.budget_ms : Infinity;
+  const until = until0 ?? Date.now() + Math.min(BUDGET_MS(), hostMs);
   const late = { state: "timeout" };
   const r = validate(body);
   const input = r.input.trim();

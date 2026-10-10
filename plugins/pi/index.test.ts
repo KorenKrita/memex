@@ -79,11 +79,12 @@ function policy(allow: Record<string, object>) {
 let clock = Date.parse("2026-01-01T00:00:00Z");
 type Entry = { type: string; id: string; parentId: string | null; timestamp: string; message?: any };
 const hosts: { emit: (ev: string, e?: any) => Promise<any> }[] = [];
-function host(native: string) {
+/** A host over a session file; `from` reloads another host's session (resume: same file, same entries). */
+function host(native: string, from?: { entries: Entry[]; leaf: () => string | null }) {
   const file = join(dir, "sessions", `${native}.jsonl`);
-  writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: native, timestamp: new Date(clock).toISOString(), cwd: dir }) + "\n");
-  const entries: Entry[] = [];
-  let leaf: string | null = null;
+  if (!from) writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: native, timestamp: new Date(clock).toISOString(), cwd: dir }) + "\n");
+  const entries: Entry[] = from ? [...from.entries] : [];
+  let leaf: string | null = from ? from.leaf() : null;
   const on = new Map<string, ((e: any, ctx: any) => any)[]>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -99,7 +100,7 @@ function host(native: string) {
     ui: { notify: (m: string) => notes.push(m), setStatus: () => {} },
     sessionManager: {
       getSessionFile: () => file, getSessionId: () => native, getLeafId: () => leaf, getEntry: byId,
-      getBranch: branch, buildContextEntries: branch,
+      getBranch: branch, buildContextEntries: branch, getEntries: () => entries,
     },
   };
   const pi: any = {
@@ -114,8 +115,8 @@ function host(native: string) {
     return r;
   };
   const add = (message: any, persist = true) => {
+    clock = Math.max(clock + 1, Date.now()); // real time, as Pi stamps entries (after the input that made them)
     const e: Entry = { type: "message", id: `e${entries.length}`, parentId: leaf, timestamp: new Date(clock).toISOString(), message: { ...message, timestamp: clock } };
-    clock += 1000;
     entries.push(e);
     leaf = e.id;
     if (persist) appendFileSync(file, JSON.stringify(e) + "\n");
@@ -125,16 +126,17 @@ function host(native: string) {
   hosts.push({ emit });
   void emit("session_start", { reason: "startup" });
   return {
-    file, ctx, tools, commands, notes, emit, entries,
+    file, ctx, tools, commands, notes, emit, entries, leaf: () => leaf,
     setLeaf: (id: string | null) => (leaf = id),
     source: sourceIdOf("pi", native),
     /** One run: input → before_agent_start → user entry → context → reply → turn_end. Returns the system
      *  prompt sections and the messages sent to the model. */
-    async run(input: string, reply: string, o: { source?: string } = {}) {
+    async run(input: string, reply: string, o: { source?: string; beforeContext?: () => Promise<void> } = {}) {
       await emit("input", { text: input, source: o.source ?? "interactive" });
       const sections: Record<string, string> = {};
       await emit("before_agent_start", { prompt: input, systemPrompt: "", systemPromptOptions: { sections } });
       const u = add({ role: "user", content: text(input) }, false); // in memory first: the file has it at turn end
+      await o.beforeContext?.();
       const messages = branch().map((e) => e.message);
       const r = await emit("context", { messages });
       add({ role: "assistant", content: text(reply) }, false);
@@ -206,6 +208,20 @@ test("the snapshot is asked once and the same text set on every run", async () =
   expect((await db`select count(*)::int n from start_snapshot where source = ${h.source}`)[0].n).toBe(1);
 });
 
+test("a stored snapshot is still checked each run: what is forgotten meanwhile is not injected again", async () => {
+  const a = host("old2");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  await drain(db);
+  const h = host("new2");
+  const r1 = await h.run("first", "one");
+  expect(r1.sections.memex).toContain(`session:${a.source}`);
+  const { forgetSource } = await import("../../server/forget.ts");
+  await forgetSource(db, a.source);
+  const r2 = await h.run("second", "two");
+  expect(r2.sections.memex ?? "").not.toContain(`session:${a.source}`);
+});
+
 // ---------- per-turn recall ----------
 
 test("recall: a hint is attached to the latest user message, then replayed frozen on the same message", async () => {
@@ -241,6 +257,56 @@ test("recall carries the previous exchange as references the server accepts", as
   const q = calls.find((c) => c.path.endsWith("/embeddings"))!.body.input[0] as string;
   expect(q).toContain("previous user: tell me about deploys");
   expect(q).toContain("previous reply: deploys use zx-7781 ports");
+});
+
+test("after a resume, the first new input is recalled (history entries do not take the new input)", async () => {
+  const a = host("past7");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now7");
+  await h.run("hello there", "hi");
+  await h.run("and more", "ok");
+  await flush(h);
+  const h2 = host("now7", { entries: h.entries, leaf: h.leaf }); // a new process on the same session
+  const r = await h2.run("the port zx-7781?", "ok");
+  expect(sentText([r.sent.at(-1)])).toContain("<memex-recall>");
+  expect((await db`select state from recall_block where source = ${h.source} and user_rec = ${r.user.id}`)[0]?.state).toBe("shown");
+});
+
+test("the current input already in the local file, the server a turn behind: recall still reads the right branch", async () => {
+  const a = host("past8");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now8");
+  await h.run("tell me about deploys", "deploys use zx-7781 ports");
+  await flush(h);
+  // Pi wrote the new user entry to the file before this context call; no sync since.
+  const r = await h.run("and that port?", "ok", { beforeContext: async () => appendFileSync(h.file, JSON.stringify(h.entries.at(-1)) + "\n") });
+  expect((await db`select state from recall_block where source = ${h.source} and user_rec = ${r.user.id}`)[0]?.state).toBe("shown");
+});
+
+test("a recall answered after the turn's budget is never injected, not even by a later replay", async () => {
+  const a = host("past9");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const { recallHooks } = await import("../../server/recall.ts");
+  process.env.MEMEX_RECALL_MS = "60000"; // the server still answers and saves, late
+  process.env.MEMEX_PI_RECALL_MS = "300"; // the plugin's budget for the turn
+  let release!: () => void;
+  recallHooks.beforeSearch = () => new Promise<void>((r) => (release = r));
+  try {
+    const h = host("now9");
+    const r1 = await h.run("the port zx-7781?", "ok");
+    expect(sentText(r1.sent)).not.toContain("memex-recall");
+    release();
+    await Bun.sleep(300); // the late answer is saved on the server
+    const r2 = await h.run("thanks a lot", "bye");
+    expect(sentText(r2.sent)).not.toContain("memex-recall");
+  } finally {
+    recallHooks.beforeSearch = async () => {};
+    delete process.env.MEMEX_RECALL_MS;
+    delete process.env.MEMEX_PI_RECALL_MS;
+  }
 });
 
 test("an extension's input, a /command and an ambiguous timestamp are not recalled", async () => {

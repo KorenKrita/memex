@@ -166,6 +166,19 @@ test("an empty decision is stored and replayed too", async () => {
   expect((await db`select state from recall_block`).map((r: any) => r.state)).toEqual(["empty"]);
 });
 
+test("budget_ms: past the host's shorter budget nothing is saved, so no later replay shows it", async () => {
+  await put("a", [["where is the port", "ANSWER the port is zx-7781"]]);
+  await drain(db);
+  recallHooks.beforeSearch = () => Bun.sleep(300);
+  try {
+    expect((await ask(R("u1", "the port zx-7781?", { budget_ms: 100 }))).state).toBe("timeout");
+  } finally {
+    recallHooks.beforeSearch = async () => {};
+  }
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+  expect((await replay()).blocks).toEqual([]);
+});
+
 test("slash commands and empty input are skipped; nothing stored", async () => {
   expect((await ask(R("u1", "/memex refresh"))).state).toBe("skipped");
   expect((await ask(R("u2", "   "))).state).toBe("skipped");

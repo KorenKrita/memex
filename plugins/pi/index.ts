@@ -31,10 +31,10 @@ type Session = {
   meta: { repo?: string };
   chain: Promise<unknown>; // syncs, one at a time
   lastSync?: { at: string; outcome: SyncOutcome | { status: "error"; reason: string } };
-  snapshot?: Promise<string>; // the start-of-session text, asked once, replayed as is
   inputs: boolean[]; // input events not yet tied to a user entry, in order: true = typed by the user
-  seen: Set<string>; // user entries already tied to an input
+  seen: Set<string>; // user entries already tied to an input, or there before it
   recalls: Map<string, Promise<void>>; // user entry id → its one recall request
+  late: Set<string>; // user entries whose recall missed its budget: never shown
   blocks: Map<string, string>; // user entry id → frozen recall block
   cursor?: string;
   lastRecall?: string;
@@ -75,7 +75,7 @@ export default function memex(pi: ExtensionAPI) {
     s = {
       file, source: sourceIdOf("pi", ctx.sessionManager.getSessionId()), scope: file ? scopeOf(policy, file) : NONE,
       meta: { ...(repoOf(ctx.cwd) ? { repo: repoOf(ctx.cwd) } : {}) },
-      chain: Promise.resolve(), inputs: [], seen: new Set(), recalls: new Map(), blocks: new Map(),
+      chain: Promise.resolve(), inputs: [], seen: new Set(), recalls: new Map(), late: new Set(), blocks: new Map(),
     };
     return s;
   }
@@ -134,20 +134,24 @@ export default function memex(pi: ExtensionAPI) {
     await within(sync(ctx, SHUTDOWN_MS), SHUTDOWN_MS);
   });
 
-  // §6.1: the snapshot is asked once per session and the same text is set on every run (a stable prefix).
+  // §6.1: the snapshot is built once per session and stored on the server; each run asks for it again, so the
+  // server re-checks it (a forget or revoke since drops what it covered) — the same text otherwise (stable prefix).
   pi.on("before_agent_start", async (e, ctx) => {
     const x = stateOf(ctx);
     if (!can(x, "snapshot")) return;
-    x.snapshot ??= t!("POST", "/v1/snapshot", { source: x.source, scope: x.scope, ...(x.meta.repo ? { repo: x.meta.repo } : {}) },
-                      { deadline: Date.now() + SNAPSHOT_MS })
+    const text = await t!("POST", "/v1/snapshot", { source: x.source, scope: x.scope, ...(x.meta.repo ? { repo: x.meta.repo } : {}) },
+                          { deadline: Date.now() + SNAPSHOT_MS })
       .then((r: any) => (typeof r?.text === "string" ? r.text : ""))
       .catch(() => "");
-    const text = await x.snapshot;
     if (text && stateOf(ctx) === x) e.systemPromptOptions.sections.memex = text;
   });
 
+  // An input becomes one new user entry. Entries that exist when it arrives (history of a resumed session, other
+  // branches) are never its entry.
   pi.on("input", async (e, ctx) => {
-    stateOf(ctx).inputs.push(e.source !== "extension");
+    const x = stateOf(ctx);
+    for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
+    x.inputs.push(e.source !== "extension");
   });
 
   // §6.2: recall for the latest user message, once per user entry; frozen blocks replayed on their messages.
@@ -163,18 +167,25 @@ export default function memex(pi: ExtensionAPI) {
       const hit = branch.filter((b: any) => b.type === "message" && ts(b.message) === at);
       return hit.length === 1 ? (hit[0] as any) : undefined;
     };
-    // Each input becomes one user entry, in order: the new user entries on the branch take the queued inputs
-    // (an extension's message — sendUserMessage, steer — is never recalled).
+    // Each queued input takes the next new user entry on the branch, in order (an extension's message —
+    // sendUserMessage, steer — is never recalled).
     let human = false;
     for (const b of branch as any[])
       if (b.type === "message" && b.message?.role === "user" && !x.seen.has(b.id)) {
         x.seen.add(b.id);
         human = x.inputs.shift() ?? false;
       }
+    const leaf = ctx.sessionManager.getLeafId();
     const latest = [...e.messages].reverse().find((m: any) => m.role === "user");
     const cur = latest && entryOf(latest);
-    if (cur && human && branch.at(-1)?.id === cur.id && !x.recalls.has(cur.id)) x.recalls.set(cur.id, recallFor(ctx, x, branch, cur));
-    if (cur && x.recalls.has(cur.id)) await within(x.recalls.get(cur.id)!, RECALL_MS);
+    if (cur && human && branch.at(-1)?.id === cur.id && !x.recalls.has(cur.id)) {
+      // One budget from here for the whole recall; an answer after it is dropped, and so is its block later.
+      const deadline = Date.now() + Number(process.env.MEMEX_PI_RECALL_MS ?? RECALL_MS);
+      x.recalls.set(cur.id, recallFor(ctx, x, branch, cur, deadline).then(() => {
+        if (Date.now() >= deadline) x.late.add(cur.id);
+      }));
+      if ((await within(x.recalls.get(cur.id)!, Math.max(0, deadline - Date.now()))) === "late") x.late.add(cur.id);
+    }
     // Blocks as the server has them now; unreachable → every past block is left out (§6.2 degradation).
     let ok = false;
     try {
@@ -188,11 +199,12 @@ export default function memex(pi: ExtensionAPI) {
       x.cursor = undefined;
       x.blocks = new Map();
     }
-    if (!ok || !x.blocks.size || stateOf(ctx) !== x) return;
+    // Still the state this request was made for: same session, same leaf.
+    if (!ok || !x.blocks.size || stateOf(ctx) !== x || ctx.sessionManager.getLeafId() !== leaf) return;
     let changed = false;
     const messages = e.messages.map((m: any) => {
       const entry = m.role === "user" ? entryOf(m) : undefined;
-      const block = entry && x.blocks.get(entry.id);
+      const block = entry && !x.late.has(entry.id) ? x.blocks.get(entry.id) : undefined;
       if (!block) return m;
       changed = true;
       const content = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
@@ -203,10 +215,10 @@ export default function memex(pi: ExtensionAPI) {
 
   /** The one recall request of a user entry: its text, the same branch's previous exchange (with references to
    *  the lines as uploaded), the leaf the query reads from. A refusal or timeout injects nothing. */
-  async function recallFor(ctx: ExtensionContext, x: Session, branch: any[], cur: any) {
+  async function recallFor(ctx: ExtensionContext, x: Session, branch: any[], cur: any, deadline: number) {
     const input = piTextOf(cur, "user");
     if (!input || input.startsWith("/")) return;
-    await within(x.chain, 1_000); // the previous turn's sync, so its records can be referenced
+    await within(x.chain, Math.max(0, Math.min(1_000, deadline - Date.now()))); // the previous turn's sync, so its records can be referenced
     const at = branch.findIndex((b) => b.id === cur.id);
     const prior = at < 0 ? [] : branch.slice(0, at);
     const u = prior.findLastIndex((b) => b.type === "message" && piTextOf(b, "user"));
@@ -216,18 +228,20 @@ export default function memex(pi: ExtensionAPI) {
     const ref = (b: any) => (b && hashOf.has(b.id) ? { rec: b.id, hash: hashOf.get(b.id)! } : null);
     const pu = u >= 0 ? prior[u] : undefined, pa = a > u && u >= 0 ? prior[a] : undefined;
     const pur = ref(pu), par = pur ? ref(pa) : null;
-    const synced = hashOf.has(cur.id);
     const body = {
       source: x.source, scope: x.scope, user_rec: cur.id, input,
       ...(pur ? { prev_user: piTextOf(pu, "user"), prev_user_ref: pur } : {}),
       ...(par ? { prev_assistant: piTextOf(pa, "assistant"), prev_assistant_ref: par } : {}),
       dests: allowedDests(policy, x.scope, "recall"),
-      // Not yet uploaded: the query reads the branch it continues (its parent), else the input itself.
-      ...(synced ? { leaf: cur.id } : cur.parentId ? { leaf: cur.parentId } : {}),
+      // The branch the input continues: its parent. Valid whether or not the server has the input yet (a local
+      // file holding it says nothing about the server's copy).
+      ...(cur.parentId ? { leaf: cur.parentId } : {}),
+      // What is left of the budget, less the way back: the server saves nothing after it.
+      budget_ms: Math.max(1, deadline - Date.now() - 200),
       inContext: ctx.sessionManager.buildContextEntries().map((b: any) => b.id).filter((id: string) => id !== cur.id).slice(-10_000),
     };
     try {
-      const r: any = await t!("POST", "/v1/recall", body, { deadline: Date.now() + RECALL_MS });
+      const r: any = await t!("POST", "/v1/recall", body, { deadline });
       x.lastRecall = `${new Date().toISOString()} ${r.state}${r.reason ? ` (${r.reason})` : ""}`;
     } catch (e) {
       x.lastRecall = `${new Date().toISOString()} failed: ${err(e)}`;
