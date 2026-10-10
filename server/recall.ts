@@ -146,6 +146,11 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const text = ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
           if (text.trim() !== input) return { found: null, pin, stale: true };
         }
+        else if (keys.length && (await q`select 1 from tomb where key = any(${q.array(keys.map((k: string) => `canon:${k.slice(2)}:${r.user_rec}`), "text")}) limit 1`).length) {
+          // Not in L0, but a forgotten ancestor of this lineage held this id: a copy forget removed (Pi copies keep
+          // the parent's ids), not a new input — refused, never sent as "not yet synced".
+          return { found: null, pin, stale: true };
+        }
         // Each referenced record of the previous exchange: its canonical record (an inherited one is its fork
         // ancestor's) still holds the referenced line, nothing of it tombed. Else the query is not of this state.
         for (const ref of [r.prev_user_ref, r.prev_assistant_ref]) {

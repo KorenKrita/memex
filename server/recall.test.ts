@@ -1081,6 +1081,24 @@ test("a fork child's input withdrawn by the parent's revision: refused with or w
   expect(calls.length).toBe(0);
 });
 
+for (const withPrev of [false, true])
+  test(`a fork child's input inherited from a parent since forgotten (${withPrev ? "with" : "without"} the previous exchange): refused, nothing sent`, async () => {
+    await put("a", [["q", "ANSWER zx-7781"]]);
+    const P = sourceIdOf("pi", "gpar");
+    const u0 = msg("user", "u0", null, "g question"), a0 = msg("assistant", "a0", "u0", "g reply"), u1 = msg("user", "u1", "a0", "GONE_INPUT zx-7781");
+    await putRaw("gpar", [header("gpar"), u0, a0, u1]);
+    await drain(db);
+    await putRaw("me", [header("me", { parentSession: "/x/gpar.jsonl" }), u0, a0, u1], undefined, P);
+    await drain(db);
+    await forgetSource(db, P); // the child's copies of P's records leave its L0
+    await drain(db);
+    expect((await db`select count(*)::int n from record where source = ${me} and rec = 'u1'`)[0].n).toBe(0);
+    calls = [];
+    const x = withPrev ? { prev_user: "g question", prev_user_ref: ref(u0), prev_assistant: "g reply", prev_assistant_ref: ref(a0) } : {};
+    expect((await ask(R("u1", "GONE_INPUT zx-7781", x))).state).toBe("query-stale");
+    expect(calls.length).toBe(0);
+  });
+
 test("a synced, readable input id with another text: refused; with its own text: sent", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   await put("me", [["first", "reply one"], ["zx-7781 real input", "pending"]]);
