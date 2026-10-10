@@ -25,6 +25,8 @@ let judge = (a: string, b: string) => {
   return { same_object: true, relation: "replaces" };
 };
 let srv: ReturnType<typeof Bun.serve>;
+/** Set by a test: the fake model replies only once it has settled (a change landing while a request is out). */
+let before: Promise<unknown> | null = null;
 beforeAll(async () => {
   db = connect();
   await migrate(db);
@@ -36,7 +38,10 @@ beforeAll(async () => {
       const sys = body.messages[0].content as string;
       const content = body.messages[1].content as string;
       requests.push({ sys, content });
-      const reply = (o: object) => Response.json({ choices: [{ message: { content: JSON.stringify(o) } }] });
+      const reply = async (o: object) => {
+        if (before) await before.finally(() => (before = null));
+        return Response.json({ choices: [{ message: { content: JSON.stringify(o) } }] });
+      };
       if (sys.startsWith("You extract")) {
         const recs = [...content.matchAll(/<record id="([^"]*)" kind="(\w+)"([^>]*)>\n([\s\S]*?)\n<\/record>/g)].map((m) => ({
           id: m[1], kind: m[2], citable: m[3].includes('citable="yes"'), text: m[4].replace(/^\w+: /, ""),
@@ -70,6 +75,7 @@ beforeEach(async () => {
   requests = [];
   extract = DEFAULT_EXTRACT;
   judge = DEFAULT_JUDGE;
+  before = null;
 });
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -167,26 +173,28 @@ test("two statements published at once still get their pair", async () => {
   await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
   await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
   await drain(db, ["project", "summarize", "embed"]); // spans closed; the two l3 jobs wait
-  let release!: () => void;
-  const gate = new Promise<void>((ok) => (release = ok));
-  let first = true;
+  let calls = 0;
+  let other: Promise<unknown> | null = null;
   l3Hooks.afterPlanRead = async () => {
-    if (!first) return;
-    first = false;
-    // The first publisher has read its scope; the second one runs now and would read before the first commits.
-    const other = runOne(db, ["l3"]);
-    await Bun.sleep(300);
-    release();
-    void other;
+    if (++calls > 1) return; // the second publisher planning (only possible without the scope lock)
+    // The first publisher has read its scope and not committed. Run the second until it either waits for the
+    // first's scope lock or has read its own scope (then it could miss the first's statement).
+    other = runOne(db, ["l3"]);
+    for (let i = 0; i < 400; i++) {
+      const [w] = await db`select count(*)::int n from pg_locks where locktype = 'advisory' and not granted`;
+      if (w.n > 0 || calls > 1) return;
+      await Bun.sleep(5);
+    }
+    throw new Error("the second publisher neither waited nor planned");
   };
   try {
-    const one = runOne(db, ["l3"]);
-    await gate;
-    await one;
-    await drain(db, ["l3"]);
+    await runOne(db, ["l3"]);
+    expect(other).not.toBeNull();
+    await other;
   } finally {
     l3Hooks.afterPlanRead = async () => {};
   }
+  expect((await db`select count(*)::int n from l3_stmt`)[0].n).toBe(2);
   await drain(db);
   expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(1);
   expect(await texts()).toEqual(["PREF TOPICpm NEW use pnpm"]);
@@ -272,7 +280,8 @@ test("a record claimed by another extraction meanwhile keeps the first set", asy
   hooks.afterCheck = async () => {
     hooks.afterCheck = async () => {};
     const [r] = await db`select rec, hash from record where source = ${a.source} and rec = 'au0'`;
-    await db`insert into l3_seen values (${a.source}, ${r.rec}, ${r.hash})`;
+    const [sp] = await db`select id, input_fp from span where source = ${a.source}`;
+    await db`insert into l3_seen (src, rec, rec_hash, span, input_fp) values (${a.source}, ${r.rec}, ${r.hash}, ${sp.id}, ${sp.input_fp})`;
   };
   await drain(db, ["l3"]);
   expect((await db`select count(*)::int n from l3_stmt`)[0].n).toBe(0);
@@ -415,4 +424,134 @@ test("a revised record's statement is not on a freshly built card", async () => 
   await drain(db, ["project", "summarize", "embed", "l3"]);
   await put("a", [["something else", "ok", T0]]); // revised, not drained: no re-extraction yet
   expect((await snap()).text).not.toContain("use npm");
+});
+
+// ---------- generation dependencies: a statement is made from the whole input, not only its cited record ----------
+
+test("the context a statement was read with is forgotten: the statement goes, though its own record is unchanged", async () => {
+  extract = (recs) =>
+    recs.filter((r) => r.citable && r.kind === "user" && r.text.includes("PREF")).map((r) => ({
+      record_id: r.id, text: r.text + " ctx[" + recs.filter((x) => !x.citable && x.kind === "user").map((x) => x.text).join(",") + "]",
+      scope: "global", retraction: false, effective_from: null, effective_phrase: null,
+    }));
+  const p = await put("par", [["convention is tabs", "ok", T0]]);
+  await drain(db);
+  await put("kid", [["PREF TOPICfmt follow that", "ok", T1]], { parent: p.source, parentNative: "par", prefix: p.lines.slice(1) });
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICfmt follow that ctx[convention is tabs]"]);
+  await forgetSource(db, p.source);
+  expect(await texts()).toEqual([]); // not before it is made again
+  expect((await db`select count(*)::int n from l3_stmt where text like '%tabs%'`)[0].n).toBe(0); // gone from storage too
+  await drain(db);
+  expect((await texts()).some((t) => t.includes("tabs"))).toBe(false);
+});
+
+test("the context a statement was read with is revised: the old statement is unreadable and the record is read again", async () => {
+  extract = (recs) =>
+    recs.filter((r) => r.citable && r.kind === "user" && r.text.includes("PREF")).map((r) => ({
+      record_id: r.id, text: r.text + " ctx[" + recs.filter((x) => x.id !== r.id && x.kind === "user").map((x) => x.text).join(",") + "]",
+      scope: "global", retraction: false, effective_from: null, effective_phrase: null,
+    }));
+  await put("s", [["convention is tabs", "ok", T0], ["PREF TOPICfmt follow that", "ok", T1]]);
+  await drain(db);
+  const before = await texts();
+  expect(before.length).toBe(1);
+  expect(before[0]).toContain("tabs");
+  await put("s", [["convention is spaces", "ok", T0], ["PREF TOPICfmt follow that", "ok", T1]]); // the earlier record revised
+  expect((await texts()).some((t) => t.includes("tabs"))).toBe(false);
+  await drain(db);
+  const after = await texts();
+  expect(after.length).toBe(1);
+  expect(after[0]).toContain("spaces");
+  expect((await db`select count(*)::int n from l3_stmt where text like '%tabs%'`)[0].n).toBe(0); // the stale one is gone
+});
+
+test("spans closed before L3 existed are extracted after an upgrade, once; starting again adds nothing", async () => {
+  await put("old", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db, ["project", "summarize", "embed"]);
+  await db`delete from job where kind = 'l3'`; // as before the upgrade: no L3 job was ever queued
+  await migrate(db);
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICpm use npm"]);
+  const k = requests.length;
+  await migrate(db);
+  await drain(db);
+  expect(requests.length).toBe(k);
+  expect((await db`select count(*)::int n from l3_stmt`)[0].n).toBe(1);
+});
+
+import { zoom } from "./search.ts";
+test("a user card line's record: handle opens the user's words with mem_zoom", async () => {
+  await db`insert into grant_rule values ('personal', 'tool', 'memex')`;
+  await put("a", [["PREF TOPICpm use pnpm", "ok", T0]]);
+  await drain(db);
+  const h = /\[(record:[^\]]+)\]/.exec((await snap()).text)![1];
+  const z = (await zoom(db, { source: sourceIdOf("pi", "me"), scope: "personal", purpose: "tool", id: h })).body as any;
+  expect(z.records.map((x: any) => x.text)).toEqual(["PREF TOPICpm use pnpm"]);
+});
+
+test("a forget while the extraction request is out: nothing is stored", async () => {
+  const a = await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db, ["project", "summarize", "embed"]);
+  const orig = extract;
+  extract = (recs) => {
+    extract = orig;
+    before = forgetSource(db, a.source); // lands after the send, before the reply
+    return orig(recs);
+  };
+  await drain(db, ["l3"]);
+  expect(requests.some((r) => r.sys.startsWith("You extract"))).toBe(true);
+  expect((await db`select count(*)::int n from l3_stmt`)[0].n).toBe(0);
+});
+
+test("a forget while the pair request is out: no relation is stored", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  const b = await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
+  await drain(db, ["project", "summarize", "embed", "l3"]);
+  const orig = judge;
+  judge = (x, y) => {
+    judge = orig;
+    before = forgetSource(db, b.source);
+    return orig(x, y);
+  };
+  await drain(db, ["l3pair"]);
+  expect(requests.some((r) => r.sys.startsWith("You compare"))).toBe(true);
+  expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(0);
+  expect(await texts()).toEqual(["PREF TOPICpm use npm"]);
+});
+
+test("crossing an effective boundary: a new snapshot shows the new decision, a stored one stays as it was", async () => {
+  const soon = new Date(Date.now() + 1500);
+  extract = (recs) =>
+    recs.filter((r) => r.citable && r.kind === "user" && r.text.includes("PREF")).map((r) => ({
+      record_id: r.id, text: r.text, scope: "global", retraction: false,
+      effective_from: r.text.includes("from then") ? soon.toISOString() : null, effective_phrase: r.text.includes("from then") ? "from then" : null,
+    }));
+  const now = new Date(Date.now() - 60_000).toISOString();
+  await put("a", [["PREF TOPICpm use npm", "ok", now]]);
+  await put("b", [["PREF TOPICpm NEW from then use pnpm", "ok", now.replace(/:00\.\d+Z$/, ":30.000Z")]]);
+  await drain(db);
+  const s1 = await snap();
+  expect(s1.text).toContain("use npm");
+  expect(s1.text).not.toContain("use pnpm");
+  await Bun.sleep(1600);
+  expect((await snap()).text).toBe(s1.text); // frozen
+  const r = await snap({ refresh_id: "after" });
+  expect(r.text).toContain("use pnpm");
+  expect(r.text).not.toContain("use npm");
+});
+
+test("a revoke while the pair request is out: no relation is stored", async () => {
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await put("b", [["PREF TOPICpm NEW use pnpm", "ok", T1]]);
+  await drain(db, ["project", "summarize", "embed", "l3"]);
+  const orig = judge;
+  judge = (x, y) => {
+    judge = orig;
+    before = revokeGrant(db, "personal", "derive", "llm");
+    return orig(x, y);
+  };
+  await drain(db, ["l3pair"]);
+  expect(requests.some((r) => r.sys.startsWith("You compare"))).toBe(true);
+  expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(0);
 });

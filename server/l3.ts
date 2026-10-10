@@ -91,7 +91,7 @@ export function nextBoundary(stmts: Stmt[], now: number): number | null {
 // - Readable = the canonical record still holds that content, nothing of it is tombed, the scope is granted
 //   for the reader's purpose; forget removes statements, relations and extraction marks of the source.
 import { type Db, type Job, type Tx, addMigration, enqueue, finishJob } from "./db.ts";
-import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot } from "./derive.ts";
+import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
 
 addMigration(`
@@ -104,6 +104,20 @@ create index if not exists l3_stmt_src on l3_stmt (src);
 create table if not exists l3_seen (src text not null, rec text not null, rec_hash text not null, primary key (src, rec, rec_hash));
 create table if not exists l3_rel (key text primary key, a text not null, b text not null, kind text not null, model text not null,
                                    prompt_v text not null, at timestamptz not null default now());
+-- What a statement was made from: the whole extraction input (its span at that input, every source's version,
+-- every read scope), not only the record it cites.
+alter table l3_stmt add column if not exists deps jsonb not null default '{}';
+alter table l3_stmt add column if not exists input_fp text not null default '';
+alter table l3_stmt add column if not exists scopes text[] not null default '{}';
+alter table l3_seen add column if not exists span text not null default '';
+alter table l3_seen add column if not exists input_fp text not null default '';
+-- Spans closed before L3 existed (or whose extraction was lost): queue them, once (idempotent on every start).
+insert into job (kind, key)
+  select 'l3', s.id from span s
+  where exists (select 1 from jsonb_array_elements(s.records) x join unnest(s.keys, s.canons) k(key, canon) on k.key = x->>'key'
+                where x->>'kind' = 'user' and not exists (select 1 from l3_seen l where l.src || ':' || l.rec = k.canon))
+    and exists (select 1 from view v where v.span_ids @> array[s.id])
+on conflict (kind, key) where state in ('queued', 'running') do nothing;
 `);
 
 export const EXTRACT_VERSION = "l3-extract-v1";
@@ -156,7 +170,8 @@ async function candidates(q: Tx, harness: string, records: any[]) {
     if (!row) continue;
     const ts = Date.parse(JSON.parse(row.raw).timestamp ?? "");
     if (!Number.isFinite(ts)) continue; // no time it was said: nothing it could be in effect from
-    const seen = (await q`select 1 from l3_seen where src = ${src} and rec = ${rec} and rec_hash = ${row.hash}`).length > 0;
+    const seen = (await q`select 1 from l3_seen l join span sp on sp.id = l.span and sp.input_fp = l.input_fp
+                          where l.src = ${src} and l.rec = ${rec} and l.rec_hash = ${row.hash}`).length > 0;
     out.push({ id: r.id, src, rec, hash: row.hash, stated_at: ts, repo: row.repo ?? null, auth: row.scope, digest: r.digest, citable: !seen });
   }
   return out;
@@ -235,25 +250,35 @@ export async function runL3(db: Db, job: Job) {
     problems = chk.problems;
     if (problems.length) continue;
     return publish(db, job, c.deps, async (tx) => {
-      // Claim each record's extraction; one claimed meanwhile (a fork copy, another span) keeps the first set.
+      // Claim each record's extraction; one claimed meanwhile (a fork copy, another span) whose input still holds
+      // keeps the first set. A claim whose input moved (its span re-cut, its context revised) is taken over: its
+      // statements are unreadable for good, and go with their relations (their text is never rewritten).
       const mine = new Set<string>();
-      for (const x of c.cands.values())
-        if (x.citable && (await tx`insert into l3_seen values (${x.src}, ${x.rec}, ${x.hash}) on conflict do nothing returning 1`).length) mine.add(x.id);
+      for (const x of c.cands.values()) {
+        if (!x.citable) continue;
+        const won = await tx`insert into l3_seen (src, rec, rec_hash, span, input_fp) values (${x.src}, ${x.rec}, ${x.hash}, ${job.key}, ${c.span.input_fp})
+                             on conflict (src, rec, rec_hash) do update set span = excluded.span, input_fp = excluded.input_fp
+                             where not exists (select 1 from span sp where sp.id = l3_seen.span and sp.input_fp = l3_seen.input_fp) returning 1`;
+        if (!won.length) continue;
+        mine.add(x.id);
+        await dropStale(tx, x.src, x.rec);
+      }
       const stmts = chk.stmts.filter((x) => mine.has(x.cand.id));
-      await planAndInsert(tx, stmts, job.key, model);
+      await planAndInsert(tx, stmts, job.key, c.span.input_fp, c.deps, c.scopes, model);
     });
   }
   throw new Error(problems.length ? `extraction invalid after ${MAX_TRIES} tries` : "inputs kept changing");
 }
 
 /** Insert new statements and queue every pair they make in their scopes, under those scopes' locks. */
-async function planAndInsert(tx: Tx, stmts: NewStmt[], span: string, model: string) {
+async function planAndInsert(tx: Tx, stmts: NewStmt[], span: string, inputFp: string, deps: Record<string, number>, scopes0: string[], model: string) {
   const scopes = [...new Set(stmts.map((x) => x.scope))].sort();
   for (const s of scopes) await tx`select pg_advisory_xact_lock(hashtextextended(${"l3:" + s}, 0))`;
   for (const x of stmts)
-    await tx`insert into l3_stmt (id, src, rec, rec_hash, text, scope, auth_scope, stated_at, effective_from, retraction, span, model, prompt_v)
+    await tx`insert into l3_stmt (id, src, rec, rec_hash, text, scope, auth_scope, stated_at, effective_from, retraction, span, model, prompt_v, deps, input_fp, scopes)
              values (${x.id}, ${x.cand.src}, ${x.cand.rec}, ${x.cand.hash}, ${x.text}, ${x.scope}, ${x.cand.auth}, ${new Date(x.cand.stated_at)},
-                     ${x.effective_from === null ? null : new Date(x.effective_from)}, ${x.retraction}, ${span}, ${model}, ${EXTRACT_VERSION})
+                     ${x.effective_from === null ? null : new Date(x.effective_from)}, ${x.retraction}, ${span}, ${model}, ${EXTRACT_VERSION},
+                     ${deps}, ${inputFp}, ${tx.array([...new Set([...scopes0, x.cand.auth])].sort(), "text")})
              on conflict do nothing`;
   for (const s of scopes) {
     const all = (await tx`select id from l3_stmt where scope = ${s}`).map((r: any) => r.id as string);
@@ -263,13 +288,31 @@ async function planAndInsert(tx: Tx, stmts: NewStmt[], span: string, model: stri
   }
 }
 
-/** Why statement `s` cannot be read for (purpose, dest) now, or null. */
+/** A claim's statements once its input moved: unreadable for good, removed with their relations. */
+async function dropStale(tx: Tx, src: string, rec: string) {
+  const gone = (await tx`delete from l3_stmt s where s.src = ${src} and s.rec = ${rec}
+                         and not exists (select 1 from span sp where sp.id = s.span and sp.input_fp = s.input_fp) returning id`).map((r: any) => r.id as string);
+  if (gone.length) await tx`delete from l3_rel where a = any(${tx.array(gone, "text")}) or b = any(${tx.array(gone, "text")})`;
+}
+
+/** Why statement `s` cannot be read for (purpose, dest) now, or null. Readable only while what it was made
+ *  from holds as a whole (DESIGN §5.5): its span at the same input (a revised record or <context> changes the
+ *  input), that span's projection current, the cited record unchanged, nothing of its sources tombed, every
+ *  source's version as made (a forget or revision anywhere in the input moves one), every read scope granted. */
 async function unreadable(q: Tx, s: any, purpose: string, dest: string): Promise<string | null> {
   if ((await q`select 1 from tomb where key = any(${q.array(["source:" + s.src, `canon:${s.src}:${s.rec}`], "text")}) limit 1`).length) return "forgotten";
   if (!(await q`select 1 from record where source = ${s.src} and rec = ${s.rec} and state = 'ok' and hash = ${s.rec_hash}`).length) return "record-changed";
-  if (!(await q`select 1 from grant_rule where scope = ${s.auth_scope} and purpose = ${purpose} and dest = ${dest}`).length) return `not-granted:${dest}`;
+  const [sp] = await q`select sp.source, p.deps from span sp join projected p on p.source = sp.source and p.status = 'ok'
+                       where sp.id = ${s.span} and sp.input_fp = ${s.input_fp}`;
+  if (!sp || !(await unchanged(q, sp.deps))) return "input-changed";
+  if (!(await unchanged(q, sDeps(s.deps)))) return "input-changed";
+  const scopes: string[] = s.scopes?.length ? s.scopes : [s.auth_scope];
+  if ((await q`select count(*)::int n from grant_rule where scope = any(${q.array(scopes, "text")}) and purpose = ${purpose} and dest = ${dest}`)[0].n !== scopes.length)
+    return `not-granted:${dest}`;
   return null;
 }
+/** The source versions of a generation vector (its d: keys are the model destination's, not the reader's). */
+const sDeps = (d: Record<string, number>) => Object.fromEntries(Object.entries(d ?? {}).filter(([k]) => k.startsWith("s:")));
 
 const asStmt = (r: any): Stmt => ({ id: r.id, scope: r.scope, stated_at: +new Date(r.stated_at), effective_from: r.effective_from ? +new Date(r.effective_from) : null, retraction: r.retraction });
 
@@ -287,9 +330,10 @@ export async function runL3Pair(db: Db, job: Job) {
       if ((await q`select 1 from l3_rel where key = ${job.key} and model = ${model} and prompt_v = ${PAIR_VERSION}`).length) return { ok: false as const, gone: true };
       for (const r of rows) {
         const why = await unreadable(q, r, "derive", "llm");
-        if (why) return { ok: false as const, reason: why, scopes: [...new Set(rows.map((r: any) => r.auth_scope as string))] };
+        if (why === "forgotten" || why === "input-changed" || why === "record-changed") return { ok: false as const, gone: true }; // for good
+        if (why) return { ok: false as const, reason: why, scopes: [...new Set<string>(rows.flatMap((r: any) => (r.scopes?.length ? r.scopes : [r.auth_scope])))] };
       }
-      const keys: string[] = [...new Set<string>(rows.map((r: any) => "s:" + r.src)), "d:llm"];
+      const keys: string[] = [...new Set<string>(rows.flatMap((r: any) => ["s:" + r.src, ...Object.keys(sDeps(r.deps))])), "d:llm"];
       const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((r: any) => [r.key, Number(r.v)]));
       return { ok: true as const, rows, deps: Object.fromEntries(keys.map((k) => [k, vs.get(k) ?? 1])) };
     });
@@ -362,8 +406,8 @@ export async function userCard(q: Tx, t: number, purpose: string, dest: string):
     .map((r) => `- ${r.text.replace(/\s+/g, " ")} [record:${r.src}:${r.rec}]`);
   let text = "## About the user (what they said, newest first)";
   for (const l of lines) if (bytes(text + "\n" + l) <= USER_MAX) text += "\n" + l;
-  const keys = [...new Set<string>(readable.map((r) => "s:" + r.src))];
+  const keys = [...new Set<string>(readable.flatMap((r) => ["s:" + r.src, ...Object.keys(sDeps(r.deps))]))];
   const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((r: any) => [r.key, Number(r.v)]));
-  const scopes = [...new Set<string>(readable.map((r) => r.auth_scope))].sort();
+  const scopes = [...new Set<string>(readable.flatMap((r) => (r.scopes?.length ? r.scopes : [r.auth_scope])))].sort();
   return { text, deps: Object.fromEntries(keys.map((k) => [k, vs.get(k) ?? 1])), scopes, next: nextBoundary(readable.map(asStmt), t) };
 }

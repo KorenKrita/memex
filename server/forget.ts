@@ -74,9 +74,14 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     for (const r of await tx`delete from span_summary where deps ? ${"s:" + source} returning span`) await enqueue(tx, "summarize", r.span);
     await tx`delete from forest_access where source = ${source}`;
     // L3: its statements (evidence of this source), their relations, and its extraction marks.
-    await tx`delete from l3_rel r using l3_stmt s where s.src = ${source} and (r.a = s.id or r.b = s.id)`;
-    await tx`delete from l3_stmt where src = ${source}`;
-    await tx`delete from l3_seen where src = ${source}`;
+    // Also statements of other sessions read with it (its records in their <context> or inherited prefix): they
+    // go, and their spans are read again from what is left.
+    const l3 = await tx`delete from l3_stmt where src = ${source} or deps ? ${"s:" + source} returning id, span`;
+    const l3ids = l3.map((r: any) => r.id as string);
+    if (l3ids.length) await tx`delete from l3_rel where a = any(${tx.array(l3ids, "text")}) or b = any(${tx.array(l3ids, "text")})`;
+    const l3spans = [...new Set<string>(l3.map((r: any) => r.span as string))];
+    await tx`delete from l3_seen where src = ${source} or span = any(${tx.array(l3spans, "text")})`;
+    for (const sp of l3spans) await enqueue(tx, "l3", sp);
     await tx`delete from session_card where source = ${source} or deps ? ${"s:" + source}`;
     // Start snapshots: the source's own, and every block made from it in anyone else's (text and all).
     await tx`delete from start_snapshot where source = ${source}`;
