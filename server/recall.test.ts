@@ -767,3 +767,20 @@ test("the session's own previous exchange revised before the recall: the host's 
   expect(outbound()).not.toContain("OLD_QUESTION");
   expect(calls.length).toBe(0);
 });
+
+test("a recall block's source scope revoked then granted again: the block stays withdrawn", async () => {
+  const { allowGrant } = await import("./derive.ts");
+  await db`insert into grant_rule values ('work', 'sync', 'memex'), ('work', 'derive', 'llm'), ('work', 'derive', 'embedding'), ('work', 'recall', 'memex'), ('work', 'recall', 'rerank'), ('work', 'recall', 'embedding')`;
+  const decl = { source: sourceIdOf("pi", "w"), harness: "pi" as const, nativeId: "w", scope: "work", parent: null };
+  const lines = [header("w"), msg("user", "u0", null, "q"), msg("assistant", "a0", "u0", "ANSWER zx-7781")];
+  const l = await requestLease(db, decl, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "w1", length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  expect((await ask(R("u1", "zx-7781"))).state).toBe("shown");
+  await revokeGrant(db, "work", "recall", "memex");
+  expect((await ask(R("u1", "zx-7781"))).state).toBe("withdrawn");
+  await allowGrant(db, "work", "recall", "memex");
+  expect((await ask(R("u1", "zx-7781"))).state).toBe("withdrawn");
+  expect((await replay()).blocks.map((b: any) => b.text).join("")).not.toContain("zx-7781");
+});

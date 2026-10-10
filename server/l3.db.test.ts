@@ -606,3 +606,20 @@ test("an unrelated revision elsewhere in the session: the statement is readable 
   expect(asked.length).toBe(1);
   void k;
 });
+
+test("the user card over a revoked scope stays dropped when it is granted again", async () => {
+  const { allowGrant } = await import("./derive.ts");
+  await db`insert into grant_rule values ('work', 'sync', 'memex'), ('work', 'derive', 'llm')`;
+  const decl = { source: sourceIdOf("pi", "w"), harness: "pi" as const, nativeId: "w", scope: "work", parent: null, meta: { repo: "repo-a" } };
+  const lines = [header("w"), msg("user", "wu0", null, "PREF TOPICsec work rule", T0), msg("assistant", "wa0", "wu0", "ok", T0)];
+  const l = await requestLease(db, decl, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "w2", length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await allowGrant(db, "work", "snapshot", "memex");
+  await drain(db);
+  expect((await snap()).text).toContain("work rule");
+  await revokeGrant(db, "work", "snapshot", "memex");
+  await allowGrant(db, "work", "snapshot", "memex");
+  expect((await snap()).text).not.toContain("work rule");
+  expect((await snap({ refresh_id: "r" })).text).toContain("work rule");
+});

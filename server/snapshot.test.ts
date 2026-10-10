@@ -390,3 +390,16 @@ test("the same refresh sent twice at once is applied once", async () => {
   expect(all.map((x) => x.gen)).toEqual([2, 2, 2, 2, 2]);
   expect((await db`select gen from start_snapshot`)[0].gen).toBe(2);
 });
+
+test("revoked then granted again: the dropped blocks stay dropped until an explicit refresh", async () => {
+  const { allowGrant } = await import("./derive.ts");
+  await put("sw", ["work0", "work1", "work2", "work3"], "repo-a", "work");
+  await allowGrant(db, "work", "snapshot", "memex");
+  await drain(db);
+  expect((await snap()).text).toContain("S(work0)");
+  await revokeGrant(db, "work", "snapshot", "memex");
+  expect((await snap()).text).not.toContain("work0");
+  await allowGrant(db, "work", "snapshot", "memex");
+  expect((await snap()).text).not.toContain("work0");
+  expect((await snap({ refresh_id: "r" })).text).toContain("S(work0)");
+});

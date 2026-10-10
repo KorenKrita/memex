@@ -61,6 +61,14 @@ export async function revokeGrant(db: Db, scope: string, purpose: string, dest: 
     await tx`select pg_advisory_xact_lock(${BARRIER})`;
     await tx`delete from grant_rule where scope = ${scope} and purpose = ${purpose} and dest = ${dest}`;
     await bump(tx, "d:" + dest);
+    // Stored start snapshots drop, for good, every block read under this grant (a session's card or title of
+    // that scope, a user card over it): granting it again does not bring them back, only a refresh does.
+    if (purpose === "snapshot" && dest === "memex")
+      await tx`update start_snapshot set blocks = (select coalesce(jsonb_agg(x), '[]') from jsonb_array_elements(blocks) x
+                 where not (coalesce(x->'scopes', '[]') ? ${scope})
+                   and not exists (select 1 from source s where s.id = x->>'source' and s.scope = ${scope}))
+               where exists (select 1 from jsonb_array_elements(blocks) x
+                             where coalesce(x->'scopes', '[]') ? ${scope} or exists (select 1 from source s where s.id = x->>'source' and s.scope = ${scope}))`;
   });
 }
 
