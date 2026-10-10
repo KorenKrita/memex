@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { type Db, type Job, type Tx, bump, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
-import { looseKeys, parentInfo, projectLines, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
+import { looseKeys, parentInfo, projectLines, timeOf, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
 import { addMigration } from "./db.ts";
 import { sourceIdOf, type Harness } from "../client/records.ts";
 
@@ -52,6 +52,11 @@ alter table projected add column if not exists deps jsonb not null default '{}';
 -- can drop forgotten evidence before it cuts a channel; key indexes for excerpts and successor lookups.
 alter table lexical add column if not exists canon text not null default '';
 alter table span add column if not exists canons text[] not null default '{}';
+-- Record times for since/until (§6.4): a lexical row's record time, a span's first and last record time (null:
+-- no readable time). Filled by projection; a source projected before these existed is projected again (below).
+alter table lexical add column if not exists at timestamptz;
+alter table span add column if not exists t0 timestamptz;
+alter table span add column if not exists t1 timestamptz;
 -- Backfill after an upgrade: a projection written before these columns existed is projected again (its
 -- rows stay out of search until then: projected.deps '{}' never counts as current).
 insert into job (kind, key)
@@ -100,6 +105,16 @@ begin
     where not exists (select 1 from tomb t where t.key = 'source:' || f.id)
   on conflict (kind, key) where state in ('queued', 'running') do nothing;
 end $$;
+-- record-times-v1: projections from before lexical.at / span.t0,t1 are projected again once, to fill them (until
+-- then since/until treat their rows as of no known time: filtered out by any time bound, kept without one).
+do $$
+begin
+  if exists (select 1 from migration_mark where key = 'record-times-v1') then return; end if;
+  insert into migration_mark values ('record-times-v1');
+  insert into job (kind, key) select 'project', p.source from projected p
+    where not exists (select 1 from tomb t where t.key = 'source:' || p.source)
+  on conflict (kind, key) where state in ('queued', 'running') do nothing;
+end $$;
 `);
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -143,7 +158,7 @@ export async function load(q: Tx, source: string, harness: string): Promise<Load
   return { lines, idle, idleMs };
 }
 
-type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: ProjectedView[]; spans: Map<string, Parameters<NonNullable<Parameters<typeof projectLines>[2]["onSpan"]>>[0]>; lexical: { key: string; rec: string; kind: string; text: string }[]; keys: [string, string][] | null; parentOk?: boolean };
+type Result = { status: "ok" | "blocked" | "empty"; reason?: string; times?: Map<string, number>; views: ProjectedView[]; spans: Map<string, Parameters<NonNullable<Parameters<typeof projectLines>[2]["onSpan"]>>[0]>; lexical: { key: string; rec: string; kind: string; text: string }[]; keys: [string, string][] | null; parentOk?: boolean };
 
 /** Analyse one source (and, through `parent`, read its fork parent's stored projection). */
 async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; idleMs: number; parentId: string | null }> {
@@ -164,7 +179,14 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   const forked = !!decl?.parent_id;
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
-  const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
+  // Each record's own time by record id (a copy keeps its original's id and time): for since/until.
+  const times = new Map<string, number>();
+  for (const l of lines.slice(src.harness === "pi" ? 1 : 0)) {
+    const id = src.harness === "pi" ? l.id : l.ordinal;
+    const t = timeOf(l.timestamp);
+    if ((typeof id === "string" || typeof id === "number") && Number.isFinite(t)) times.set(String(id), t);
+  }
+  const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id, times };
   if (blocked) return { ...base, ...empty, status: "blocked", reason: blocked };
   if (!lines.length) return { ...base, ...empty, status: "empty" };
   // Fork parent (Pi): the header names it by file path, the server by source id.
@@ -300,6 +322,13 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
           if (old.input_fp !== fp) (withdrawn = true), refresh.add(id);
         }
       }
+      // Record times of every span (content-addressed: the same records, the same times; kept ones filled in too).
+      const at = (ids: string[]) => ids.map((x) => a.times?.get(x)).filter((t): t is number => t !== undefined);
+      for (const [id, s] of a.spans) {
+        const ts = at(s.records.map((r: SpanRecord) => r.id));
+        const t0 = ts.length ? new Date(Math.min(...ts)) : null, t1 = ts.length ? new Date(Math.max(...ts)) : null;
+        await tx`update span set t0 = ${t0}, t1 = ${t1} where id = ${id} and (t0 is distinct from ${t0} or t1 is distinct from ${t1})`;
+      }
       // Spans kept from an earlier partition (not re-emitted) written before `canons` existed: fill them in.
       for (const r of await tx`select id, keys from span where source = ${source} and canons = '{}' and cardinality(keys) > 0`)
         await tx`update span set canons = ${tx.array((r.keys as string[]).map((k) => canonOf(a.harness, k)), "text")} where id = ${r.id}`;
@@ -318,7 +347,10 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       if (gone.length) withdrawn = true;
       // Lexical index: rebuild for this source (cheap relative to summaries; keeps forget/revision exact).
       await tx`delete from lexical where source = ${source}`;
-      const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => ({ source, key: r.key, part, rec: r.rec, kind: r.kind, text, canon: canonOf(a.harness, r.key) })));
+      const lex = a.lexical.flatMap((r) => chunks(r.text).map((text, part) => {
+        const t = a.times?.get(r.rec);
+        return { source, key: r.key, part, rec: r.rec, kind: r.kind, text, canon: canonOf(a.harness, r.key), at: t === undefined ? null : new Date(t) };
+      }));
       for (let i = 0; i < lex.length; i += 500) await tx`insert into lexical ${tx(lex.slice(i, i + 500))}`;
     }
     // A changed canonical mapping or block state withdraws what was derived from the old one. The map only

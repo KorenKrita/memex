@@ -395,6 +395,34 @@ test("grep: exact substring with record positions; scope and forget filter it; r
   await expect(grep(db, T0({ pattern: "x" }))).rejects.toThrow("not authorized");
 });
 
+test("since / until / repo filter search and grep by record time and the session's repo; malformed ones are 400", async () => {
+  const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+  const sess = (n: string, ts: string, text: string) => [header(n), at(msg("user", "u0", null, text), ts), at(msg("assistant", "a0", "u0", "ok " + text), ts)];
+  const putRepo = async (n: string, lines: string[], repo: string) => {
+    const decl = { source: sourceIdOf("pi", n), harness: "pi" as const, nativeId: n, scope: "personal", parent: null, meta: { repo } };
+    const l = await requestLease(db, decl, "m1");
+    expect((await tryGrant(db, l)).granted).toBe(true);
+    expect((await commit(db, { leaseId: l, commitId: `f${commitN++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
+    return decl.source;
+  };
+  const jan = await putRepo("fjan", sess("fjan", "2026-01-05T00:00:00Z", "filterword january"), "repo-a");
+  const mar = await putRepo("fmar", sess("fmar", "2026-03-05T00:00:00Z", "filterword march"), "repo-b");
+  await drain(db);
+  const srcs = async (extra: object) => [...new Set(((await body(Q("filterword", { dests: [], ...extra }))).results as any[]).map((x) => x.source))].sort();
+  expect(await srcs({})).toEqual([jan, mar].sort());
+  expect(await srcs({ since: "2026-02-01T00:00:00Z" })).toEqual([mar]);
+  expect(await srcs({ until: "2026-02-01T00:00:00Z" })).toEqual([jan]);
+  expect(await srcs({ repo: "repo-a" })).toEqual([jan]);
+  expect(await srcs({ repo: "repo-c" })).toEqual([]);
+  const g = async (extra: object) => [...new Set(((await grep(db, T0({ pattern: "filterword", ...extra }))).body as any).hits.map((h: any) => h.in))].sort();
+  expect(await g({})).toEqual([jan, mar].sort());
+  expect(await g({ since: "2026-02-01T00:00:00Z" })).toEqual([mar]);
+  expect(await g({ until: "2026-02-01T00:00:00Z", repo: "repo-a" })).toEqual([jan]);
+  expect(await g({ repo: "repo-b", until: "2026-02-01T00:00:00Z" })).toEqual([]);
+  await expect(search(db, Q("filterword", { since: "yesterday" }))).rejects.toThrow("since must be an ISO time");
+  await expect(grep(db, T0({ pattern: "x", repo: 3 }))).rejects.toThrow("repo must be");
+});
+
 test("zoom: a span's records with paging and neighbours on its view; a record by canonical id", async () => {
   const s = await put("z1", linear("z1", [["first " + "f".repeat(300), "r1"], ["second", "r2"], ["third", "r3"]]));
   await drain(db);

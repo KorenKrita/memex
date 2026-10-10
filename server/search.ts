@@ -53,7 +53,24 @@ export type SearchReq = {
   inContext?: string[]; // native record ids of the querying session still in the host's context
   leaf?: string; // the querying session's current leaf (native id): its own results are labelled against it
   limit?: number;
+  // Filters (§6.4): evidence of a record time in [since, until] (a span: its records' time range overlaps it; no
+  // readable time: out once a bound is given), of sessions whose repo is `repo`.
+  since?: Date;
+  until?: Date;
+  repo?: string;
 };
+/** The optional filters of a search / grep request: ISO times and a repo name, refused when malformed. */
+export function filtersOf(b: any): Pick<SearchReq, "since" | "until" | "repo"> {
+  const time = (v: unknown, n: string) => {
+    if (v === undefined || v === null) return undefined;
+    const t = typeof v === "string" ? Date.parse(v) : NaN;
+    if (!Number.isFinite(t)) throw new HttpError(400, `${n} must be an ISO time`);
+    return new Date(t);
+  };
+  const repo = b?.repo === undefined || b?.repo === null ? undefined : b.repo;
+  if (repo !== undefined && (typeof repo !== "string" || !repo || repo.length > 256)) throw new HttpError(400, "repo must be a non-empty string");
+  return { since: time(b?.since, "since"), until: time(b?.until, "until"), repo };
+}
 
 type Src = { source: string; scope: string; harness: string; deps: Record<string, number> };
 type Rep = { span: string; source: string; text: string; keys: string[]; channel: "ft" | "vec"; score: number };
@@ -117,7 +134,13 @@ function validate(b: any): SearchReq {
     inContext: Array.isArray(b.inContext) ? b.inContext.filter((x: unknown) => typeof x === "string").slice(0, 10_000) : [],
     leaf: typeof b.leaf === "string" && b.leaf && b.leaf.length <= 256 ? b.leaf : undefined,
     limit: Number.isInteger(b.limit) && b.limit > 0 ? Math.min(b.limit, 40) : 10,
+    ...filtersOf(b),
   };
+}
+/** Sources of `valid` the request's repo filter keeps (all without one). */
+async function inRepo(q: Tx, valid: string[], repo: string | undefined) {
+  if (repo === undefined) return valid;
+  return (await q`select id from source where id = any(${q.array(valid, "text")}) and meta->>'repo' = ${repo}`).map((x: any) => x.id as string);
 }
 
 /** Query scope check, readable and valid sources, in one snapshot. */
@@ -186,7 +209,8 @@ async function embedQuery(db: Db, r: SearchReq, until?: number, pin?: Record<str
 
 /** The three channels, fusion and rerank inputs, in one snapshot. */
 async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>, qv: number[] | undefined) {
-  const valid = [...b.valid.keys()];
+  const valid = await inRepo(q, [...b.valid.keys()], r.repo);
+  const since = r.since ?? null, until = r.until ?? null;
   const ctx = [...b.ctx];
   const ts = terms(r.query);
   const pats = ts.map((t) => "%" + esc(t) + "%");
@@ -206,6 +230,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
                (select coalesce(sum(w), 0) from unnest(${q.array(pats, "text")}::text[], ${q.array(ws, "float8")}::float8[]) p(p, w) where l.text ilike p.p) score
         from lexical l
         where l.source = any(${q.array(valid, "text")}) and l.text ilike any(${q.array(pats, "text")})
+          and (${since}::timestamptz is null or l.at >= ${since}) and (${until}::timestamptz is null or l.at <= ${until})
           and not (l.canon = any(${q.array(ctx, "text")}))
           and not exists (select 1 from tomb t where t.key = 'canon:' || l.canon)) x
       order by canon, score desc, key, part) y
@@ -214,6 +239,7 @@ async function recall(q: Tx, r: SearchReq, b: Awaited<ReturnType<typeof basis>>,
   // support records still in context.
   const repFilter = (alias: string) => q`
     ${q.unsafe(alias)}.input_fp = sp.input_fp and sp.source = any(${q.array(valid, "text")})
+    and (${since}::timestamptz is null or sp.t1 >= ${since}) and (${until}::timestamptz is null or sp.t0 <= ${until})
     and not exists (select 1 from unnest(sp.canons) c join tomb t on t.key = 'canon:' || c)
     and not (sp.canons <@ ${q.array(ctx, "text")}::text[] and cardinality(sp.canons) > 0)`;
   // 2. Summary full text (summary + anchors): units ranked by their best representation.
@@ -876,11 +902,13 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
   const pattern = typeof body.pattern === "string" && body.pattern && body.pattern.length <= 512 ? body.pattern : null;
   if (!pattern) throw new HttpError(400, "pattern must be a non-empty string");
   const regex = body.regex === true;
+  const f = filtersOf(body);
+  const since = f.since ?? null, until = f.until ?? null;
   const run = async (): Promise<Guarded> => {
     const out = await snapshot(db, async (q) => {
       await q`select set_config('statement_timeout', '5000ms', true)`;
       const b = await basis(q, r);
-      const valid = [...b.valid.keys()];
+      const valid = await inRepo(q, [...b.valid.keys()], f.repo);
       // Matching runs on each record's whole text (its chunks joined), in Postgres only: one regex engine
       // (ARE), its time bounded by the statement timeout. Positions come back as UTF-8 byte offsets in the
       // record text, the unit mem_zoom pages in. A literal pattern is located through the chunk index first;
@@ -888,6 +916,7 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
       const rows = await (regex
         ? q`with t as (select key, source, canon, kind, string_agg(text, '' order by part) text from lexical l
                        where source = any(${q.array(valid, "text")})
+                       and (${since}::timestamptz is null or l.at >= ${since}) and (${until}::timestamptz is null or l.at <= ${until})
                        and not exists (select 1 from tomb tb where tb.key = 'canon:' || l.canon)
                        group by key, source, canon, kind),
                  m as (select distinct on (key) key, source, canon, kind, text, regexp_instr(text, ${pattern}) at from t
@@ -899,6 +928,7 @@ export async function grep(db: Db, body: any): Promise<Guarded> {
         : q`with c as (select l.key, l.source from lexical l
                        left join lexical n on n.source = l.source and n.key = l.key and n.part = l.part + 1
                        where l.source = any(${q.array(valid, "text")})
+                       and (${since}::timestamptz is null or l.at >= ${since}) and (${until}::timestamptz is null or l.at <= ${until})
                        and (l.text like ${"%" + esc(pattern) + "%"} or (n.text is not null and position(${pattern} in right(l.text, ${pattern.length - 1}) || left(n.text, ${pattern.length - 1})) > 0))
                        and not exists (select 1 from tomb tb where tb.key = 'canon:' || l.canon)
                        group by l.key, l.source),
