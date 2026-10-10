@@ -131,10 +131,12 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
       const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((x: any) => [x.key, Number(x.v)]));
       const pin: Record<string, number> = { ...b.qDeps, ...Object.fromEntries(keys.map((k: string) => [k, vs.get(k) ?? 1])) };
       if (!row) {
-        // The current input, when already synced (in L0 in any state): sent only as the readable user record it
-        // is now — in a current projection's views, its indexed text the input. A withdrawn one (a revised
-        // parent's old copy, a conflict, quarantined) is not "not yet synced": refused, previous exchange or not.
-        if ((await q`select 1 from record where source = ${r.source} and rec = ${r.user_rec}`).length) {
+        // The current input, when ever synced (in L0 in any state, or a version kept in its body history after a
+        // shorter file dropped it): sent only as the readable user record it is now — in a current projection's
+        // views, its indexed text the input. A withdrawn one (a revised parent's old copy, a conflict, quarantined,
+        // dropped) is not "not yet synced": refused, previous exchange or not.
+        if ((await q`select 1 from record where source = ${r.source} and rec = ${r.user_rec}
+                     union all select 1 from body where source = ${r.source} and rec = ${r.user_rec} limit 1`).length) {
           const [p] = await q`select deps from projected where source = ${r.source} and status = 'ok'`;
           if (!p || !(await unchanged(q, p.deps))) return { found: null, pin, stale: true };
           const ks = [...new Set((await q`select recs from view where source = ${r.source}`).flatMap((v: any) =>

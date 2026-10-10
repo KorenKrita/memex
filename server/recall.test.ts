@@ -1099,6 +1099,20 @@ for (const withPrev of [false, true])
     expect(calls.length).toBe(0);
   });
 
+test("an input synced, then dropped by the collector's shorter file: refused as not readable, never taken for not yet synced", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const L = [header("me"), msg("user", "u0", null, "t root"), msg("assistant", "a0", "u0", "t reply"), msg("user", "u1", "a0", "DROPPED_INPUT zx-7781")];
+  await putRaw("me", L);
+  await drain(db);
+  await putRaw("me", L.slice(0, 3)); // the file was rewritten without u1 (the only collector)
+  await drain(db);
+  expect((await db`select count(*)::int n from record where source = ${me} and rec = 'u1'`)[0].n).toBe(0);
+  expect((await db`select count(*)::int n from body where source = ${me} and rec = 'u1'`)[0].n).toBe(1);
+  calls = [];
+  expect((await ask(R("u1", "DROPPED_INPUT zx-7781"))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
 test("a synced, readable input id with another text: refused; with its own text: sent", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   await put("me", [["first", "reply one"], ["zx-7781 real input", "pending"]]);
