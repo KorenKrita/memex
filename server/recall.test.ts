@@ -858,6 +858,38 @@ test("the fork parent's inherited record revised before the recall, the child no
   expect(outbound()).not.toContain("parent question");
 });
 
+test("the fork parent's inherited record revised and both re-projected: the child's old copy is withdrawn, not its own", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const { pl } = await forkMe();
+  await drain(db);
+  await putRaw("fpar", [pl[0], msg("user", "p0", null, "PARENT_REVISED"), pl[2]]);
+  await drain(db); // parent and child both projected again
+  const me = sourceIdOf("pi", "me");
+  expect((await db`select count(*)::int n from lexical where text like '%parent question%'`)[0].n).toBe(0);
+  // The parent's unchanged reply stays inherited; no span any view uses (summary input) holds the withdrawn question.
+  expect((await db`select count(*)::int n from span s where records::text like '%parent question%'
+                   and exists (select 1 from view v where v.span_ids @> array[s.id])`)[0].n).toBe(0);
+  calls = [];
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_user_ref: ref(pl[1]) }));
+  expect(d.state).toBe("query-stale");
+  expect(outbound()).not.toContain("parent question");
+});
+
+test("the fork parent known only in its revised version, the child imported later with the old copy: not the child's own", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const P = sourceIdOf("pi", "fpar");
+  const old = [header("fpar"), msg("user", "p0", null, "parent question"), msg("assistant", "p1", "p0", "parent reply")];
+  await putRaw("fpar", [old[0], msg("user", "p0", null, "PARENT_REVISED"), old[2]]);
+  await drain(db);
+  await putRaw("me", [header("me", { parentSession: "/x/fpar.jsonl" }), old[1], old[2], msg("user", "k1", "p1", "CHILD_OWN_go")], undefined, P);
+  await drain(db);
+  expect((await db`select count(*)::int n from lexical where text like '%parent question%'`)[0].n).toBe(0);
+  expect((await db`select count(*)::int n from lexical where text like '%CHILD_OWN_go%'`)[0].n).toBe(1);
+  calls = [];
+  await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_user_ref: ref(old[1]) }));
+  expect(outbound()).not.toContain("parent question");
+});
+
 // ---------- re-review 2: the sent text is the referenced record's ----------
 
 test("a valid reference paired with other text: the text is not sent", async () => {

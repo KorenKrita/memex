@@ -565,8 +565,9 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
 }
 
 // A resolved fork parent: its entries by match key (id + content) → canonical record key, its family's
-// shared span / node identity, and its own views' partition (the source for the child's views).
-type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews };
+// shared span / node identity, and its own views' partition (the source for the child's views). `ids`: every
+// entry id the parent has or had (any version) — a child entry with such an id was copied from the parent.
+type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; ids: Set<string> };
 type ParentLookup = (p: string) => ParentInfo | "invalid" | undefined; // undefined: parent not among the inputs
 
 // A root, as in Pi's getTree(): parentId null, pointing at itself, or at an entry not in the file (an
@@ -641,6 +642,13 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
       continue;
     }
     const inheritedKey = from?.keys.get(m);
+    if (!inheritedKey && from?.ids.has(e.id)) {
+      // A copy of a parent entry whose content the parent no longer has (revised there): withdrawn with the
+      // parent's old version, never this file's own record (DESIGN §4.1).
+      res.unresolved++;
+      navOf.set(e.id, []);
+      continue;
+    }
     const k = inheritedKey ?? `${session}/${m}`;
     keys.set(m, k);
     if (inheritedKey) {
@@ -893,7 +901,8 @@ function analyzeLines(path: string, lines: Record<string, any>[], res: FileResul
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
-    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews } : undefined, views: parsed.views, fileViews };
+    const ids = new Set<string>(lines.slice(1).flatMap((e) => (typeof e.id === "string" ? [e.id] : [])));
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, ids } : undefined, views: parsed.views, fileViews };
   }
 }
 
@@ -921,8 +930,8 @@ export function projectLines(label: string, lines: Record<string, any>[], opts: 
   return { res: a.res, parent: a.parent, views };
 }
 export type { ParentInfo };
-export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"]): ParentInfo {
-  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }) };
+export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], ids: Iterable<string>): ParentInfo {
+  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }), ids: new Set(ids) };
 }
 
 // Regular files under the inputs; symlinks are never followed (reported instead), paths deduplicated.

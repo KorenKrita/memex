@@ -1178,7 +1178,7 @@ test("the trace records every stage: channel tops, fused order, the cut, the ret
   expect(j).not.toContain("alpha");
 });
 
-test("grep → zoom across fork copies: a revised parent record is not shared; `in` picks a readable copy, never another", async () => {
+test("grep → zoom across fork copies: a revised parent record withdraws the child's inherited copy; `in` picks a readable copy, never another", async () => {
   const P = sourceIdOf("pi", "rv");
   const v1 = msg("assistant", "a0", "u0", "old revision rvtoken");
   await put("rv", [header("rv"), msg("user", "u0", null, "q"), v1, msg("assistant", "a1", "a0", "shared rvshared")]);
@@ -1192,13 +1192,15 @@ test("grep → zoom across fork copies: a revised parent record is not shared; `
   expect(sh.hits.map((h: any) => h.in)).toEqual([P]);
   expect(((await zoom(db, T0({ id: sh.hits[0].record, in: sh.hits[0].in }))).body as any).source).toBe(P);
   await expect(zoom(db, T0({ id: sh.hits[0].record, in: C }))).rejects.toThrow("not found");
-  // The parent's a0 is revised in place: the child's copy stops matching and becomes the child's own record.
+  // The parent's a0 is revised in place: the child's copy was inherited, so it is withdrawn with the parent's old
+  // version (user decision 2026-10-10) — never the child's own record, not searchable, not readable.
   await put("rv", [header("rv"), msg("user", "u0", null, "q"), msg("assistant", "a0", "u0", "new revision changed"), msg("assistant", "a1", "a0", "shared rvshared")]);
   await drain(db);
   const g = (await grep(db, T0({ pattern: "old revision" }))).body as any;
-  expect(g.hits.map((h: any) => [h.record, h.in])).toEqual([["record:" + C + ":a0", C]]);
-  const z = (await zoom(db, T0({ id: g.hits[0].record }))).body as any;
-  expect(z.records.map((x: any) => x.text).join("")).toBe("old revision rvtoken");
+  expect(g.hits).toEqual([]);
+  await expect(zoom(db, T0({ id: "record:" + C + ":a0", in: C }))).rejects.toThrow("not found");
+  // The child's own records after the copied prefix stay readable.
+  expect(((await grep(db, T0({ pattern: "go" }))).body as any).hits.some((h: any) => h.in === C)).toBe(true);
   // A copy that is not readable is refused, not replaced by a readable one.
   await expect(zoom(db, T0({ id: sh.hits[0].record, in: sourceIdOf("pi", "nope") }))).rejects.toThrow("not found");
 });

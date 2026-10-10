@@ -219,7 +219,7 @@ describe("Pi", () => {
     expect(report.perFile.find((f) => f.path === child)!.forkStatus).toBe("parent-not-given");
   });
 
-  test("fork inheritance: same id and content (key order irrelevant); parent not given → quarantined", () => {
+  test("fork inheritance: same id and content (key order irrelevant), same id other content withdrawn; parent not given → quarantined", () => {
     const parentRows = [piHeader(), piMsg("u1", null, user("shared")), piMsg("a1", "u1", say("shared reply"))];
     const parent = file("pi/fork/parent.jsonl", parentRows);
     const reordered = Object.fromEntries(Object.entries(parentRows[1] as object).reverse());
@@ -229,7 +229,9 @@ describe("Pi", () => {
     const solo = dryRun([child]).perFile[0];
     expect(solo).toMatchObject({ forkStatus: "parent-not-given", unresolved: 3, evidence: 0, spans: 0 });
     const both = dryRun([join(dir, "pi/fork")]).perFile.find((f) => f.path === child)!;
-    expect(both).toMatchObject({ forkStatus: "resolved", inherited: 1, evidence: 2 });
+    // Same id, other content: a copy of a version the parent no longer has — withdrawn with it (DESIGN §4.1),
+    // not the child's own evidence; the child's new entry is.
+    expect(both).toMatchObject({ forkStatus: "resolved", inherited: 1, unresolved: 1, evidence: 1 });
   });
 
   test("unsupported header version is skipped", () => {

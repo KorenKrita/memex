@@ -137,7 +137,10 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
       else if (p.scope !== src.scope || p.status !== "ok" || !p.keys) parent = "invalid";
       else {
         const vs = await q`select keys, spans from view where source = ${src.parent_id} order by ord`;
-        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf);
+        // Every entry id the parent has held (any version: bodies of revised records stay): a child entry with one
+        // of them is a copy, inherited only while the parent still has that content.
+        const ids = await q`select distinct rec from body where source = ${src.parent_id} and rec <> 'header'`;
+        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf, ids.map((r: any) => r.rec as string));
       }
     }
   }
