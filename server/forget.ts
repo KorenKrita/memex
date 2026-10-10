@@ -32,13 +32,22 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     const versions = await tx`select rec, raw from body where source = ${source}`;
     const ids = [...new Set<string>(versions.map((r: any) => r.rec))];
     if (ids.length) await tx`insert into tomb select 'canon:' || ${source} || ':' || x from unnest(${tx.array(ids, "text")}::text[]) x on conflict do nothing`;
-    // Records S inherited: its projection maps them ("id:content hash") to an ancestor's key; S's own keys
-    // start with its native id. A version the projection does not map (e.g. a superseded revision) counts
-    // as S's own: that can only tomb more of S, never something of an ancestor S did not hold as a copy.
+    // Versions native to S. Pi fork (its header names a parent): by time alone (DESIGN §4.1) — a copy, inherited,
+    // withdrawn or not yet mapped, is never S's contribution, so it tombs nothing of the ancestor it came from.
+    // Otherwise: records S inherited are those its projection maps ("id:content hash") to an ancestor's key (S's own
+    // keys start with its native id); a version the projection does not map (e.g. a superseded revision) counts as
+    // S's own: that can only tomb more of S.
+    const headRaw = versions.find((r: any) => r.rec === "header")?.raw;
+    let sHead: any;
+    try {
+      sHead = headRaw ? JSON.parse(headRaw) : undefined;
+    } catch {}
+    const piFork = sHead?.type === "session" && !!sHead.parentSession;
     const [pr] = await tx`select keys from projected where source = ${source}`;
     const [src] = await tx`select native_id from source where id = ${source}`;
     const inherited = new Set<string>(((pr?.keys ?? []) as [string, string][]).filter(([, k]) => !k.startsWith(src.native_id + "/")).map(([m]) => m));
-    const own = versions.filter((r: any) => r.rec !== "header" && !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`));
+    const own = versions.filter((r: any) => r.rec !== "header" &&
+      (piFork ? !isCopyTime(JSON.parse(r.raw), sHead) : !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`)));
     const tombs = [...new Set<string>(own.map((r: any) => copyTomb(source, r.rec, r.raw)))];
     if (tombs.length) await tx`insert into tomb select x from unnest(${tx.array(tombs, "text")}::text[]) x on conflict do nothing`;
     const match = new Set(tombs);

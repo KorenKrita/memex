@@ -784,6 +784,36 @@ test("a child's own entry newer than the fork with the same id and content as a 
   expect(await own()).toEqual(["xk"]);
 });
 
+for (const order of ["C before the forget", "C after the forget"])
+  test(`A → B → C, B forgotten (${order}): C's copies of A stay A's, never refused or removed for B's copies of them`, async () => {
+    const A = sourceIdOf("pi", "ra"), B = sourceIdOf("pi", "rb");
+    const u0 = msg("user", "u0", null, "r3-a-question"), a0 = msg("assistant", "a0", "u0", "r3-a-reply");
+    await put("ra", [header("ra"), u0, a0]);
+    await drain(db);
+    // B holds A's records as copies; it saw them before A's projection mapped them (so B's own mapping may lack them).
+    await put("rb", [header("rb", { parentSession: "/x/ra.jsonl" }), u0, a0, msg("user", "b1", "a0", "r3-b-own")], "personal", A);
+    await drain(db);
+    await db`update projected set keys = '[]'::jsonb where source = ${B}`; // as if B's copies were unmapped (withdrawn)
+    const cl = [header("rc", { parentSession: "/x/rb.jsonl" }), u0, a0, msg("user", "c1", "a0", "r3-c-own")];
+    let C = sourceIdOf("pi", "rc");
+    if (order === "C before the forget") C = await put("rc", cl, "personal", B);
+    await forgetSource(db, B);
+    expect((await db`select count(*)::int n from tomb where key like ${"copy:" + B + ":a0:%"}`)[0].n).toBe(0); // a copy is no contribution of B
+    expect((await db`select count(*)::int n from tomb where key like ${"copy:" + B + ":b1:%"}`)[0].n).toBe(1);
+    if (order === "C after the forget") {
+      const l = await requestLease(db, { source: C, harness: "pi", nativeId: "rc", scope: "personal", parent: B }, "m1");
+      await tryGrant(db, l);
+      const r = await commit(db, { leaseId: l, commitId: "rc-after", length: cl.length, changes: cl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+      expect((r as any).refused).toBe(0);
+    }
+    await drain(db);
+    expect((await db`select count(*)::int n from body where source = ${C} and rec = 'a0'`)[0].n).toBe(1);
+    const owners = ((await db`select keys from projected where source = ${C}`)[0].keys as [string, string][]).filter(([m]) => /^(u0|a0):/.test(m)).map(([, k]) => k.split("/")[0]);
+    expect(owners).toEqual(["ra", "ra"]); // inherited through the forgotten B from the living A
+    expect(await hasText("r3-c-own")).toBe(true);
+    expect(await hasText("r3-b-own")).toBe(false);
+  });
+
 for (const parentSynced of [false, true])
   test(`a fork whose header names a parent the collector did not link (parent ${parentSynced ? "synced in another scope" : "absent"}): copies withdrawn, its own kept`, async () => {
     const u0 = msg("user", "u0", null, "unlinked-copy-q"), a0 = msg("assistant", "a0", "u0", "unlinked-copy-r");
