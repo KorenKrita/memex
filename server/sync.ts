@@ -122,6 +122,24 @@ async function rearmTimeout(tx: Tx, leaseId: number | null) {
            where ms is not null`;
 }
 
+/** Every declared ancestor of `source` (living or forgotten: a forgotten source keeps its row), cycle-safe. */
+export async function ancestorsOf(tx: Tx, source: string): Promise<string[]> {
+  return (await tx`with recursive a(id, path) as (
+                     select parent_id, array[id] from source where id = ${source} and parent_id is not null
+                     union all
+                     select s.parent_id, a.path || s.id from a join source s on s.id = a.id
+                     where s.parent_id is not null and not s.id = any(a.path))
+                   select distinct id from a`).map((x: any) => x.id as string);
+}
+/** A forgotten source's content tomb for one of its own record versions (forget.ts). */
+export const copyTomb = (owner: string, rec: string, raw: string) => `copy:${owner}:${rec}:${contentHash(JSON.parse(raw))}`;
+/** Content tombs a record may be a copy under: its lineage's (`anc`, from ancestorsOf), plus the ownerless
+ *  `copy:<rec>:<hash>` a database from before tombs named their source may hold (its owner unknown: still
+ *  refusing, never guessed into a lineage). */
+export const copyTombsOf = (anc: string[], rec: string, raw: string) => {
+  const h = contentHash(JSON.parse(raw));
+  return [`copy:${rec}:${h}`, ...anc.map((g) => `copy:${g}:${rec}:${h}`)];
+};
 export async function commit(db: Db, c: Commit): Promise<CommitResult> {
   if (!Number.isInteger(c.length) || c.length < 0 || c.changes.length > MAX_COMMIT_RECORDS)
     return { ok: false, reason: "bad-request", detail: `at most ${MAX_COMMIT_RECORDS} changes` };
@@ -154,16 +172,18 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       return { ok: false, reason: "not-granted" } as const;
     }
     // Refuse forgotten records: this source's own (`canon:source:rec`), and copies of a forgotten fork
-    // ancestor's own records, by content (`copy:rec:content hash`, forget.ts), so an import after the forget
-    // cannot bring them back as this session's own. A record that only reuses an id is not a copy.
-    const copyKey = (ch: Change) => {
+    // ancestor's own records, by content (`copy:ancestor:rec:content hash`, forget.ts), so an import after the
+    // forget cannot bring them back as this session's own. Only this lineage's tombs count: a session outside it
+    // that held the same bytes is not where this record came from. A record that only reuses an id is not a copy.
+    const anc = await ancestorsOf(tx, l.source);
+    const copyKeys = (ch: Change) => {
       try {
-        return `copy:${ch.id}:${contentHash(JSON.parse(ch.raw))}`;
+        return copyTombsOf(anc, ch.id, ch.raw);
       } catch {
-        return "";
+        return [];
       }
     };
-    const cand = c.changes.flatMap((ch) => [`canon:${l.source}:${ch.id}`, ...(ch.id === "header" ? [] : [copyKey(ch)])]);
+    const cand = c.changes.flatMap((ch) => [`canon:${l.source}:${ch.id}`, ...(ch.id === "header" ? [] : copyKeys(ch))]);
     const tombs = new Set<string>((await tx`select key from tomb where key = any(${tx.array(cand, "text")})`).map((r: any) => r.key));
     // Pi: only a possible copy (not newer than this file's fork time, DESIGN §4.1) is refused as one; an own
     // entry that happens to carry a forgotten record's id and content is accepted.
@@ -182,7 +202,7 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
         return true;
       }
     };
-    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !tombs.has(copyKey(ch)) || !maybeCopy(ch)));
+    const keep = c.changes.filter((ch) => !tombs.has(`canon:${l.source}:${ch.id}`) && (ch.id === "header" || !copyKeys(ch).some((k) => tombs.has(k)) || !maybeCopy(ch)));
     // Projection: the copy now has `length` records; rows past it are gone; changed positions are replaced.
     const dropped = await tx`delete from projection where source = ${l.source} and collector = ${l.collector} and pos >= ${c.length}
                              returning rec`;

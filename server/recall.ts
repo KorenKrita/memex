@@ -18,11 +18,10 @@
 import { createHash } from "node:crypto";
 import { type Db, type Tx } from "./db.ts";
 import { Guarded } from "./http.ts";
-import { BARRIER, HttpError } from "./sync.ts";
+import { BARRIER, HttpError, copyTombsOf } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 import { canonOf, load } from "./project.ts";
-import { copyTomb } from "./forget.ts";
 import { contentHash, looseOf } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
@@ -161,6 +160,9 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           if (!p || !(await unchanged(q, p.deps))) return { found: null, pin, stale: true };
           const inherited = new Map<string, string>((p?.keys ?? []) as [string, string][]);
           const k = `${ref.rec}:${contentHash(JSON.parse(cur.raw))}`;
+          // Pi fork: the record must be in the current mapping (own or inherited) — a missing key is no proof of
+          // being this session's own. A Pi root (no mapping) and Codex keep their own record id as canonical.
+          if (cur.harness === "pi" && p.keys && !inherited.has(k)) return { found: null, pin, stale: true };
           const canon = inherited.has(k) ? canonOf(cur.harness, inherited.get(k)!) : `${r.source}:${ref.rec}`;
           const src = canon.slice(0, canon.indexOf(":"));
           if (src !== r.source && !keys.includes("s:" + src)) return { found: null, pin, stale: true };
@@ -172,10 +174,10 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
             const same = (x: string) => (cur.harness === "pi" ? looseOf(JSON.parse(x)) : contentHash(JSON.parse(x)));
             if (!anc || same(anc.raw) !== same(cur.raw)) return { found: null, pin, stale: true };
           }
-          // A content tomb (`copy:`) speaks only of copies: a Pi record the current projection holds as this session's
-          // own is not one (DESIGN §4.1: newer than the fork), whatever content a forgotten session had.
+          // A content tomb (`copy:`) speaks only of copies, of this lineage's forgotten sources: a Pi record the
+          // current projection holds as this session's own is not one (DESIGN §4.1: newer than the fork).
           const own = cur.harness === "pi" && src === r.source;
-          const tk = ["source:" + src, "canon:" + canon, ...(own ? [] : [copyTomb(ref.rec, cur.raw)])];
+          const tk = ["source:" + src, "canon:" + canon, ...(own ? [] : copyTombsOf(keys.map((x: string) => x.slice(2)), ref.rec, cur.raw))];
           const tombed = await q`select 1 from tomb where key = any(${q.array(tk, "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };
         }

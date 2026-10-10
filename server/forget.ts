@@ -2,9 +2,10 @@
 // same order as every writer: sync.commit takes the barrier before it touches its lease row).
 //   1. tombs for what S itself contributed: `source:S`; `canon:S:rec` for every record S ever held; and for
 //      every version of a record native to S (not one S inherited from its own fork parent), a content
-//      tomb `copy:<rec>:<content hash>`. A fork copy keeps the parent's record id and content (the dry-run's
-//      match rule), so the content tomb finds copies in any descendant, now or imported later, without
-//      touching a descendant's own record that merely reuses an id, nor what S itself inherited from above;
+//      tomb `copy:S:<rec>:<content hash>`. A fork copy keeps the parent's record id and content (the dry-run's
+//      match rule), so the content tomb finds copies in S's descendants, now or imported later, without
+//      touching a descendant's own record, nor what S itself inherited from above, nor any session outside S's
+//      lineage that happens to hold the same bytes (the tomb names S; a lineage checks its own ancestors' tombs);
 //   2. fork descendants: rows matching a content tomb leave their L0; their version moves and they are
 //      projected again (a forgotten parent counts as no parent; what remains is their own and what they
 //      inherited from further up, which keeps its origin through the next living ancestor's projection);
@@ -13,7 +14,7 @@
 //      it are refused at their barrier check (§5.5).
 // The host's own log files and existing backups are not touched.
 import { type Db, type Tx, bump, enqueue } from "./db.ts";
-import { BARRIER } from "./sync.ts";
+import { BARRIER, copyTomb } from "./sync.ts";
 import { contentHash, isCopyTime } from "../dryrun/dryrun.ts";
 import "./project.ts";
 import "./derive.ts";
@@ -22,7 +23,6 @@ import "./forest.ts";
 import "./snapshot.ts";
 import "./l3.ts";
 
-export const copyTomb = (rec: string, raw: string) => `copy:${rec}:${contentHash(JSON.parse(raw))}`;
 
 export async function forgetSource(db: Db, source: string): Promise<{ records: number; descendants: number; copies: number }> {
   return db.begin(async (tx: Tx) => {
@@ -39,7 +39,7 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     const [src] = await tx`select native_id from source where id = ${source}`;
     const inherited = new Set<string>(((pr?.keys ?? []) as [string, string][]).filter(([, k]) => !k.startsWith(src.native_id + "/")).map(([m]) => m));
     const own = versions.filter((r: any) => r.rec !== "header" && !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`));
-    const tombs = [...new Set<string>(own.map((r: any) => copyTomb(r.rec, r.raw)))];
+    const tombs = [...new Set<string>(own.map((r: any) => copyTomb(source, r.rec, r.raw)))];
     if (tombs.length) await tx`insert into tomb select x from unnest(${tx.array(tombs, "text")}::text[]) x on conflict do nothing`;
     const match = new Set(tombs);
     // Fork descendants: drop their copies, move their version, project them again.
@@ -54,7 +54,7 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
                             where r.source = ${id} and r.rec = 'header'`;
       const head = hd ? JSON.parse(hd.raw) : undefined;
       const pi = head?.type === "session";
-      const hit = rows.filter((r: any) => match.has(copyTomb(r.rec, r.raw)) && (!pi || isCopyTime(JSON.parse(r.raw), head)));
+      const hit = rows.filter((r: any) => match.has(copyTomb(source, r.rec, r.raw)) && (!pi || isCopyTime(JSON.parse(r.raw), head)));
       if (hit.length) {
         copies += new Set(hit.map((r: any) => r.rec)).size;
         for (const r of hit) {

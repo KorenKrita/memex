@@ -784,6 +784,33 @@ test("a child's own entry newer than the fork with the same id and content as a 
   expect(await own()).toEqual(["xk"]);
 });
 
+test("an unrelated session with the very same entry is forgotten: a fork's copy inherited from its own parent stays, also when synced again", async () => {
+  // P and Q are independent roots that hold the same entry bytes (same id, content and time). C forks Q.
+  const P = sourceIdOf("pi", "np"), Q = sourceIdOf("pi", "nq");
+  const u0 = msg("user", "u0", null, "shared-bytes-q"), a0 = msg("assistant", "a0", "u0", "shared-bytes-r");
+  await put("np", [header("np"), u0, a0]);
+  await put("nq", [header("nq"), u0, a0]);
+  await drain(db);
+  const kl = [header("nc", { parentSession: "/x/nq.jsonl" }), u0, a0, msg("user", "k1", "a0", "nc-own")];
+  const C = await put("nc", kl, "personal", Q);
+  await drain(db);
+  const owner = async () => ((await db`select keys from projected where source = ${C}`)[0]?.keys as [string, string][] ?? []).filter(([m]) => m.startsWith("a0:")).map(([, k]) => k.split("/")[0]);
+  expect(await owner()).toEqual(["nq"]);
+  await forgetSource(db, P);
+  await drain(db);
+  expect(await owner()).toEqual(["nq"]); // Q, C's own parent, still holds it
+  expect((await db`select count(*)::int n from record where source = ${C} and rec = 'a0'`)[0].n).toBe(1);
+  // C syncs again (a new collector copy, a restart): its copy of Q's entry is accepted.
+  const l = await requestLease(db, { source: C, harness: "pi", nativeId: "nc", scope: "personal", parent: Q }, "m2");
+  await tryGrant(db, l);
+  const r = await commit(db, { leaseId: l, commitId: "nc-again", length: kl.length, changes: kl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  expect(r.ok).toBe(true);
+  expect((r as any).refused ?? 0).toBe(0);
+  await drain(db);
+  expect(await owner()).toEqual(["nq"]);
+  expect(await hasText("shared-bytes-r")).toBe(true);
+});
+
 test("a Pi fork that drops a label re-chains the next entry's parent: that copy is still inherited, not withdrawn", async () => {
   const P = sourceIdOf("pi", "lbp");
   const u0 = msg("user", "u0", null, "lbl-question"), lb = JSON.stringify({ type: "label", id: "l1", parentId: "u0", timestamp: T, targetId: "u0", label: "x" });

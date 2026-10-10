@@ -1110,7 +1110,7 @@ test("a child's own exchange with a forgotten parent's very ids and content: sti
   expect(await owners()).toEqual(["me", "me"]);
   await forgetSource(db, P); // its z1, z2 leave `copy:` content tombs that match the child's own entries
   await drain(db);
-  expect((await db`select count(*)::int n from tomb where key like 'copy:z%'`)[0].n).toBe(2);
+  expect((await db`select count(*)::int n from tomb where key like ${"copy:" + P + ":z%"}`)[0].n).toBe(2);
   expect(await owners()).toEqual(["me", "me"]);
   const req = R("u9", "zx-7781", { prev_user: "same-own-q", prev_user_ref: ref(z1), prev_assistant: "same-own-r", prev_assistant_ref: ref(z2) });
   expect((await ask(req)).state).toBe("shown");
