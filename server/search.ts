@@ -112,7 +112,7 @@ function validate(b: any): SearchReq {
     source: s(b.source, "source", 64),
     scope: s(b.scope, "scope", 64),
     purpose,
-    query: s(b.query, "query", 8192),
+    query: s(b.query, "query", 20_000), // a recall query: input (8192) + the previous exchange (8192 + 800 bytes)
     dests: Array.isArray(b.dests) ? b.dests.filter((d: unknown) => d === "embedding" || d === "rerank") : [],
     inContext: Array.isArray(b.inContext) ? b.inContext.filter((x: unknown) => typeof x === "string").slice(0, 10_000) : [],
     leaf: typeof b.leaf === "string" && b.leaf && b.leaf.length <= 256 ? b.leaf : undefined,
@@ -153,16 +153,21 @@ export async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purp
 }
 
 /** Embed the query (guarded by the embedding destination's version), or say why not. */
-async function embedQuery(db: Db, r: SearchReq, until?: number): Promise<{ v?: number[]; skipped?: string; deps?: Record<string, number> }> {
+/** A pinned query basis (a frozen recall's): the query text was built from that state; any other is refused. */
+function pinned(b: { qDeps: Record<string, number> }, pin?: Record<string, number>) {
+  if (pin && Object.entries(pin).some(([k, v]) => b.qDeps[k] !== v)) throw new HttpError(409, "query-stale");
+}
+async function embedQuery(db: Db, r: SearchReq, until?: number, pin?: Record<string, number>): Promise<{ v?: number[]; skipped?: string; deps?: Record<string, number> }> {
   if (!r.dests.includes("embedding")) return { skipped: "not-requested" };
   const url = process.env.MEMEX_EMBED_URL, model = process.env.MEMEX_EMBED_MODEL, key = process.env.MEMEX_EMBED_KEY;
   if (!url || !model || !key) return { skipped: "not-configured" };
   const c = await snapshot(db, async (q) => {
     const b = await basis(q, r); // the query is still authorized and its session not forgotten
+    pinned(b, pin);
     if (!(await granted(q, r.scope, r.purpose, "embedding"))) return null;
     const [v] = await q`select v from vis_version where key = 'd:embedding'`;
     return { ...b.qDeps, "d:embedding": Number(v?.v ?? 1) };
-  });
+  }, until);
   if (!c) return { skipped: "not-granted" };
   try {
     const res = await guardedPost(db, c, url.replace(/\/+$/, "") + "/embeddings", key, { model, input: [r.query], dimensions: EMBED_DIM, encoding_format: "float" }, until);
@@ -461,13 +466,15 @@ export function mergeLabels(ls: string[]): string {
 
 export const searchHooks = { beforeTrace: async () => {} };
 
-/** `until` (epoch ms, optional): an overall deadline; past it the search fails instead of finishing late. */
-export async function search(db: Db, body: unknown, until?: number): Promise<Guarded> {
+/** `until` (epoch ms, optional): an overall deadline; past it the search fails instead of finishing late.
+ *  `pin` (optional): the query basis the query text was built from (a frozen recall's); if the querying session
+ *  moves away from it at any read, the search fails (409 query-stale) instead of answering for another state. */
+export async function search(db: Db, body: unknown, until?: number, pin?: Record<string, number>): Promise<Guarded> {
   const r = validate(body);
   const late = () => until !== undefined && Date.now() >= until;
-  await snapshot(db, (q) => basis(q, r)); // the query's own authorization, before its text goes anywhere
+  await snapshot(db, async (q) => pinned(await basis(q, r), pin), until); // the query's own authorization, before its text goes anywhere
   const t0 = performance.now();
-  let emb = await embedQuery(db, r, until);
+  let emb = await embedQuery(db, r, until, pin);
   const tEmbed = performance.now() - t0;
   let tries = 0;
   const run = async (): Promise<Guarded> => {
@@ -475,8 +482,8 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     if (late()) throw new HttpError(504, "deadline");
     const t1 = performance.now();
     const s = await snapshot(db, async (q) => {
-      if (until !== undefined) await q`select set_config('statement_timeout', ${Math.max(1, until - Date.now()) + "ms"}, true)`;
       const b = await basis(q, r);
+      pinned(b, pin);
       const rc = await recall(q, r, b, emb.v);
       const scopes = (c: Cand) => [...c.sources].map((x) => b.valid.get(x)!.scope);
       // Rerank authorization: the query scope and every scope whose text would be sent.
@@ -510,7 +517,7 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
       // Index lag (§6.5): derived work not yet published when this search read the index.
       const lag = Object.fromEntries((await q`select kind, count(*)::int n from job where state in ('queued', 'running') group by kind`).map((x: any) => [x.kind, x.n]));
       return { b, rc, rerankSkip, dRerank: Number(dr?.v ?? 1), labels, lag };
-    });
+    }, until);
     const { b, rc, labels } = s;
     const tRecall = performance.now() - t1;
     const t2 = performance.now();
@@ -518,9 +525,11 @@ export async function search(db: Db, body: unknown, until?: number): Promise<Gua
     // Every source carried by a candidate, plus the read grant's destination version.
     const deps: Record<string, number> = { ...b.qDeps };
     for (const c of rc.chosen) for (const x of c.sources) Object.assign(deps, b.valid.get(x)!.deps);
-    // The query vector was made under the versions it was sent with; if one of them is not what this recall
-    // read (the querying session revised while it was out), it belongs to another state: embed again.
+    // The query vector was made under the versions it was sent with; if one of them is not what this search
+    // read (the querying session revised while it was out), it belongs to another state. A pinned (frozen)
+    // query cannot be made again from the same text: refused. A tool search embeds its text again.
     if (emb.v && Object.entries(emb.deps!).some(([k, v]) => k in deps && deps[k] !== v)) {
+      if (pin) throw new HttpError(409, "query-stale");
       emb = await embedQuery(db, r, until);
       return run();
     }

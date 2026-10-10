@@ -30,13 +30,21 @@ create table if not exists vis_version (key text primary key, v bigint not null 
 -- session's decisions (seq, assigned under its row lock, so commit order = seq order). Withdrawals that hide
 -- some of a session's blocks move its version 'r:<session>' (bump() does it in the withdrawing transaction),
 -- which every replay response depends on — an empty increment included.
-create table if not exists recall_state (source text primary key, seq bigint not null default 0);
+create table if not exists recall_state (source text primary key, seq bigint not null default 0, gen bigint);
 create table if not exists recall_block (source text not null, user_rec text not null, query_hash text not null, seq bigint not null,
                                          state text not null, text text not null, deps jsonb not null, sources text[] not null,
                                          refs jsonb not null default '[]', at timestamptz not null default now(), primary key (source, user_rec));
 create index if not exists recall_block_deps on recall_block using gin (deps);
 alter table recall_block add column if not exists refs jsonb not null default '[]';
-alter table recall_state drop column if exists gen;
+-- From the 2b83df9 schema: recall_state.gen was the withdrawal count; it moves into r:<session> (kept above any
+-- version a client may hold), and the column stays (unused) rather than being dropped.
+alter table recall_state add column if not exists gen bigint;
+insert into vis_version select 'r:' || source, gen + 1 from recall_state where gen is not null and gen > 0
+  on conflict (key) do update set v = greatest(vis_version.v, excluded.v);
+-- Blocks frozen before hints carried their view (refs empty, bare span:/record: handles): never served again
+-- (their handles would reopen on whatever view is current); their text stays, nothing is searched again.
+with l as (update recall_block set state = 'legacy' where state = 'shown' and refs = '[]' returning source)
+insert into vis_version select distinct 'r:' || source, 2 from l on conflict (key) do update set v = vis_version.v + 1;
 create table if not exists tomb (key text primary key, at timestamptz not null default now());   -- 'source:S' | 'canon:C'
 
 create table if not exists lease (id bigserial primary key, source text not null, collector text not null, ttl_ms int not null,

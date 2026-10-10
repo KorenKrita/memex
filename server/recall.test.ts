@@ -97,6 +97,14 @@ async function put(native: string, ex: [string, string][]) {
   expect((await commit(db, { leaseId: l, commitId: `r${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
   return decl.source;
 }
+/** Commit raw lines (branches: entries with any parents) with an optional leaf. */
+async function putRaw(native: string, lines: string[], leaf?: string) {
+  const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent: null };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  expect((await commit(db, { leaseId: l, commitId: `r${n++}`, length: lines.length, leaf, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
+  return decl.source;
+}
 const me = sourceIdOf("pi", "me");
 const R = (user_rec: string, input: string, x: object = {}) => ({ source: me, scope: "personal", user_rec, input, dests: ["embedding", "rerank"], ...x });
 const ask = async (b: object) => {
@@ -214,7 +222,8 @@ test("an incomplete rerank input is not injected, however high its score", async
   const sr = (await search(db, { source: me, scope: "personal", purpose: "recall", query: "zx-7781", dests: ["embedding", "rerank"] })).body as any;
   const rec = sr.results.find((x: any) => x.key.startsWith("record:"));
   expect(rec.incomplete).toContain("next-clipped"); // the fixture does what it says
-  expect(d.text).not.toContain(`[${rec.key}]`);
+  const [row] = await db`select refs from recall_block where user_rec = 'u1'`;
+  expect(JSON.stringify(row?.refs ?? [])).not.toContain(rec.key.slice(7)); // the clipped record is not among the frozen hints
 });
 
 test("lines that would pass the token budget are left out (budget over the whole block)", async () => {
@@ -376,11 +385,9 @@ test("the querying session revised while its query embedding is out: nothing fro
     embedHook = null;
     await put("me", [["revised question", "old reply"]]);
   };
-  const before = calls.filter((c) => c.path.endsWith("/embeddings")).length;
-  await ask(R("u9", "zx-7781", { prev_user: "old question", prev_assistant: "old reply" }));
-  expect(calls.filter((c) => c.path.endsWith("/embeddings")).length - before).toBe(2); // embedded again after the revision
-  const [cur] = await db`select v from vis_version where key = ${"s:" + me}`;
-  for (const row of await db`select deps from recall_block`) expect(row.deps["s:" + me]).toBe(Number(cur.v)); // never the old version
+  const d = await ask(R("u9", "zx-7781", { prev_user: "old question", prev_assistant: "old reply" }));
+  expect(d.state).toBe("query-stale");
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
 });
 
 // ---------- the deadline ----------
@@ -480,7 +487,7 @@ test("trace publication waiting for the barrier is bounded by the deadline", asy
 test("long inputs: the composed query stays within what search accepts", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   await drain(db);
-  const d = await ask(R("u1", "zx-7781 " + "x".repeat(5900), { prev_user: "y".repeat(8000), prev_assistant: "z".repeat(60000) }));
+  const d = await ask(R("u1", "zx-7781 " + "x".repeat(8180), { prev_user: "y".repeat(8192), prev_assistant: "z".repeat(60000) }));
   expect(["shown", "empty"]).toContain(d.state);
 });
 
@@ -513,4 +520,84 @@ test("the deadline passing during save: nothing stored", async () => {
   };
   expect((await ask(R("u1", "zx-7781"))).state).toBe("timeout");
   expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+});
+
+test("a hint opens the frozen view after the session switches branch (no withdrawal)", async () => {
+  // a: u0 → a0 → (u1 → a1 "ANSWER on the first branch") | (u2 → a2 elsewhere, later the leaf)
+  const h = header("br");
+  const l = [h, msg("user", "u0", null, "start"), msg("assistant", "a0", "u0", "ok"),
+             msg("user", "u1", "a0", "ANSWER zx-7781 on the first branch"), msg("assistant", "a1", "u1", "r1")];
+  await putRaw("br", l, "a1");
+  await drain(db);
+  const d = await ask(R("u1", "zx-7781"));
+  expect(d.state).toBe("shown");
+  const id = /^\[([^\]]+)\]/.exec(d.text.split("\n").find((x: string) => x.startsWith("[hint:"))!)![1];
+  const [row] = await db`select refs from recall_block`;
+  const { at: _a, ...frozen } = row.refs[0].view_key;
+  // A new branch from a0 becomes the leaf: appended records only, no withdrawal.
+  await putRaw("br", [...l, msg("user", "u2", "a0", "other branch"), msg("assistant", "a2", "u2", "r2")], "a2");
+  await drain(db);
+  const z = (await zoom(db, { source: me, scope: "personal", purpose: "tool", id })).body as any;
+  expect(z.view_key).toMatchObject(frozen); // the frozen tip, not the new leaf's
+  expect(z.view_key.tip).toBe("a1");
+  expect(JSON.stringify(z)).toContain("on the first branch");
+});
+
+test("the first read waiting on a locked table is bounded by the deadline: no model call, nothing stored later", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  process.env.MEMEX_RECALL_MS = "400";
+  let holding!: () => void;
+  const isHeld = new Promise<void>((r) => (holding = r));
+  const blocker = db.begin(async (tx: any) => {
+    await tx`lock table recall_block in access exclusive mode`;
+    holding();
+    await Bun.sleep(1000);
+  });
+  await isHeld;
+  const k = calls.length;
+  const t = Date.now();
+  expect((await ask(R("u1", "zx-7781"))).state).toBe("timeout");
+  expect(Date.now() - t).toBeLessThan(800);
+  await blocker;
+  await Bun.sleep(100);
+  expect(calls.length).toBe(k);
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+});
+
+test("upgrade from the 2b83df9 schema: the withdrawal count carries over; old bare-handle blocks are not served", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  await ask(R("u1", "zx-7781"));
+  // As the older schema left it: a gen count (2 withdrawals seen by a client holding "seq.3"), and a block
+  // without refs whose text has a bare span handle.
+  await db`update recall_state set gen = 2`;
+  await db`update recall_block set refs = '[]', text = '<memex-recall>\n[span:sp_x] on-path · old → mem_zoom\n</memex-recall>'`;
+  await db`delete from vis_version where key = ${"r:" + me}`;
+  await migrate(db);
+  const v = Number((await db`select v from vis_version where key = ${"r:" + me}`)[0].v);
+  expect(v).toBeGreaterThan(2); // above any generation an old client could hold (its cursor said 2)
+  const r = await replay("1.2");
+  expect(r.replace).toBe(true);
+  expect(r.blocks).toEqual([]); // the legacy block is not served
+  expect((await ask(R("u1", "zx-7781"))).state).toBe("withdrawn"); // its binding stays decided; no new search
+  expect((await db`select text from recall_block`)[0].text).toContain("sp_x"); // kept, not rewritten
+});
+
+test("the querying session revised before the search starts: refused at its first read, no model call", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["old question", "old reply"]]);
+  await drain(db);
+  // Revise between recall's pin and search: the pin no longer holds at search's authorization read.
+  const { recallHooks: rh } = await import("./recall.ts");
+  rh.beforeSearch = async () => {
+    await put("me", [["revised question", "old reply"]]);
+  };
+  try {
+    const k = calls.length;
+    expect((await ask(R("u9", "zx-7781", { prev_user: "old question" }))).state).toBe("query-stale");
+    expect(calls.length).toBe(k);
+  } finally {
+    rh.beforeSearch = async () => {};
+  }
 });

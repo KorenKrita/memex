@@ -148,7 +148,23 @@ export async function unchanged(tx: Tx, deps: Record<string, number>) {
 export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {}, inPublish: async (_tx: Tx) => {} };
 const PUBLISH_HOLD_MS = () => Number(process.env.MEMEX_PUBLISH_HOLD_MS ?? 5_000);
 
-export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>) => db.begin("isolation level repeatable read read only", f) as Promise<T>;
+/** A read-only repeatable-read snapshot. `until` (epoch ms): the whole transaction, waiting for a connection
+ *  included, ends by then (transaction_timeout, and the caller stops waiting at the deadline). */
+export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>, until?: number) => {
+  if (until === undefined) return db.begin("isolation level repeatable read read only", f) as Promise<T>;
+  const left = until - Date.now();
+  if (left <= 0) return Promise.reject(new Error("deadline passed"));
+  const run = db.begin("isolation level repeatable read read only", async (q: Tx) => {
+    const l = until - Date.now();
+    if (l <= 0) throw new Error("deadline passed");
+    await q`select set_config('transaction_timeout', ${l + "ms"}, true), set_config('lock_timeout', ${l + "ms"}, true)`;
+    return f(q);
+  }) as Promise<T>;
+  let t: ReturnType<typeof setTimeout>;
+  const late = new Promise<never>((_, bad) => (t = setTimeout(() => bad(new Error("deadline passed")), left)));
+  run.catch(() => {});
+  return Promise.race([run, late]).finally(() => clearTimeout(t));
+};
 
 // ---------- guarded send ----------
 
