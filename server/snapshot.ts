@@ -131,8 +131,8 @@ export async function startSnapshot(db: Db, body: any): Promise<Guarded> {
             if (ins.length && refreshId) await tx`insert into snapshot_refresh values (${r.source}, ${refreshId}, 1) on conflict do nothing`;
             return ins.length > 0;
           }
-        // A refresh: applied once (its id recorded in the same transaction), over the generation it was built on.
-        if (refreshId && (await tx`select 1 from snapshot_refresh where source = ${r.source} and refresh_id = ${refreshId}`).length) return false;
+        // A refresh: applied once (its id recorded in the same transaction), over the generation it was built on —
+        // the same id racing itself was built on a generation the winner already moved past, so it cannot save.
         const up = await tx`update start_snapshot set gen = gen + 1, refresh_id = ${refreshId}, blocks = ${blocks}, built_at = now()
                             where source = ${r.source} and gen = ${s.base} returning gen`;
         if (up.length && refreshId) await tx`insert into snapshot_refresh values (${r.source}, ${refreshId}, ${up[0].gen})`;

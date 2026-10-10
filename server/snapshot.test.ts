@@ -306,3 +306,84 @@ test("a snapshot asks in the background only for the cards it shows, not for eve
     delete process.env.MEMEX_FOREST_HOT_DAYS;
   }
 });
+
+test("two different refreshes at once: each applied exactly once; retrying either changes nothing", async () => {
+  await put("sa", ["alpha0", "alpha1", "alpha2", "alpha3"]);
+  await drain(db);
+  expect((await snap()).gen).toBe(1);
+  const { snapshotHooks } = await import("./snapshot.ts");
+  let gate!: () => void;
+  const open = new Promise<void>((r) => (gate = r));
+  let waiting = 0;
+  snapshotHooks.beforeSave = async () => {
+    if (waiting++ === 0) await open; // A built, held before saving; B builds and saves meanwhile
+  };
+  try {
+    const a = snap({ refresh_id: "A" });
+    while (waiting === 0) await Bun.sleep(5);
+    const b = await snap({ refresh_id: "B" });
+    gate();
+    const ra = await a;
+    expect(new Set([ra.gen, b.gen])).toEqual(new Set([2, 3]));
+  } finally {
+    snapshotHooks.beforeSave = async () => {};
+  }
+  expect((await db`select refresh_id, gen from snapshot_refresh order by gen`).map((r: any) => r.refresh_id).sort()).toEqual(["A", "B"]);
+  await put("sn", ["newer0"]);
+  await drain(db);
+  for (const id of ["A", "B"]) {
+    const x = await snap({ refresh_id: id });
+    expect(x.gen).toBe(3);
+    expect(x.text).not.toContain("newer0");
+  }
+});
+
+test("sessions left out (past the card limit, or past the budget) are not woken by a snapshot", async () => {
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1"; // every session cold: its card degraded, made only on demand
+  try {
+    const word = new Map<string, string>();
+    const mine: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const src = await put("m" + i, [`mm${i}a`, `mm${i}b`, `mm${i}c`, `mm${i}d`]); // current repo; only 3 cards shown
+      mine.push(src);
+      word.set(src, `mm${i}a`);
+      await Bun.sleep(3);
+    }
+    const others: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const w = `xq${i}z`.padEnd(400, "y");
+      const src = await put("x" + i, [w, "two", "three", "four"], "repo-b"); // titles beyond the budget
+      others.push(src);
+      word.set(src, `xq${i}z`);
+    }
+    await drain(db);
+    await db`delete from forest_access`;
+    const k = requests.length;
+    const s = await snap();
+    await drain(db);
+    const shown = [...mine, ...others].filter((src) => s.text.includes(`[session:${src}]`));
+    const left = [...mine, ...others].filter((src) => !shown.includes(src));
+    expect(s.text.match(/^## /gm)?.length).toBe(3);
+    expect(left.some((x) => mine.includes(x))).toBe(true); // one past the card limit
+    expect(left.some((x) => others.includes(x))).toBe(true); // some past the budget
+    const wanted = new Set((await db`select source from forest_access`).map((r: any) => r.source));
+    for (const x of left) expect(wanted.has(x)).toBe(false);
+    for (const x of shown) expect(wanted.has(x)).toBe(true);
+    // The background work afterwards was for the shown ones only.
+    const asked = requests.slice(k).map((r) => JSON.stringify(r));
+    expect(asked.length).toBeGreaterThan(0);
+    for (const x of left) expect(asked.some((a) => a.includes(word.get(x)! + "y") || a.includes(word.get(x)! + ")"))).toBe(false);
+    for (const x of shown.slice(0, 1)) expect(asked.some((a) => a.includes(word.get(x)!))).toBe(true);
+  } finally {
+    delete process.env.MEMEX_FOREST_HOT_DAYS;
+  }
+});
+
+test("the same refresh sent twice at once is applied once", async () => {
+  await put("sa", ["alpha0", "alpha1", "alpha2", "alpha3"]);
+  await drain(db);
+  await snap();
+  const all = await Promise.all(Array.from({ length: 5 }, () => snap({ refresh_id: "R" })));
+  expect(all.map((x) => x.gen)).toEqual([2, 2, 2, 2, 2]);
+  expect((await db`select gen from start_snapshot`)[0].gen).toBe(2);
+});
