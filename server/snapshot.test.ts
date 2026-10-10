@@ -6,7 +6,10 @@ import { commit, requestLease, tryGrant } from "./sync.ts";
 import { revokeGrant } from "./derive.ts";
 import { startSnapshot, BUDGET, FRAMING, TOOLS } from "./snapshot.ts";
 import { forgetSource } from "./forget.ts";
-import { drain } from "./worker.ts";
+import { drain as drainAll, handlers } from "./worker.ts";
+// L3 jobs are tested in l3.test.ts; here they would only add model calls.
+const KINDS = Object.keys(handlers).filter((k) => !k.startsWith("l3"));
+const drain = (db: any, kinds = KINDS, max?: number) => drainAll(db, kinds, max);
 import { sourceIdOf } from "../client/records.ts";
 
 let db: Db;
@@ -377,7 +380,7 @@ test("sessions left out (past the card limit, or past the budget) are not woken 
   } finally {
     delete process.env.MEMEX_FOREST_HOT_DAYS;
   }
-});
+}, 30_000); // 64 sessions projected and drained
 
 test("the same refresh sent twice at once is applied once", async () => {
   await put("sa", ["alpha0", "alpha1", "alpha2", "alpha3"]);

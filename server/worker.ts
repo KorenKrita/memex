@@ -4,9 +4,10 @@ import { claimJob, failJob, type Db, type Job } from "./db.ts";
 import { runProject } from "./project.ts";
 import { runEmbed, runSummarize } from "./derive.ts";
 import { runCard, runForest, runMerge } from "./forest.ts";
+import { runL3, runL3Pair } from "./l3.ts";
 
 export type Handler = (db: Db, job: Job) => Promise<unknown>;
-export const handlers: Record<string, Handler> = { project: runProject, summarize: runSummarize, embed: runEmbed, forest: runForest, merge: runMerge, card: runCard };
+export const handlers: Record<string, Handler> = { project: runProject, summarize: runSummarize, embed: runEmbed, forest: runForest, merge: runMerge, card: runCard, l3: runL3, l3pair: runL3Pair };
 
 /** Run one due job of the given kinds. Returns false when none was due. */
 export async function runOne(db: Db, kinds = Object.keys(handlers)): Promise<boolean> {

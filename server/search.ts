@@ -516,8 +516,8 @@ export async function search(db: Db, body: unknown, until?: number, pin?: Record
         const vk = { source: src, tip: t.v?.tip ?? null, basis: t.basis, version: viewVersion(b, src), at: t.at };
         labels.set(c.key, { label, basis: t.basis, reason: t.reason ?? null, view_key: vk, reps, src });
       }
-      // Index lag (§6.5): derived work not yet published when this search read the index.
-      const lag = Object.fromEntries((await q`select kind, count(*)::int n from job where state in ('queued', 'running') group by kind`).map((x: any) => [x.kind, x.n]));
+      // Index lag (§6.5): derived work not yet published when this search read the index (L3 is not searched, §6.3).
+      const lag = Object.fromEntries((await q`select kind, count(*)::int n from job where state in ('queued', 'running') and kind not like 'l3%' group by kind`).map((x: any) => [x.kind, x.n]));
       return { b, rc, rerankSkip, dRerank: Number(dr?.v ?? 1), labels, lag };
     }, until);
     const { b, rc, labels } = s;

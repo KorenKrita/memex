@@ -249,7 +249,10 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
       for (const id of closed)
         // Also a parent's span that closes here first (its tail goes on in this child): idempotent if the
         // parent already had it summarized.
-        if (!wasClosed.has(id) || refresh.has(id)) await enqueue(tx, "summarize", id);
+        if (!wasClosed.has(id) || refresh.has(id)) {
+          await enqueue(tx, "summarize", id);
+          await enqueue(tx, "l3", id); // L3 reads the raw user records, not the summary: never waits for it
+        }
       // Spans of this source no view uses any more and nothing else depends on: drop them.
       const gone = await tx`delete from span s where s.source = ${source} and not exists (select 1 from view v where v.span_ids @> array[s.id])
                             and not exists (select 1 from span u where u.unit = s.id and u.id <> s.id) returning id`;

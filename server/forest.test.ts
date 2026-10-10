@@ -6,7 +6,10 @@ import { commit, requestLease, tryGrant, BARRIER } from "./sync.ts";
 import { revokeGrant } from "./derive.ts";
 import { readForest, roots, runMerge } from "./forest.ts";
 import { forgetSource } from "./forget.ts";
-import { drain } from "./worker.ts";
+import { drain as drainAll, handlers } from "./worker.ts";
+// L3 jobs are tested in l3.test.ts; here they would only add model calls.
+const KINDS = Object.keys(handlers).filter((k) => !k.startsWith("l3"));
+const drain = (db: any, kinds = KINDS, max?: number) => drainAll(db, kinds, max);
 import { sourceIdOf } from "../client/records.ts";
 
 let db: Db;

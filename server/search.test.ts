@@ -8,7 +8,10 @@ import { EMBED_DIM, revokeGrant } from "./derive.ts";
 import { addApiKey, Guarded, httpHooks, route, serve, transport } from "./http.ts";
 import { search, zoom, grep, GUARANTEED, searchHooks, mergeLabels, labelOf } from "./search.ts";
 import { forgetSource } from "./forget.ts";
-import { drain } from "./worker.ts";
+import { drain as drainAll, handlers } from "./worker.ts";
+// L3 jobs are tested in l3.test.ts; here they would only add model calls.
+const KINDS = Object.keys(handlers).filter((k) => !k.startsWith("l3"));
+const drain = (db: any, kinds = KINDS, max?: number) => drainAll(db, kinds, max);
 import { sourceIdOf } from "../client/records.ts";
 
 let db: Db;

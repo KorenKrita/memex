@@ -8,7 +8,10 @@ import { Guarded, serve, addApiKey, httpHooks, transport } from "./http.ts";
 import { recall, blocks, recallHooks, tokens, TOKEN_BUDGET, FRAMING, queryOf, clip } from "./recall.ts";
 import { zoom } from "./search.ts";
 import { forgetSource } from "./forget.ts";
-import { drain } from "./worker.ts";
+import { drain as drainAll, handlers } from "./worker.ts";
+// L3 jobs are tested in l3.test.ts; here they would only add model calls.
+const KINDS = Object.keys(handlers).filter((k) => !k.startsWith("l3"));
+const drain = (db: any, kinds = KINDS, max?: number) => drainAll(db, kinds, max);
 import { sourceIdOf } from "../client/records.ts";
 
 let db: Db;

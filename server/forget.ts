@@ -20,6 +20,7 @@ import "./derive.ts";
 import "./search.ts";
 import "./forest.ts";
 import "./snapshot.ts";
+import "./l3.ts";
 
 export const copyTomb = (rec: string, raw: string) => `copy:${rec}:${contentHash(JSON.parse(raw))}`;
 
@@ -72,6 +73,10 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     // Queued again: it may be made lawfully from what remains (another view closes it, other context).
     for (const r of await tx`delete from span_summary where deps ? ${"s:" + source} returning span`) await enqueue(tx, "summarize", r.span);
     await tx`delete from forest_access where source = ${source}`;
+    // L3: its statements (evidence of this source), their relations, and its extraction marks.
+    await tx`delete from l3_rel r using l3_stmt s where s.src = ${source} and (r.a = s.id or r.b = s.id)`;
+    await tx`delete from l3_stmt where src = ${source}`;
+    await tx`delete from l3_seen where src = ${source}`;
     await tx`delete from session_card where source = ${source} or deps ? ${"s:" + source}`;
     // Start snapshots: the source's own, and every block made from it in anyone else's (text and all).
     await tx`delete from start_snapshot where source = ${source}`;
