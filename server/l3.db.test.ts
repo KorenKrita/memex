@@ -120,6 +120,20 @@ test("only the user's own words become statements; assistant text is never promo
   expect(ex.content).not.toMatch(/kind="assistant"[^>]*citable/);
 });
 
+test("a user record whose time is not a string makes no statement, and the rest of its span still does", async () => {
+  const { lines } = await put("s1", [["PREF TOPICpm use pnpm", "ok", T0], ["PREF TOPICed use vim", "ok", T1]]);
+  // The first user record's time replaced by an object without a primitive conversion (valid JSON).
+  const bad = JSON.stringify({ ...JSON.parse(lines[1]), timestamp: { toString: null, valueOf: null } });
+  const decl = { source: sourceIdOf("pi", "s1"), harness: "pi" as const, nativeId: "s1", scope: "personal", parent: null, meta: { repo: "repo-a" } };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  expect((await commit(db, { leaseId: l, commitId: `n${n++}`, length: lines.length, changes: [{ pos: 1, id: JSON.parse(bad).id, hash: sha(bad), raw: bad }] })).ok).toBe(true);
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICed use vim"]);
+  // No extraction errored on it (a throw would leave the job queued again with its error).
+  expect((await db`select count(*)::int n from job where kind = 'l3' and error is not null`)[0].n).toBe(0);
+});
+
 test("an answer citing a record the user did not write is refused: nothing is stored", async () => {
   extract = (recs) => recs.filter((r) => r.kind === "assistant").map((r) => ({ record_id: r.id, text: r.text, scope: "global", retraction: false, effective_from: null, effective_phrase: null }));
   await put("s1", [["hello", "PREF TOPICpm use yarn", T0]]);
