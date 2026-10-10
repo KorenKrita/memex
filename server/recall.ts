@@ -23,7 +23,7 @@ import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 import { canonOf } from "./project.ts";
 import { copyTomb } from "./forget.ts";
-import { contentHash } from "../dryrun/dryrun.ts";
+import { contentHash, looseOf } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
 const TAU = () => (process.env.MEMEX_RECALL_TAU ? Number(process.env.MEMEX_RECALL_TAU) : NaN); // [待标定] unset: not ready
@@ -150,10 +150,12 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const src = canon.slice(0, canon.indexOf(":"));
           if (src !== r.source && !keys.includes("s:" + src)) return { found: null, pin, stale: true };
           if (src !== r.source) {
-            // An inherited copy: the ancestor's own record still holds the same content now.
+            // An inherited copy: the ancestor's own record still holds the same content now — by the projection's
+            // copy rule (Pi: the parent link aside, re-chained past a dropped label; else the whole line).
             const [anc] = await q`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                                   where r.source = ${src} and r.rec = ${ref.rec} and r.state = 'ok'`;
-            if (!anc || contentHash(JSON.parse(anc.raw)) !== contentHash(JSON.parse(cur.raw))) return { found: null, pin, stale: true };
+            const same = (x: string) => (cur.harness === "pi" ? looseOf(JSON.parse(x)) : contentHash(JSON.parse(x)));
+            if (!anc || same(anc.raw) !== same(cur.raw)) return { found: null, pin, stale: true };
           }
           const tombed = await q`select 1 from tomb where key = any(${q.array(["source:" + src, "canon:" + canon, copyTomb(ref.rec, cur.raw)], "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };

@@ -627,6 +627,27 @@ test("a fork child's recall with an unchanged inherited context succeeds", async
   expect(d.state).toBe("shown");
 });
 
+test("a fork child's inherited reply re-chained past a dropped label (as Pi forks): its previous exchange is sent; changed text is not", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const P = sourceIdOf("pi", "fpar");
+  const u0 = msg("user", "p0", null, "label question"), lb = JSON.stringify({ type: "label", id: "l1", parentId: "p0", timestamp: T, targetId: "p0", label: "x" });
+  const a0 = msg("assistant", "p1", "l1", "label reply");
+  await putRaw("fpar", [header("fpar"), u0, lb, a0]);
+  const a0c = JSON.stringify({ ...JSON.parse(a0), parentId: "p0" });
+  await putRaw("me", [header("me", { parentSession: "/x/fpar.jsonl" }), u0, a0c], undefined, P);
+  await drain(db);
+  calls = [];
+  const d = await ask(R("u9", "zx-7781", { prev_user: "label question", prev_user_ref: ref(u0), prev_assistant: "label reply", prev_assistant_ref: ref(a0c) }));
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("label reply");
+  // The parent's reply revised: the copy is withdrawn, its text not sent.
+  await putRaw("fpar", [header("fpar"), u0, lb, msg("assistant", "p1", "l1", "label reply REVISED")]);
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u8", "zx-7781", { prev_user: "label question", prev_user_ref: ref(u0), prev_assistant: "label reply", prev_assistant_ref: ref(a0c) }))).state).toBe("query-stale");
+  expect(outbound()).not.toContain("label reply");
+});
+
 test("the fork ancestor holding the inherited context revised during the call: nothing frozen", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   const { pl } = await forkMe();
