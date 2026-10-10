@@ -1178,9 +1178,9 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
   expect(k).toBeDefined();
   expect(await hasText("upgrade-old-copy")).toBe(true);
-  // A database that already ran fork-copy-v2..v5 (their marks only): v6 still runs, once.
-  await db`delete from migration_mark where key = 'fork-copy-v6'`;
-  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing`;
+  // A database that already ran fork-copy-v2..v6 (their marks only): v7 still runs, once.
+  await db`delete from migration_mark where key = 'fork-copy-v7'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5'), ('fork-copy-v6') on conflict do nothing`;
   await migrate(db);
   expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
   const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
@@ -1191,19 +1191,22 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   expect(await hasText("upgrade-kid-own")).toBe(true);
 });
 
-test("an upgrade from projections that kept an unlinked fork's copy as its own (v5 already ran; the header key escaped): unreadable at migrate, before any worker", async () => {
+for (const kind of ["the key escaped", "a value jsonb cannot hold"])
+test(`an upgrade from projections that kept an unlinked fork's copy as its own (v6 already ran; ${kind}): unreadable at migrate, before any worker`, async () => {
   const u0 = msg("user", "u0", null, "q"), a0 = msg("assistant", "a0", "u0", "unlinked-old-copy");
   // A fork whose parent file the collector did not link (parent: null), its header naming the parent.
-  // Its header spells the key with a JSON escape: the same "parentSession" to any JSON reader.
-  const h = header("ulk", { parentSession: "/x/absent.jsonl" }).replace('"parentSession"', '"parent\\u0053ession"');
+  // Its header spells the key with a JSON escape (the same "parentSession" to any JSON reader), or carries a
+  // valid JSON value PostgreSQL's jsonb rejects (an escaped NUL): the migration neither misses it nor fails.
+  const named = header("ulk", { parentSession: "/x/absent.jsonl" });
+  const h = kind === "the key escaped" ? named.replace('"parentSession"', '"parent\\u0053ession"') : named.replace(/}$/, ',"x":"\\u0000"}');
   expect(JSON.parse(h).parentSession).toBe("/x/absent.jsonl");
   const C = await put("ulk", [h, u0, a0, msg("user", "k1", "a0", "unlinked-kid-own")], "personal", null);
   await drain(db);
   // As the previous version left it: the copy indexed as the child's own.
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"ulk/a0:old#0"}, 0, 'a0', 'assistant', 'unlinked-old-copy', ${C + ":a0"})`;
   expect(await hasText("unlinked-old-copy")).toBe(true);
-  await db`delete from migration_mark where key = 'fork-copy-v6'`;
-  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing`;
+  await db`delete from migration_mark where key = 'fork-copy-v7'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5'), ('fork-copy-v6') on conflict do nothing`;
   // A root session (no parent named) is not moved.
   const R = await put("ulr", [header("ulr"), msg("user", "r0", null, "root-text")]);
   await drain(db);

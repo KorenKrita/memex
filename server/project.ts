@@ -64,22 +64,33 @@ create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
 -- One-time semantic migrations, each applied once (its mark inserted with it).
 create table if not exists migration_mark (key text primary key, at timestamptz not null default now());
--- fork-copy-v6 (DESIGN §4.1; v2-v5 before it): projections from before the Pi fork copy rule (a copy told by its
+-- fork-copy-v7 (DESIGN §4.1; v2-v6 before it): projections from before the Pi fork copy rule (a copy told by its
 -- own time against the child's fork time, whatever the ancestors hold; a fork is one whose header names a parent,
 -- linked or not; an unlinked fork is no usable parent) may hold a withdrawn copy as the child's own, or a newer
 -- own entry as inherited or quarantined. Every Pi fork child's version moves now — a declared parent, or a
 -- current header naming one, told from the parsed JSON (any spelling of the key; v4 missed header-only forks, v5
--- escaped keys) — in this transaction (its old projection, summaries, statements and frozen blocks stop counting
--- as current before any worker runs), and it is projected again. Once: a later start moves nothing (a database
--- that ran v2-v5 runs v6 once more).
+-- escaped keys); a header jsonb cannot hold (an escaped NUL, a number out of range: valid JSON all the same; v6
+-- aborted the start on it) or not JSON at all counts as naming one — in this transaction (its old projection,
+-- summaries, statements and frozen blocks stop counting as current before any worker runs), and it is projected
+-- again. Once: a later start moves nothing (a database that ran v2-v6 runs v7 once more).
 do $$
+declare
+  h record;
+  named boolean;
 begin
-  if exists (select 1 from migration_mark where key = 'fork-copy-v6') then return; end if;
-  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5'), ('fork-copy-v6') on conflict do nothing;
-  create temporary table fork_child on commit drop as
-    select s.id from source s where s.harness = 'pi' and (s.parent_id is not null or exists (
-      select 1 from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
-      where r.source = s.id and r.rec = 'header' and b.raw is json object and (b.raw::jsonb ->> 'parentSession') is not null));
+  if exists (select 1 from migration_mark where key = 'fork-copy-v7') then return; end if;
+  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5'), ('fork-copy-v6'), ('fork-copy-v7') on conflict do nothing;
+  create temporary table fork_child (id text primary key) on commit drop;
+  insert into fork_child select id from source where harness = 'pi' and parent_id is not null;
+  for h in select s.id, b.raw from source s join record r on r.source = s.id and r.rec = 'header' join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+           where s.harness = 'pi' and s.parent_id is null loop
+    begin
+      named := (h.raw::jsonb ->> 'parentSession') is not null;
+    exception when others then
+      named := true;
+    end;
+    if named then insert into fork_child values (h.id) on conflict do nothing; end if;
+  end loop;
   insert into vis_version select 's:' || id, 2 from fork_child on conflict (key) do update set v = vis_version.v + 1;
   if to_regclass('recall_block') is not null then
     insert into vis_version select distinct 'r:' || b.source, 2 from recall_block b, fork_child f where b.deps ? ('s:' || f.id)
