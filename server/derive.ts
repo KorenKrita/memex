@@ -148,23 +148,27 @@ export async function unchanged(tx: Tx, deps: Record<string, number>) {
 export const hooks = { afterCheck: async () => {}, beforeSkip: async () => {}, inPublish: async (_tx: Tx) => {} };
 const PUBLISH_HOLD_MS = () => Number(process.env.MEMEX_PUBLISH_HOLD_MS ?? 5_000);
 
-/** A read-only repeatable-read snapshot. `until` (epoch ms): the whole transaction, waiting for a connection
- *  included, ends by then (transaction_timeout, and the caller stops waiting at the deadline). */
-export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>, until?: number) => {
-  if (until === undefined) return db.begin("isolation level repeatable read read only", f) as Promise<T>;
+/** A transaction bounded by `until` (epoch ms): the caller stops waiting at the deadline — waiting for a pool
+ *  connection included — and a transaction that starts or is still running after it does nothing more (it
+ *  checks on start, and transaction/lock timeouts end it inside the server), so a late one never commits. */
+export function within<T>(db: Db, f: (q: Tx) => Promise<T>, until: number, mode?: string): Promise<T> {
   const left = until - Date.now();
   if (left <= 0) return Promise.reject(new Error("deadline passed"));
-  const run = db.begin("isolation level repeatable read read only", async (q: Tx) => {
+  const body = async (q: Tx) => {
     const l = until - Date.now();
     if (l <= 0) throw new Error("deadline passed");
     await q`select set_config('transaction_timeout', ${l + "ms"}, true), set_config('lock_timeout', ${l + "ms"}, true)`;
     return f(q);
-  }) as Promise<T>;
+  };
+  const run = (mode ? db.begin(mode, body) : db.begin(body)) as Promise<T>;
   let t: ReturnType<typeof setTimeout>;
   const late = new Promise<never>((_, bad) => (t = setTimeout(() => bad(new Error("deadline passed")), left)));
   run.catch(() => {});
   return Promise.race([run, late]).finally(() => clearTimeout(t));
-};
+}
+/** A read-only repeatable-read snapshot, bounded by `until` when given. */
+export const snapshot = <T>(db: Db, f: (q: Tx) => Promise<T>, until?: number) =>
+  until === undefined ? (db.begin("isolation level repeatable read read only", f) as Promise<T>) : within(db, f, until, "isolation level repeatable read read only");
 
 // ---------- guarded send ----------
 
@@ -179,7 +183,7 @@ export async function guardedPost(db: Db, deps: Record<string, number>, url: str
   const data = Buffer.from(JSON.stringify(body));
   await hooks.afterCheck();
   let reply!: Promise<Reply>;
-  const sent = await db.begin(async (tx: Tx) => {
+  const send = async (tx: Tx) => {
     // The whole held interval is bounded: waiting for the lock, the comparison, and the send below.
     await tx`select set_config('lock_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true), set_config('statement_timeout', ${left(SEND_DEADLINE_MS) + "ms"}, true)`;
     await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
@@ -216,7 +220,10 @@ export async function guardedPost(db: Db, deps: Record<string, number>, url: str
       req.end(data, () => (clearTimeout(t), ok()));
     });
     return true;
-  });
+  };
+  // With a deadline, waiting for a connection is bounded too, and a transaction that only starts after it
+  // throws before sending (within's start check, then the deadline check after the comparison).
+  const sent = until === undefined ? await db.begin(send) : await within(db, send, until);
   if (!sent) return "stale";
   return reply;
 }

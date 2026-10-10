@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { type Db, type Tx, addMigration } from "./db.ts";
 import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
-import { EMBED_DIM, guardedPost, snapshot, unchanged } from "./derive.ts";
+import { EMBED_DIM, guardedPost, snapshot, unchanged, within } from "./derive.ts";
 import { canonOf } from "./project.ts";
 import { forestView, leavesOf, nodeOn, readCard, wantForest } from "./forest.ts";
 
@@ -153,9 +153,10 @@ export async function basis(q: Tx, r: Pick<SearchReq, "source" | "scope" | "purp
 }
 
 /** Embed the query (guarded by the embedding destination's version), or say why not. */
-/** A pinned query basis (a frozen recall's): the query text was built from that state; any other is refused. */
-function pinned(b: { qDeps: Record<string, number> }, pin?: Record<string, number>) {
-  if (pin && Object.entries(pin).some(([k, v]) => b.qDeps[k] !== v)) throw new HttpError(409, "query-stale");
+/** A pinned query basis (a frozen recall's: the querying session, its fork ancestors and the read grant): the
+ *  query text was built from that state; read in the caller's snapshot, any other state is refused. */
+async function pinned(q: Tx, pin?: Record<string, number>) {
+  if (pin && !(await unchanged(q, pin))) throw new HttpError(409, "query-stale");
 }
 async function embedQuery(db: Db, r: SearchReq, until?: number, pin?: Record<string, number>): Promise<{ v?: number[]; skipped?: string; deps?: Record<string, number> }> {
   if (!r.dests.includes("embedding")) return { skipped: "not-requested" };
@@ -163,10 +164,11 @@ async function embedQuery(db: Db, r: SearchReq, until?: number, pin?: Record<str
   if (!url || !model || !key) return { skipped: "not-configured" };
   const c = await snapshot(db, async (q) => {
     const b = await basis(q, r); // the query is still authorized and its session not forgotten
-    pinned(b, pin);
+    await pinned(q, pin);
     if (!(await granted(q, r.scope, r.purpose, "embedding"))) return null;
     const [v] = await q`select v from vis_version where key = 'd:embedding'`;
-    return { ...b.qDeps, "d:embedding": Number(v?.v ?? 1) };
+    // The send depends on the whole pin too: an ancestor withdrawn after this read stops the send.
+    return { ...b.qDeps, ...(pin ?? {}), "d:embedding": Number(v?.v ?? 1) };
   }, until);
   if (!c) return { skipped: "not-granted" };
   try {
@@ -472,7 +474,7 @@ export const searchHooks = { beforeTrace: async () => {} };
 export async function search(db: Db, body: unknown, until?: number, pin?: Record<string, number>): Promise<Guarded> {
   const r = validate(body);
   const late = () => until !== undefined && Date.now() >= until;
-  await snapshot(db, async (q) => pinned(await basis(q, r), pin), until); // the query's own authorization, before its text goes anywhere
+  await snapshot(db, async (q) => (await basis(q, r), await pinned(q, pin)), until); // the query's own authorization, before its text goes anywhere
   const t0 = performance.now();
   let emb = await embedQuery(db, r, until, pin);
   const tEmbed = performance.now() - t0;
@@ -483,7 +485,7 @@ export async function search(db: Db, body: unknown, until?: number, pin?: Record
     const t1 = performance.now();
     const s = await snapshot(db, async (q) => {
       const b = await basis(q, r);
-      pinned(b, pin);
+      await pinned(q, pin);
       const rc = await recall(q, r, b, emb.v);
       const scopes = (c: Cand) => [...c.sources].map((x) => b.valid.get(x)!.scope);
       // Rerank authorization: the query scope and every scope whose text would be sent.
@@ -523,7 +525,7 @@ export async function search(db: Db, body: unknown, until?: number, pin?: Record
     const t2 = performance.now();
     let rerankSkip = s.rerankSkip;
     // Every source carried by a candidate, plus the read grant's destination version.
-    const deps: Record<string, number> = { ...b.qDeps };
+    const deps: Record<string, number> = { ...b.qDeps, ...(pin ?? {}) }; // a pinned query's whole pin guards rerank and publication
     for (const c of rc.chosen) for (const x of c.sources) Object.assign(deps, b.valid.get(x)!.deps);
     // The query vector was made under the versions it was sent with; if one of them is not what this search
     // read (the querying session revised while it was out), it belongs to another state. A pinned (frozen)
@@ -603,12 +605,7 @@ export async function search(db: Db, body: unknown, until?: number, pin?: Record
     // The trace is published like any derived artefact: under the shared barrier, only while the query's
     // basis and every candidate's still hold (a forget of the querying session deletes its traces).
     await searchHooks.beforeTrace();
-    const t = await db.begin(async (tx: Tx) => {
-      if (until !== undefined) {
-        const left = until - Date.now();
-        if (left <= 0) throw new HttpError(504, "deadline");
-        await tx`select set_config('lock_timeout', ${left + "ms"}, true), set_config('transaction_timeout', ${left + "ms"}, true)`;
-      }
+    const publish = async (tx: Tx) => {
       await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
       if (!(await unchanged(tx, deps))) return null;
       const [row] = await tx`insert into search_trace (source, purpose, data) values (${r.source}, ${r.purpose},
@@ -619,7 +616,9 @@ export async function search(db: Db, body: unknown, until?: number, pin?: Record
                                ms: { embed: Math.round(tEmbed), recall: Math.round(tRecall), rerank: Math.round(tRerank), total: Math.round(performance.now() - t0) },
                              }}) returning id`;
       return row;
-    });
+    };
+    // With a deadline: the connection wait, the barrier wait and the insert all end by then (within).
+    const t = until === undefined ? await db.begin(publish) : await within(db, publish, until);
     if (!t) return run();
     return new Guarded(deps, {
       results,

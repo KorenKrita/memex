@@ -80,7 +80,7 @@ beforeEach(async () => {
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
-const header = (id: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x" });
+const header = (id: string, extra = {}) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...extra });
 const msg = (role: string, id: string, parent: string | null, text: string) =>
   JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
 let n = 0;
@@ -98,8 +98,8 @@ async function put(native: string, ex: [string, string][]) {
   return decl.source;
 }
 /** Commit raw lines (branches: entries with any parents) with an optional leaf. */
-async function putRaw(native: string, lines: string[], leaf?: string) {
-  const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent: null };
+async function putRaw(native: string, lines: string[], leaf?: string, parent: string | null = null) {
+  const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent };
   const l = await requestLease(db, decl, "m1");
   expect((await tryGrant(db, l)).granted).toBe(true);
   expect((await commit(db, { leaseId: l, commitId: `r${n++}`, length: lines.length, leaf, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
@@ -599,5 +599,118 @@ test("the querying session revised before the search starts: refused at its firs
     expect(calls.length).toBe(k);
   } finally {
     rh.beforeSearch = async () => {};
+  }
+});
+
+// ---------- review round 3 ----------
+
+/** The querying session as a fork child of `fpar` whose previous exchange is inherited from it. */
+async function forkMe() {
+  const P = sourceIdOf("pi", "fpar");
+  const pl = [header("fpar"), msg("user", "p0", null, "parent question"), msg("assistant", "p1", "p0", "parent reply")];
+  await putRaw("fpar", pl);
+  await putRaw("me", [header("me", { parentSession: "/x/fpar.jsonl" }), pl[1], pl[2]], undefined, P);
+  return { P, pl };
+}
+
+test("a fork child's recall with an unchanged inherited context succeeds", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await forkMe();
+  await drain(db);
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply" }));
+  expect(d.state).toBe("shown");
+});
+
+test("the fork ancestor holding the inherited context revised during the call: nothing frozen", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const { pl } = await forkMe();
+  await drain(db);
+  embedHook = async () => {
+    embedHook = null;
+    await putRaw("fpar", [pl[0], msg("user", "p0", null, "parent question revised"), pl[2]]);
+  };
+  const d = await ask(R("u9", "zx-7781", { prev_user: "parent question", prev_assistant: "parent reply" }));
+  expect(d.state).toBe("query-stale");
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+});
+
+test("the same user record with two different queries at once: one decides, the other is refused", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  // Both pass the first read before either saves.
+  let waiting = 0;
+  let gate!: () => void;
+  const open = new Promise<void>((r) => (gate = r));
+  recallHooks.beforeSave = async () => {
+    if (++waiting === 2) gate();
+    await open;
+  };
+  const rs = await Promise.allSettled([ask(R("u1", "zx-7781 first")), ask(R("u1", "zx-7781 second"))]);
+  const ok = rs.filter((x) => x.status === "fulfilled");
+  const bad = rs.filter((x) => x.status === "rejected") as PromiseRejectedResult[];
+  expect(ok.length).toBe(1);
+  expect(bad.length).toBe(1);
+  expect(String(bad[0].reason)).toContain("another query");
+  expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(1);
+});
+
+test("waiting for a pool connection past the deadline: the call ends in time and nothing is saved later", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  process.env.MEMEX_RECALL_MS = "600";
+  const one = connect(undefined, 1);
+  let blocker: Promise<unknown> = Promise.resolve();
+  recallHooks.beforeSave = async () => {
+    let holding!: () => void;
+    const isHeld = new Promise<void>((r) => (holding = r));
+    blocker = one.begin(async () => {
+      holding();
+      await Bun.sleep(1200);
+    });
+    await isHeld;
+  };
+  try {
+    const t = Date.now();
+    const r = await recall(one, R("u1", "zx-7781"));
+    expect((r instanceof Guarded ? r.body : r) as any).toMatchObject({ state: "timeout" });
+    expect(Date.now() - t).toBeLessThan(1000);
+    await blocker;
+    await Bun.sleep(200);
+    expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(0);
+  } finally {
+    await one.close();
+  }
+});
+
+test("saved in time but the answer blocked: the call times out, the decision stays for a retry", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  process.env.MEMEX_RECALL_MS = "800";
+  const one = connect(undefined, 1);
+  const { recallHooks: rh } = await import("./recall.ts");
+  let blocker: Promise<unknown> = Promise.resolve();
+  rh.afterSave = async () => {
+    let holding!: () => void;
+    const isHeld = new Promise<void>((r) => (holding = r));
+    blocker = one.begin(async () => {
+      holding();
+      await Bun.sleep(1200);
+    });
+    await isHeld;
+  };
+  try {
+    const t = Date.now();
+    const r = await recall(one, R("u1", "zx-7781"));
+    expect((r instanceof Guarded ? r.body : r) as any).toMatchObject({ state: "timeout" });
+    expect(Date.now() - t).toBeLessThan(1100);
+    await blocker;
+    expect((await db`select count(*)::int n from recall_block`)[0].n).toBe(1);
+    rh.afterSave = async () => {};
+    const k = reranks();
+    expect((await ask(R("u1", "zx-7781"))).state).toBe("shown"); // recovered by the retry, no new search
+    expect(reranks()).toBe(k);
+  } finally {
+    rh.afterSave = async () => {};
+    await one.close();
   }
 });

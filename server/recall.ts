@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { type Db, type Tx } from "./db.ts";
 import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
-import { snapshot, unchanged } from "./derive.ts";
+import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
@@ -31,7 +31,7 @@ export const FRAMING = "<memex-recall>\n[memex] Background data from earlier ses
 const END = "</memex-recall>";
 
 /** Hooks for tests: after the search, before saving (where a withdrawal or the deadline can land). */
-export const recallHooks = { beforeSave: async () => {}, beforeSearch: async () => {} };
+export const recallHooks = { beforeSave: async () => {}, beforeSearch: async () => {}, afterSave: async () => {} };
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 /** The first `n` bytes of `s`, never splitting a character. */
@@ -152,40 +152,46 @@ export async function recall(db: Db, body: any): Promise<Guarded | object> {
   for (const p of picked) for (const [k, v] of Object.entries(p.deps)) if (k in deps && deps[k] !== v) return { state: "timeout" };
   for (const p of picked) Object.assign(deps, p.deps);
   await recallHooks.beforeSave();
-  const saved = await db
-    .begin(async (tx: Tx) => {
-      const left = until - Date.now();
-      if (left <= 0) return "late" as const;
-      await tx`select set_config('lock_timeout', ${left + "ms"}, true), set_config('transaction_timeout', ${left + "ms"}, true)`;
-      await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
-      if (!(await unchanged(tx, deps))) return "moved" as const;
-      await tx`insert into recall_state (source) values (${r.source}) on conflict do nothing`;
-      const [st] = await tx`update recall_state set seq = seq + 1 where source = ${r.source} returning seq`;
-      const text = picked.length ? [FRAMING, ...picked.map((p, i) => `[hint:${st.seq}.${i}] ${p.body}`), END].join("\n") : "";
-      const ins = await tx`insert into recall_block (source, user_rec, query_hash, seq, state, text, deps, sources, refs)
-                           values (${r.source}, ${r.user_rec}, ${qh}, ${st.seq}, ${picked.length ? "shown" : "empty"}, ${text}, ${deps},
-                                   ${tx.array([...new Set(picked.map((p) => p.source))], "text")}, ${picked.map((p) => p.ref) as any})
-                           on conflict (source, user_rec) do nothing returning seq`;
-      if (!ins.length) throw new Error("raced"); // the same binding saved meanwhile: roll back, read it
-      if (Date.now() >= until) throw new Error("late"); // past the deadline before commit: nothing saved
-      return "saved" as const;
-    })
-    .catch((e) => {
-      if (Date.now() >= until) return "late" as const;
-      if (e?.message === "raced") return "raced" as const;
-      throw e;
-    });
+  // The save: bounded by the deadline as a whole (connection wait, barrier wait, writes) and checked once more
+  // before commit, so a late transaction never commits.
+  const saved = await within(db, async (tx: Tx) => {
+    await tx`select pg_advisory_xact_lock_shared(${BARRIER})`;
+    if (!(await unchanged(tx, deps))) return "moved" as const;
+    await tx`insert into recall_state (source) values (${r.source}) on conflict do nothing`;
+    const [st] = await tx`update recall_state set seq = seq + 1 where source = ${r.source} returning seq`;
+    const text = picked.length ? [FRAMING, ...picked.map((p, i) => `[hint:${st.seq}.${i}] ${p.body}`), END].join("\n") : "";
+    const ins = await tx`insert into recall_block (source, user_rec, query_hash, seq, state, text, deps, sources, refs)
+                         values (${r.source}, ${r.user_rec}, ${qh}, ${st.seq}, ${picked.length ? "shown" : "empty"}, ${text}, ${deps},
+                                 ${tx.array([...new Set(picked.map((p) => p.source))], "text")}, ${picked.map((p) => p.ref) as any})
+                         on conflict (source, user_rec) do nothing returning seq`;
+    if (!ins.length) throw new Error("raced"); // the same binding saved meanwhile: roll back, read it
+    if (Date.now() >= until) throw new Error("late"); // past the deadline before commit: nothing saved
+    return "saved" as const;
+  }, until).catch((e: any) => {
+    if (e?.message === "raced") return "raced" as const;
+    if (Date.now() >= until || /deadline|timeout|canceling statement/i.test(String(e?.message))) return "late" as const;
+    throw e;
+  });
+  if (saved === "saved") await recallHooks.afterSave();
   if (saved === "late") return { state: "timeout" };
   if (saved === "moved") return { state: "timeout" }; // made from something withdrawn meanwhile: not saved, not shown
-  // Read what is stored now (this save, or the same binding's saved first) — without the deadline: the
-  // decision is made; answering it is not part of making it.
-  const again = (await snapshot(db, async (q) => {
-    const bb = await basis(q, q0);
-    const [row] = await q`select * from recall_block where source = ${r.source} and user_rec = ${r.user_rec}`;
-    if (!row) return null;
-    const v = await readable(q, bb, row);
-    return { deps: v ? (row.deps as Record<string, number>) : bb.qDeps, body: out(row, v) };
-  }));
+  // Read what is stored now: this save, or the same binding's saved first — which must be for the same query
+  // (two different queries racing for one user record: one decides, the other is refused). Within the
+  // deadline too: a decision saved in time stays, and a retry of this binding reads it.
+  let again: { deps: Record<string, number>; body: object } | null;
+  try {
+    again = await snapshot(db, async (q) => {
+      const bb = await basis(q, q0);
+      const [row] = await q`select * from recall_block where source = ${r.source} and user_rec = ${r.user_rec}`;
+      if (!row) return null;
+      if (row.query_hash !== qh) throw new HttpError(409, "this user record was recalled for another query");
+      const v = await readable(q, bb, row);
+      return { deps: v ? (row.deps as Record<string, number>) : bb.qDeps, body: out(row, v) };
+    }, until);
+  } catch (e) {
+    if (Date.now() >= until) return { state: "timeout" };
+    throw e;
+  }
   if (!again) return { state: "timeout" };
   return new Guarded(again.deps, again.body, async () => (await recall(db, body)) as Guarded);
 }
