@@ -124,13 +124,13 @@ test("a record in conflict between two collectors: no text, tree kept, other rec
   expect(lx.length).toBe(0);
 });
 
-test("fork parent: before the parent exists the prefix is quarantined; once projected, inherited records stay the parent's", async () => {
+test("fork parent: before the parent exists the copies are quarantined (the child's own entry is not); once projected, inherited records stay the parent's", async () => {
   const P = sourceIdOf("pi", "par");
   const parentLines = [header("par"), user("u1", null, "parent question"), asst("a1", "u1", "parent answer")];
   const child = [header("kid", "/somewhere/par.jsonl"), user("u1", null, "parent question"), asst("a1", "u1", "parent answer"), user("k1", "a1", "child question")];
   const C = await put("kid", child, { parent: P });
   await drain(db);
-  expect((await db`select count(*)::int n from lexical where source = ${C}`)[0].n).toBe(0); // all quarantined
+  expect((await db`select rec from lexical where source = ${C}`).map((x: any) => x.rec)).toEqual(["k1"]); // copies quarantined, k1 its own
   await put("par", parentLines);
   await drain(db); // parent projects, re-queues the child
   const lx = (await db`select rec from lexical where source = ${C} order by rec`).map((r: any) => r.rec);
@@ -140,12 +140,12 @@ test("fork parent: before the parent exists the prefix is quarantined; once proj
   expect(cv.keys.slice(0, 2)).toEqual(pv.keys); // the child's view walks through the parent's records
 });
 
-test("fork parent in another scope is never linked", async () => {
+test("fork parent in another scope is never linked: its copies stay out, the child's own entry is kept", async () => {
   const P = await put("par2", [header("par2"), user("u1", null, "work secret"), asst("a1", "u1", "w")], { scope: "work" });
   const C = await put("kid2", [header("kid2", "/x.jsonl"), user("u1", null, "work secret"), asst("a1", "u1", "w"), user("k1", "a1", "mine")], { parent: P });
   await drain(db);
-  expect((await db`select count(*)::int n from lexical where source = ${C}`)[0].n).toBe(0);
-  expect((await db`select count(*)::int n from view where source = ${C}`)[0].n).toBe(0);
+  expect((await db`select rec, text from lexical where source = ${C}`).map((x: any) => x.rec)).toEqual(["k1"]);
+  expect(JSON.stringify(await db`select text from lexical where source = ${C}`)).not.toContain("work secret");
 });
 
 test("a commit during a projection run is not lost: the run publishes nothing and the job runs again", async () => {

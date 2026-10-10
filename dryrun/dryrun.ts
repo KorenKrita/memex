@@ -654,18 +654,13 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   const own: Rec[] = []; // records new in this file: the only ones counted as evidence
   for (const e of entries) {
     const m = matchOf(e);
-    if (res.forkStatus === "parent-not-given" || res.forkStatus === "unresolved") {
-      // Copied history keeps the parent's ids; without a usable parent nothing here can be called new.
-      res.unresolved++;
-      navOf.set(e.id, []);
-      continue;
-    }
     // A copy (DESIGN §4.1, user decision): Pi copies the parent's entries with their ids and times, so in a fork
-    // child an entry not newer than the fork (the header's time; an unreadable time counts) is a copy — told from
-    // this file alone, whatever its ancestors hold. A copy is inherited while the nearest living ancestor has its
-    // content (its parent link aside: Pi re-chains past dropped labels), else withdrawn, never this file's own.
-    // An entry newer than the fork is this file's own, even with the very content of a parent entry.
-    const copied = !!from && isCopyTime(e, header);
+    // child (its header names a parent, resolved or not) an entry not newer than the fork (the header's time; an
+    // unreadable time counts) is a copy — told from this file alone, whatever its ancestors hold. A copy is
+    // inherited while the nearest living ancestor has its content (its parent link aside: Pi re-chains past
+    // dropped labels), else withdrawn (also when no usable parent is known), never this file's own. An entry
+    // newer than the fork is this file's own, even with the very content of a parent entry, parent known or not.
+    const copied = !!header.parentSession && isCopyTime(e, header);
     const inheritedKey = copied ? (from?.keys.get(m) ?? from?.loose.get(looseOf(e))) : undefined;
     if (!inheritedKey && copied) {
       res.unresolved++;
@@ -908,7 +903,7 @@ function analyze(path: string, opts: AnalyzeOptions): { res: FileResult; parent?
   }
 }
 
-type Analysis = { res: FileResult; parent?: ParentInfo; views?: Rec[][]; fileViews?: FileViews };
+type Analysis = { res: FileResult; parent?: ParentInfo; keys?: Map<string, string>; views?: Rec[][]; fileViews?: FileViews };
 function analyzeLines(path: string, lines: Record<string, any>[], res: FileResult, opts: AnalyzeOptions & { idOf?: Family["idOf"]; prior?: FileViews }): Analysis {
   {
     if (lines.length === 0) return skip(res, "empty"), { res };
@@ -925,7 +920,7 @@ function analyzeLines(path: string, lines: Record<string, any>[], res: FileResul
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
     const loose = parsed.keys ? looseKeys(lines.slice(1), parsed.keys) : new Map<string, string>();
-    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, loose } : undefined, views: parsed.views, fileViews };
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, loose } : undefined, keys: parsed.keys, views: parsed.views, fileViews };
   }
 }
 
@@ -934,7 +929,7 @@ function analyzeLines(path: string, lines: Record<string, any>[], res: FileResul
 /** A view's closed part as persisted: record keys in order and the spans over them (never re-cut). */
 export type PriorView = { keys: string[]; spans: { id?: string; start: number; end: number }[] };
 export type ProjectedView = { recs: { key: string; id: string; kind: string }[]; spans: { id?: string; start: number; end: number }[] };
-export type Projection = { res: FileResult; parent?: ParentInfo; views: ProjectedView[] };
+export type Projection = { res: FileResult; parent?: ParentInfo; keys?: Map<string, string>; views: ProjectedView[] };
 export interface ProjectOptions {
   idOf: (recs: { key: string }[]) => string; // persistent span id from the ordered record keys
   prior?: PriorView[]; // this source's previous partition, closed spans only: they are never re-cut
@@ -950,7 +945,7 @@ export function projectLines(label: string, lines: Record<string, any>[], opts: 
   const prior = opts.prior?.length ? joinViews({ paths: opts.prior.map((v) => v.keys), viewSpans: opts.prior.map((v) => v.spans) }) : undefined;
   const a = analyzeLines(label, lines, res, { parent: opts.parent && (() => opts.parent!()), idOf: opts.idOf, prior, onSpan: opts.onSpan, onLexical: opts.onLexical });
   const views = (a.views ?? []).map((path, i) => ({ recs: path.map((r) => ({ key: r.key, id: r.id, kind: r.kind })), spans: a.fileViews!.viewSpans[i] }));
-  return { res: a.res, parent: a.parent, views };
+  return { res: a.res, parent: a.parent, keys: a.keys, views }; // keys: this file's own mapping, usable as a parent or not
 }
 export type { ParentInfo };
 export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], loose: Map<string, string>): ParentInfo {

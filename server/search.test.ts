@@ -784,6 +784,50 @@ test("a child's own entry newer than the fork with the same id and content as a 
   expect(await own()).toEqual(["xk"]);
 });
 
+for (const parentSynced of [false, true])
+  test(`a fork whose header names a parent the collector did not link (parent ${parentSynced ? "synced in another scope" : "absent"}): copies withdrawn, its own kept`, async () => {
+    const u0 = msg("user", "u0", null, "unlinked-copy-q"), a0 = msg("assistant", "a0", "u0", "unlinked-copy-r");
+    if (parentSynced) await put("hp", [header("hp"), u0, a0], "work");
+    await drain(db);
+    // parent: null, as client/sync.ts declares it when the parent file is absent or outside this scope.
+    const C = await put("hc", [header("hc", { parentSession: "/x/hp.jsonl" }), u0, a0, msg("user", "k1", "a0", "unlinked-own")], "personal", null);
+    await drain(db);
+    expect(await hasText("unlinked-own")).toBe(true);
+    expect(JSON.stringify(await db`select text from lexical where source = ${C}`)).not.toContain("unlinked-copy");
+    const keys = ((await db`select keys from projected where source = ${C}`)[0].keys ?? []) as [string, string][];
+    expect(keys.map(([m]) => m.split(":")[0]).sort()).toEqual(["k1"]);
+  });
+
+test("a fork whose declared parent is not usable (in dispute): its own entries searchable, copies withdrawn; inherited once the parent is usable", async () => {
+  const P = sourceIdOf("pi", "dp");
+  const u0 = msg("user", "u0", null, "disp-copy-q"), a0 = msg("assistant", "a0", "u0", "disp-copy-r");
+  const base = [header("dp"), u0, a0];
+  await put("dp", [...base, msg("user", "x1", "a0", "one")]);
+  const l = await requestLease(db, { source: P, harness: "pi", nativeId: "dp", scope: "personal", parent: null }, "m2");
+  await tryGrant(db, l);
+  const other = [...base, msg("user", "x1", "u0", "two")]; // where x1 hangs is in dispute: the parent is blocked
+  await commit(db, { leaseId: l, commitId: "dp-m2", length: other.length, changes: other.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  expect((await db`select status from projected where source = ${P}`)[0].status).toBe("blocked");
+  const C = await put("dk", [header("dk", { parentSession: "/x/dp.jsonl" }), u0, a0, msg("user", "k1", "a0", "disp-kid-own")], "personal", P);
+  await drain(db);
+  expect(await hasText("disp-kid-own")).toBe(true);
+  expect(JSON.stringify(await db`select text from lexical where source = ${C}`)).not.toContain("disp-copy");
+  // A fork of this fork: it is no usable parent (its own ancestry unresolved), so the grandchild's copies stay out.
+  const G = await put("dg", [header("dg", { parentSession: "/x/dk.jsonl" }), u0, a0, msg("user", "k1", "a0", "disp-kid-own"), msg("user", "g1", "k1", "disp-grand-own")], "personal", C);
+  await drain(db);
+  expect(JSON.stringify(await db`select text from lexical where source = ${G}`)).not.toMatch(/disp-copy|disp-kid-own/);
+  expect(await hasText("disp-grand-own")).toBe(true);
+  // The dispute resolved: the parent is usable, the child's copies are inherited.
+  const l2 = await requestLease(db, { source: P, harness: "pi", nativeId: "dp", scope: "personal", parent: null }, "m2");
+  await tryGrant(db, l2);
+  const fixed = [...base, msg("user", "x1", "a0", "one")];
+  await commit(db, { leaseId: l2, commitId: "dp-m2b", length: fixed.length, changes: fixed.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  const owners = ((await db`select keys from projected where source = ${C}`)[0].keys as [string, string][]).filter(([m]) => /^(u0|a0):/.test(m)).map(([, k]) => k.split("/")[0]);
+  expect(owners).toEqual(["dp", "dp"]);
+});
+
 test("an unrelated session with the very same entry is forgotten: a fork's copy inherited from its own parent stays, also when synced again", async () => {
   // P and Q are independent roots that hold the same entry bytes (same id, content and time). C forks Q.
   const P = sourceIdOf("pi", "np"), Q = sourceIdOf("pi", "nq");
@@ -1069,9 +1113,9 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
   expect(k).toBeDefined();
   expect(await hasText("upgrade-old-copy")).toBe(true);
-  // A database that already ran fork-copy-v2 and v3 (their marks only): v4 still runs, once.
-  await db`delete from migration_mark where key = 'fork-copy-v4'`;
-  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3') on conflict do nothing`;
+  // A database that already ran fork-copy-v2..v4 (their marks only): v5 still runs, once.
+  await db`delete from migration_mark where key = 'fork-copy-v5'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing`;
   await migrate(db);
   expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
   const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
@@ -1080,6 +1124,31 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await drain(db);
   expect(await hasText("upgrade-old-copy")).toBe(false);
   expect(await hasText("upgrade-kid-own")).toBe(true);
+});
+
+test("an upgrade from projections that kept an unlinked fork's copy as its own (v4 already ran): unreadable at migrate, before any worker", async () => {
+  const u0 = msg("user", "u0", null, "q"), a0 = msg("assistant", "a0", "u0", "unlinked-old-copy");
+  // A fork whose parent file the collector did not link (parent: null), its header naming the parent.
+  const C = await put("ulk", [header("ulk", { parentSession: "/x/absent.jsonl" }), u0, a0, msg("user", "k1", "a0", "unlinked-kid-own")], "personal", null);
+  await drain(db);
+  // As the previous version left it: the copy indexed as the child's own.
+  await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"ulk/a0:old#0"}, 0, 'a0', 'assistant', 'unlinked-old-copy', ${C + ":a0"})`;
+  expect(await hasText("unlinked-old-copy")).toBe(true);
+  await db`delete from migration_mark where key = 'fork-copy-v5'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing`;
+  // A root session (no parent named) is not moved.
+  const R = await put("ulr", [header("ulr"), msg("user", "r0", null, "root-text")]);
+  await drain(db);
+  const rv = (await db`select v from vis_version where key = ${"s:" + R}`)[0]?.v ?? null;
+  await migrate(db);
+  expect(await hasText("unlinked-old-copy")).toBe(false); // before any worker ran
+  expect((await db`select v from vis_version where key = ${"s:" + R}`)[0]?.v ?? null).toBe(rv);
+  const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
+  await migrate(db); // once only
+  expect((await db`select v from vis_version where key = ${"s:" + C}`)[0].v).toBe(v);
+  await drain(db);
+  expect(await hasText("unlinked-old-copy")).toBe(false);
+  expect(await hasText("unlinked-kid-own")).toBe(true);
 });
 
 test("a fresh database: the entry point creates every table before serving", async () => {

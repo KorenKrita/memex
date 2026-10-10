@@ -231,7 +231,7 @@ describe("Pi", () => {
     expect(report.perFile.find((f) => f.path === child)!.forkStatus).toBe("parent-not-given");
   });
 
-  test("fork inheritance: same id and content (key order irrelevant), same id other content withdrawn; parent not given → quarantined", () => {
+  test("fork inheritance: same id and content (key order irrelevant), same id other content withdrawn; parent not given → copies quarantined, the child's own entry kept", () => {
     const parentRows = [piHeader(), piMsg("u1", null, user("shared")), piMsg("a1", "u1", say("shared reply"))];
     const parent = file("pi/fork/parent.jsonl", parentRows);
     const reordered = Object.fromEntries(Object.entries(parentRows[1] as object).reverse());
@@ -239,7 +239,7 @@ describe("Pi", () => {
     const childRows = [piHeader({ id: "child", parentSession: parent }), reordered, edited, piMsg("u2", "a1", user("new in child"))];
     const child = file("pi/fork/child.jsonl", childRows);
     const solo = dryRun([child]).perFile[0];
-    expect(solo).toMatchObject({ forkStatus: "parent-not-given", unresolved: 3, evidence: 0, spans: 0 });
+    expect(solo).toMatchObject({ forkStatus: "parent-not-given", unresolved: 2, inherited: 0, evidence: 1 }); // u2, newer than the fork, is its own
     const both = dryRun([join(dir, "pi/fork")]).perFile.find((f) => f.path === child)!;
     // Same id, other content: a copy of a version the parent no longer has — withdrawn with it (DESIGN §4.1),
     // not the child's own evidence; the child's new entry is.
@@ -526,7 +526,7 @@ describe("third review", () => {
     const child = file("pi/badparent/child.jsonl", [piHeader({ id: "child", parentSession: parent }), piMsg("u", null, user("q")), piMsg("b", "u", say("new"))]);
     const r = isolated(`const r = dryRun([${JSON.stringify(join(dir, "pi/badparent"))}]); const c = r.perFile.find((f) => f.path === ${JSON.stringify(child)}); console.log(JSON.stringify([r.skipped, c.forkStatus, c.evidence]));`);
     expect(r.signal).toBeNull();
-    expect(JSON.parse(r.out)).toEqual([{ "invalid-tree": [parent] }, "unresolved", 0]);
+    expect(JSON.parse(r.out)).toEqual([{ "invalid-tree": [parent] }, "unresolved", 1]); // only its own b (newer than the fork)
   });
 
   test("short sessions (< 4 leaves) build no internal nodes", () => {
@@ -560,21 +560,27 @@ describe("third review", () => {
 });
 
 describe("fourth review", () => {
-  test("a fork chain that loops back is unresolved all the way, nothing reaches a span", () => {
+  test("a fork chain that loops back is unresolved all the way: no copy reaches a span, only each file's own entries", () => {
     const [A, B] = ["A", "B"].map((n) => join(dir, "pi/forkloop", `${n}.jsonl`));
-    file("pi/forkloop/A.jsonl", [piHeader({ id: "sA", parentSession: B }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))]);
-    file("pi/forkloop/B.jsonl", [piHeader({ id: "sB", parentSession: A }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const u = piMsg("u", null, user("u")); // the shared copy, older than either fork
+    const [hA, hB] = [piHeader({ id: "sA", parentSession: B }), piHeader({ id: "sB", parentSession: A })];
+    file("pi/forkloop/A.jsonl", [hA, u, piMsg("a", "u", say("a"))]);
+    file("pi/forkloop/B.jsonl", [hB, u, piMsg("b", "u", say("b"))]);
     const r = dryRun([join(dir, "pi/forkloop")]);
-    for (const f of r.perFile) expect(f).toMatchObject({ forkStatus: "unresolved", evidence: 0, spans: 0, summaryInputBytes: 0 });
+    for (const f of r.perFile) expect(f).toMatchObject({ forkStatus: "unresolved", unresolved: 1, inherited: 0, evidence: 1 }); // u: a copy; a / b: own
   });
 
   test("a fork of an unresolved fork is unresolved too", () => {
     const missing = join(dir, "pi/chain/not-given.jsonl");
-    const B = file("pi/chain/B.jsonl", [piHeader({ id: "sB", parentSession: missing }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
-    const C = file("pi/chain/C.jsonl", [piHeader({ id: "sC", parentSession: B }), piMsg("u", null, user("u")), piMsg("b", "u", say("b")), piMsg("c", "b", say("c"))]);
+    const u = piMsg("u", null, user("u")); // B's copy of its (absent) parent's entry, older than B's fork
+    const hB = piHeader({ id: "sB", parentSession: missing });
+    const b = piMsg("b", "u", say("b")); // B's own
+    const B = file("pi/chain/B.jsonl", [hB, u, b]);
+    const C = file("pi/chain/C.jsonl", [piHeader({ id: "sC", parentSession: B }), u, b, piMsg("c", "b", say("c"))]);
     const r = dryRun([B, C]);
-    expect(r.perFile.find((f) => f.path === B)).toMatchObject({ forkStatus: "parent-not-given", spans: 0 });
-    expect(r.perFile.find((f) => f.path === C)).toMatchObject({ forkStatus: "unresolved", evidence: 0, spans: 0, summaryInputBytes: 0 });
+    expect(r.perFile.find((f) => f.path === B)).toMatchObject({ forkStatus: "parent-not-given", unresolved: 1, evidence: 1 });
+    // C: u, b copies (of an unresolved parent: withdrawn), c its own
+    expect(r.perFile.find((f) => f.path === C)).toMatchObject({ forkStatus: "unresolved", unresolved: 2, inherited: 0, evidence: 1 });
   });
 
   test("an entry whose parent is missing is an orphan root (as in Pi's getTree), and is reported", () => {
@@ -789,13 +795,14 @@ describe("fourth review", () => {
 
   test("copies that differ are all quarantined, and so are forks of them, whatever the file names", () => {
     const run = (d: string, first: string, second: string) => {
+      stampOf.clear(); // each run is its own fixture
       const x = file(`${d}/${first}.jsonl`, [piHeader({ id: "dup" }), piMsg("u", null, user("u"))]);
       file(`${d}/${second}.jsonl`, [piHeader({ id: "dup" }), piMsg("u", null, user("u")), piMsg("a", "u", say("longer"))]);
       const k = file(`${d}/kid.jsonl`, [piHeader({ id: "kid", parentSession: x }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
       const r = dryRun([join(dir, d)]);
       return { conflicting: r.skipped["conflicting-copies"]?.length, kid: r.perFile.find((f) => f.path === k)!.forkStatus, evidence: r.total.evidence };
     };
-    const want = { conflicting: 2, kid: "unresolved" as const, evidence: 0 };
+    const want = { conflicting: 2, kid: "unresolved" as const, evidence: 1 }; // only the kid's own b
     expect(run("pi/conflict-ab", "a", "b")).toEqual(want);
     expect(run("pi/conflict-ba", "b", "a")).toEqual(want);
   });
@@ -811,7 +818,7 @@ describe("fourth review", () => {
     const k = file("pi/noid/k.jsonl", [piHeader({ id: "k", parentSession: p }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
     const r = dryRun([join(dir, "pi/noid")]);
     expect(r.perFile.find((f) => f.path === p)).toMatchObject({ status: "skipped", reason: "no-session-id" });
-    expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "unresolved", evidence: 0 });
+    expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "unresolved", unresolved: 1, evidence: 1 }); // u a copy, b its own
   });
 
   test("copies are found whatever lines come before the header (blank, malformed, non-object)", () => {

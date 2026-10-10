@@ -64,24 +64,29 @@ create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
 -- One-time semantic migrations, each applied once (its mark inserted with it).
 create table if not exists migration_mark (key text primary key, at timestamptz not null default now());
--- fork-copy-v4 (DESIGN §4.1; v2, v3 before it): projections from before the Pi fork copy rule (a copy told by its
--- own time against the child's fork time, whatever the ancestors hold) may hold a withdrawn copy as the child's
--- own, or a newer own entry as inherited. Every Pi fork child's version moves now, in this transaction (its old
--- projection, summaries, statements and frozen blocks stop counting as current before any worker runs), and
--- it is projected again. Once: a later start moves nothing (a database that ran v2 or v3 runs v4 once more).
+-- fork-copy-v5 (DESIGN §4.1; v2-v4 before it): projections from before the Pi fork copy rule (a copy told by its
+-- own time against the child's fork time, whatever the ancestors hold; a fork is one whose header names a parent,
+-- linked or not) may hold a withdrawn copy as the child's own, or a newer own entry as inherited or quarantined.
+-- Every Pi fork child's version moves now — a declared parent, or a header naming one (v4 missed the latter) —
+-- in this transaction (its old projection, summaries, statements and frozen blocks stop counting as current
+-- before any worker runs), and it is projected again. Once: a later start moves nothing (a database that ran
+-- v2-v4 runs v5 once more).
 do $$
 begin
-  if exists (select 1 from migration_mark where key = 'fork-copy-v4') then return; end if;
-  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing;
-  insert into vis_version select 's:' || s.id, 2 from source s where s.harness = 'pi' and s.parent_id is not null
-    on conflict (key) do update set v = vis_version.v + 1;
+  if exists (select 1 from migration_mark where key = 'fork-copy-v5') then return; end if;
+  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4'), ('fork-copy-v5') on conflict do nothing;
+  create temporary table fork_child on commit drop as
+    select s.id from source s where s.harness = 'pi' and (s.parent_id is not null or exists (
+      select 1 from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+      where r.source = s.id and r.rec = 'header' and b.raw like '%parentSession%' and b.raw is json object
+        and (b.raw::jsonb ->> 'parentSession') is not null));
+  insert into vis_version select 's:' || id, 2 from fork_child on conflict (key) do update set v = vis_version.v + 1;
   if to_regclass('recall_block') is not null then
-    insert into vis_version select distinct 'r:' || b.source, 2 from recall_block b, source s
-      where s.harness = 'pi' and s.parent_id is not null and b.deps ? ('s:' || s.id)
+    insert into vis_version select distinct 'r:' || b.source, 2 from recall_block b, fork_child f where b.deps ? ('s:' || f.id)
       on conflict (key) do update set v = vis_version.v + 1;
   end if;
-  insert into job (kind, key) select 'project', s.id from source s
-    where s.harness = 'pi' and s.parent_id is not null and not exists (select 1 from tomb t where t.key = 'source:' || s.id)
+  insert into job (kind, key) select 'project', f.id from fork_child f
+    where not exists (select 1 from tomb t where t.key = 'source:' || f.id)
   on conflict (kind, key) where state in ('queued', 'running') do nothing;
 end $$;
 `);
@@ -127,7 +132,7 @@ export async function load(q: Tx, source: string, harness: string): Promise<Load
   return { lines, idle, idleMs };
 }
 
-type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: ProjectedView[]; spans: Map<string, Parameters<NonNullable<Parameters<typeof projectLines>[2]["onSpan"]>>[0]>; lexical: { key: string; rec: string; kind: string; text: string }[]; keys: [string, string][] | null };
+type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: ProjectedView[]; spans: Map<string, Parameters<NonNullable<Parameters<typeof projectLines>[2]["onSpan"]>>[0]>; lexical: { key: string; rec: string; kind: string; text: string }[]; keys: [string, string][] | null; parentOk?: boolean };
 
 /** Analyse one source (and, through `parent`, read its fork parent's stored projection). */
 async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; idleMs: number; parentId: string | null }> {
@@ -142,9 +147,10 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
     seen.add(src.parent_id);
     src.parent_id = (await q`select parent_id from source where id = ${src.parent_id}`)[0]?.parent_id ?? null;
   }
-  // Whether a fork child ever declared a parent (living or forgotten): its copies are told by their own times.
+  // A fork child: it declared a parent (living or forgotten), or its own header names one (a parent file the
+  // collector did not link: absent, or outside this scope). Its copies are told by their own times either way.
   const [decl] = await q`select parent_id from source where id = ${source}`;
-  const forked = !!decl?.parent_id;
+  let forked = !!decl?.parent_id;
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
   const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
@@ -153,17 +159,18 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    // No living ancestor: copies (by their times) have nothing to be inherited from — withdrawn; the child's own
-    // entries stay. Never a declared parent: a root session.
+    forked ||= !!lines[0].parentSession;
+    // No living ancestor known: copies (by their times) have nothing to be inherited from — withdrawn; the
+    // child's own entries stay. No parent declared nor named: a root session.
     if (!src.parent_id && forked) {
       lines[0].parentSession = "/memex/forgotten";
       parent = parentInfo([], [], spanIdOf, new Map());
     } else if (!src.parent_id) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
-      const [p] = await q`select s.scope, pr.status, pr.keys from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
+      const [p] = await q`select s.scope, pr.status, pr.keys, pr.res from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
       if (!p || !p.status) parent = undefined; // not projected yet: quarantined until it is
-      else if (p.scope !== src.scope || p.status !== "ok" || !p.keys) parent = "invalid";
+      else if (p.scope !== src.scope || p.status !== "ok" || !p.keys || p.res?.parent_ok === false) parent = "invalid"; // an unresolved fork is no parent
       else {
         const vs = await q`select keys, spans from view where source = ${src.parent_id} order by ord`;
         // A copy is inherited only while the nearest living ancestor still has its content.
@@ -187,7 +194,12 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
     onLexical: (r) => lexical.push({ key: r.key, rec: r.id, kind: r.kind, text: r.text }),
   });
   if (p.res.status !== "indexed") return { ...base, ...empty, status: "blocked", reason: p.res.reason };
-  return { ...base, status: "ok", views: p.views, spans, lexical, keys: p.parent ? [...p.parent.keys] : null };
+  // The mapping this source's records got (own or inherited): recall and forget read it. A fork whose ancestry is
+  // not resolved stores it too (its own entries newer than the fork are its own), yet never serves as a parent:
+  // its status is not "ok" for that purpose — see `parentOk`.
+  const keys = p.parent?.keys ?? p.keys;
+  const parentOk = !!p.parent;
+  return { ...base, status: "ok", views: p.views, spans, lexical, keys: keys ? [...keys] : null, parentOk };
 }
 
 const chunks = (text: string) => {
@@ -229,7 +241,7 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     const a = await analyse(tx, source);
     let withdrawn = false;
     const [before] = await tx`select status, keys, deps from projected where source = ${source}`;
-    await tx`insert into projected (source, status, keys, res) values (${source}, ${a.status}, ${a.keys}, ${{ reason: a.reason ?? null }})
+    await tx`insert into projected (source, status, keys, res) values (${source}, ${a.status}, ${a.keys}, ${{ reason: a.reason ?? null, parent_ok: !!a.parentOk }})
              on conflict (source) do update set status = excluded.status, keys = excluded.keys, res = excluded.res, at = now()`;
     const wasClosed = new Set<string>(
       (await tx`select spans, closed_end from view where source = ${source}`).flatMap((v: any) => v.spans.filter((x: any) => x.id && x.end <= v.closed_end).map((x: any) => x.id)),
