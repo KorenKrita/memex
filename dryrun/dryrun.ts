@@ -566,8 +566,23 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
 
 // A resolved fork parent: its entries by match key (id + content) → canonical record key, its family's
 // shared span / node identity, and its own views' partition (the source for the child's views). `ids`: every
-// entry id the parent has or had (any version) — a child entry with such an id was copied from the parent.
-type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; ids: Set<string> };
+// entry id the parent has or had (any version, forgotten ancestors' too). `loose`: its current entries by id +
+// content without the parent link (Pi re-chains a copied entry past a dropped label) → canonical record key.
+type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; ids: Set<string>; loose: Map<string, string> };
+const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e)}`;
+const looseOf = (e: Record<string, any>) => {
+  const { parentId: _, ...rest } = e;
+  return `${e.id}:${contentHash(rest)}`;
+};
+/** `loose` of entries whose match keys `keys` maps. */
+export function looseKeys(entries: Record<string, any>[], keys: Map<string, string>) {
+  const m = new Map<string, string>();
+  for (const e of entries) {
+    const k = typeof e.id === "string" ? keys.get(matchOf(e)) : undefined;
+    if (k) m.set(looseOf(e), k);
+  }
+  return m;
+}
 type ParentLookup = (p: string) => ParentInfo | "invalid" | undefined; // undefined: parent not among the inputs
 
 // A root, as in Pi's getTree(): parentId null, pointing at itself, or at an entry not in the file (an
@@ -629,7 +644,6 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
   // Matching uses id + content; identity adds the session the record is native to (DESIGN §4.1), so a
   // record new here is not mistaken for a byte-identical record new in a sibling, and an inherited one
   // keeps its source.
-  const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e)}`;
   const keys = new Map<string, string>();
   const navOf = new Map<string, Rec[]>(); // records for navigation (inherited ones included)
   const own: Rec[] = []; // records new in this file: the only ones counted as evidence
@@ -641,10 +655,14 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
       navOf.set(e.id, []);
       continue;
     }
-    const inheritedKey = from?.keys.get(m);
-    if (!inheritedKey && from?.ids.has(e.id)) {
-      // A copy of a parent entry whose content the parent no longer has (revised there): withdrawn with the
-      // parent's old version, never this file's own record (DESIGN §4.1).
+    // A copy (DESIGN §4.1): Pi copies the parent's entries with their ids and times, so an entry is one when the
+    // parent has held its id (any version, forgotten ancestors too) and it is not newer than the fork (the
+    // header's time; an unreadable time counts as a copy). Inherited while the parent still has its content —
+    // its parent link aside, which Pi re-chains past dropped labels — else withdrawn with the parent's old
+    // version, never this file's own record. A newer entry that only reuses an id is this file's own.
+    const copied = !!from?.ids.has(e.id) && !(Date.parse(e.timestamp) > Date.parse(header.timestamp));
+    const inheritedKey = from?.keys.get(m) ?? (copied ? from?.loose.get(looseOf(e)) : undefined);
+    if (!inheritedKey && copied) {
       res.unresolved++;
       navOf.set(e.id, []);
       continue;
@@ -902,7 +920,8 @@ function analyzeLines(path: string, lines: Record<string, any>[], res: FileResul
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
     const ids = new Set<string>(lines.slice(1).flatMap((e) => (typeof e.id === "string" ? [e.id] : [])));
-    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, ids } : undefined, views: parsed.views, fileViews };
+    const loose = parsed.keys ? looseKeys(lines.slice(1), parsed.keys) : new Map<string, string>();
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, ids, loose } : undefined, views: parsed.views, fileViews };
   }
 }
 
@@ -930,8 +949,8 @@ export function projectLines(label: string, lines: Record<string, any>[], opts: 
   return { res: a.res, parent: a.parent, views };
 }
 export type { ParentInfo };
-export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], ids: Iterable<string>): ParentInfo {
-  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }), ids: new Set(ids) };
+export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], ids: Iterable<string>, loose: Map<string, string>): ParentInfo {
+  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }), ids: new Set(ids), loose };
 }
 
 // Regular files under the inputs; symlinks are never followed (reported instead), paths deduplicated.

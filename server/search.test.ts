@@ -646,12 +646,15 @@ test("forget a parent: a child's own record that reuses a parent record id is ke
   const pl = [header("sid"), msg("user", "u0", null, "parent-text-x"), msg("assistant", "a0", "u0", "r")];
   await put("sid", pl);
   await drain(db);
-  // The child's own entry happens to have id "x9", as does a later parent entry with other content.
-  const kl = [header("sk", { parentSession: "/x/sid.jsonl" }), pl[1], pl[2], msg("user", "x9", "a0", "child-own-x9"), msg("assistant", "x10", "x9", "r")];
+  // The child's own entry happens to have id "x9", as does a later parent entry with other content. The child's
+  // entries are written after the fork (its header's time), as Pi writes them; copies keep their earlier time.
+  const late = (raw: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: "2026-01-02T00:00:00Z" });
+  const kl = [header("sk", { parentSession: "/x/sid.jsonl" }), pl[1], pl[2], late(msg("user", "x9", "a0", "child-own-x9")), late(msg("assistant", "x10", "x9", "r"))];
   const K = await put("sk", kl, "personal", P);
   await drain(db);
-  await put("sid", [...pl, msg("user", "x9", "a0", "parent-later-x9")]);
+  await put("sid", [...pl, late(msg("user", "x9", "a0", "parent-later-x9"))]);
   await drain(db);
+  expect(await hasText("child-own-x9")).toBe(true); // an id collision is not a copy
   await forgetSource(db, P);
   await drain(db);
   expect(await hasText("child-own-x9")).toBe(true);
@@ -664,6 +667,45 @@ test("forget a parent: a child's own record that reuses a parent record id is ke
   await drain(db);
   expect(await hasText("child-own-x9")).toBe(true);
   expect(await hasText("parent-text-x")).toBe(false);
+});
+
+test("a child's copy of a parent version the server never held, then the parent forgotten: the copy stays withdrawn", async () => {
+  const P = sourceIdOf("pi", "rvp");
+  const u0 = msg("user", "u0", null, "q"), a0 = msg("assistant", "a0", "u0", "old-withdrawn-copy");
+  await put("rvp", [header("rvp"), u0, msg("assistant", "a0", "u0", "revised-current")]); // only the revised version
+  await drain(db);
+  const late = (raw: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: "2026-01-02T00:00:00Z" });
+  const kl = [header("rvk", { parentSession: "/x/rvp.jsonl", timestamp: "2026-01-01T12:00:00Z" }), u0, a0, late(msg("user", "k1", "a0", "kid-new-entry"))];
+  const K = await put("rvk", kl, "personal", P);
+  await drain(db);
+  expect(await hasText("old-withdrawn-copy")).toBe(false);
+  expect(await hasText("kid-new-entry")).toBe(true);
+  await forgetSource(db, P);
+  await drain(db);
+  expect(await hasText("old-withdrawn-copy")).toBe(false);
+  expect(await hasText("revised-current")).toBe(false);
+  expect(await hasText("kid-new-entry")).toBe(true);
+  // The child syncs the same file again after the forget: still not its own.
+  const l = await requestLease(db, { source: K, harness: "pi", nativeId: "rvk", scope: "personal", parent: P }, "m1");
+  await tryGrant(db, l);
+  await commit(db, { leaseId: l, commitId: "rvk-again", length: kl.length, changes: kl.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
+  await drain(db);
+  expect(await hasText("old-withdrawn-copy")).toBe(false);
+  expect(await hasText("kid-new-entry")).toBe(true);
+});
+
+test("a Pi fork that drops a label re-chains the next entry's parent: that copy is still inherited, not withdrawn", async () => {
+  const P = sourceIdOf("pi", "lbp");
+  const u0 = msg("user", "u0", null, "lbl-question"), lb = JSON.stringify({ type: "label", id: "l1", parentId: "u0", timestamp: T, targetId: "u0", label: "x" });
+  const a0 = msg("assistant", "a0", "l1", "lbl-shared-reply");
+  await put("lbp", [header("lbp"), u0, lb, a0]);
+  await drain(db);
+  const a0c = JSON.stringify({ ...JSON.parse(a0), parentId: "u0" }); // Pi's createBranchedSession re-chains past the label
+  await put("lbk", [header("lbk", { parentSession: "/x/lbp.jsonl" }), u0, a0c], "personal", P);
+  await drain(db);
+  // The child maps its copy to the parent's record (the same evidence), not withdrawn and not its own.
+  const [pk] = await db`select keys from projected where source = ${sourceIdOf("pi", "lbk")}`;
+  expect((pk.keys as [string, string][]).filter(([m]) => m.startsWith("a0:")).map(([, k]) => k.split("/")[0])).toEqual(["lbp"]);
 });
 
 test("forget concurrent with a real commit that holds its lease row: no deadlock, the commit is refused", async () => {

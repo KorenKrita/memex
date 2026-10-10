@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { type Db, type Job, type Tx, bump, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
-import { parentInfo, projectLines, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
+import { looseKeys, parentInfo, projectLines, type ParentInfo, type PriorView, type ProjectedView, type SpanRecord } from "../dryrun/dryrun.ts";
 import { addMigration } from "./db.ts";
 import { sourceIdOf, type Harness } from "../client/records.ts";
 
@@ -111,15 +111,21 @@ type Result = { status: "ok" | "blocked" | "empty"; reason?: string; views: Proj
 async function analyse(q: Tx, source: string): Promise<Result & { harness: string; scope: string; idle: boolean; idleMs: number; parentId: string | null }> {
   const [src] = await q`select harness, scope, parent_id from source where id = ${source}`;
   // A forgotten parent is skipped: forget removed its own records from this L0, and what it had inherited
-  // keeps its origin through the nearest living ancestor (the copies match that ancestor's records).
+  // keeps its origin through the nearest living ancestor (the copies match that ancestor's records). The ids it
+  // held stay known (its `canon:` tombs): a copy of one of its versions is never this file's own (DESIGN §4.1).
+  const gone: string[] = [];
   for (const seen = new Set([source]); src.parent_id && (await q`select 1 from tomb where key = ${"source:" + src.parent_id}`).length; ) {
     if (seen.has(src.parent_id)) {
       src.parent_id = null; // a cycle of declared parents: no usable ancestor
       break;
     }
     seen.add(src.parent_id);
+    gone.push(src.parent_id);
     src.parent_id = (await q`select parent_id from source where id = ${src.parent_id}`)[0]?.parent_id ?? null;
   }
+  const goneIds = gone.length
+    ? (await q`select key from tomb where key like any(${q.array(gone.map((g) => `canon:${g}:%`), "text")})`).map((r: any) => (r.key as string).slice((r.key as string).indexOf(":", 6) + 1))
+    : [];
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
   const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
@@ -128,8 +134,12 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    // Unknown or no living ancestor: a root session (records whose parent entry was forgotten are orphan roots).
-    if (!src.parent_id) delete lines[0].parentSession;
+    // Unknown or no living ancestor: a root session (records whose parent entry was forgotten are orphan roots),
+    // whose copies of a forgotten ancestor's versions still are not its own.
+    if (!src.parent_id && goneIds.length) {
+      lines[0].parentSession = "/memex/forgotten";
+      parent = parentInfo([], [], spanIdOf, goneIds, new Map());
+    } else if (!src.parent_id) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
       const [p] = await q`select s.scope, pr.status, pr.keys from source s left join projected pr on pr.source = s.id where s.id = ${src.parent_id}`;
@@ -138,9 +148,11 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
       else {
         const vs = await q`select keys, spans from view where source = ${src.parent_id} order by ord`;
         // Every entry id the parent has held (any version: bodies of revised records stay): a child entry with one
-        // of them is a copy, inherited only while the parent still has that content.
+        // of them, not newer than the fork, is a copy, inherited only while the parent still has that content.
         const ids = await q`select distinct rec from body where source = ${src.parent_id} and rec <> 'header'`;
-        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf, ids.map((r: any) => r.rec as string));
+        const keys = new Map<string, string>(p.keys);
+        const cur = (await load(q, src.parent_id, "pi")).lines.slice(1);
+        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf, [...ids.map((r: any) => r.rec as string), ...goneIds], looseKeys(cur, keys));
       }
     }
   }
