@@ -1539,3 +1539,51 @@ test("zoom session: a complete forest with a degraded card asks for the card in 
   }
   expect((await zb({ id: "session:" + s! })).card_degraded).toBe(false);
 });
+
+// ---------- review stage 3 #6: forest zoom is paged ----------
+
+test("a cold session's forest is paged by bytes; continuations neither repeat nor skip leaves, even when merges land between pages", async () => {
+  const words = Array.from({ length: 64 }, (_, i) => `w${i}` + "x".repeat(600));
+  summaryOf = (input) => (/kind="user">\n?([^<]*)/.exec(input.slice(input.indexOf("<input>")))?.[1]?.trim() ?? "s").slice(0, 590);
+  process.env.MEMEX_FOREST_HOT_DAYS = "-1"; // cold: no merges, every leaf shown
+  let s: string;
+  try {
+    s = await put("pg", lin("pg", [...words, "tail"]));
+    await drain(db);
+  } finally {
+    process.env.MEMEX_FOREST_HOT_DAYS = "100000";
+  }
+  const p1 = await zb({ id: "session:" + s });
+  expect(Buffer.byteLength(JSON.stringify(p1.items))).toBeLessThan(20 * 1024);
+  expect(p1.more).toBe(true);
+  // Merges complete between the pages (the read asked for them).
+  await drain(db);
+  expect((await db`select count(*)::int n from forest_node where text is not null`)[0].n).toBeGreaterThan(0); // they did land
+  const seen: [number, number][] = p1.items.map((i: any) => i.leaves);
+  let next = p1.next_offset;
+  for (let k = 0; next !== null && k < 20; k++) {
+    const p = await zb({ id: "session:" + s, view_key: p1.view_key, offset: next });
+    seen.push(...p.items.map((i: any) => i.leaves));
+    next = p.next_offset;
+  }
+  expect(next).toBeNull();
+  // A contiguous cover of every leaf: none repeated or skipped.
+  const total = p1.items.length && (await db`select spans, closed_end from view where source = ${s}`).map((v: any) => v.spans.filter((x: any) => x.id && x.end <= v.closed_end).length)[0];
+  let at = 0;
+  for (const [a, b] of seen) {
+    expect(a).toBe(at);
+    at = b;
+  }
+  expect(at).toBe(total);
+  expect(total).toBeGreaterThan(60);
+});
+
+test("a continuation needs the view key; a revised view refuses it", async () => {
+  const s = await put("pr", lin("pr", ["a0", "a1", "a2", "a3", "a4"]));
+  await drain(db);
+  const p1 = await zb({ id: "session:" + s });
+  await expect(zoom(db, T0({ id: "session:" + s, offset: 2 }))).rejects.toThrow("view_key");
+  await put("pr", lin("pr", ["a0 changed", "a1", "a2", "a3", "a4"]));
+  await drain(db);
+  await expect(zoom(db, T0({ id: "session:" + s, view_key: p1.view_key, offset: 2 }))).rejects.toThrow();
+});

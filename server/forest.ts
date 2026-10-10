@@ -280,7 +280,7 @@ const genSources = (harness: string, span: { records: any[]; context: any[] }) =
  *  under it is. `start/size` select a subtree (a node being expanded); default: the whole view. Returns the
  *  items (a node with current text, else its children, down to leaves), the sources used, and whether every
  *  item was a ready node or a root leaf. */
-export async function forestView(q: Tx, leaves: string[], readable: (source: string) => boolean, sel?: { start: number; size: number }) {
+export async function forestView(q: Tx, leaves: string[], readable: (source: string) => boolean, sel?: { start: number; size: number }, from = 0) {
   const model = env("MEMEX_LLM_MODEL");
   const rows = await q`select s.id, s.records, s.context, ss.text, src.harness from span s join source src on src.id = s.source
                        join span_summary ss on ss.span = s.id and ss.input_fp = s.input_fp
@@ -302,7 +302,16 @@ export async function forestView(q: Tx, leaves: string[], readable: (source: str
   const items: ForestItem[] = [];
   const used = new Set<string>();
   const addFrom = (from: number, n: number) => leaves.slice(from, from + n).forEach((sp) => sums.get(sp)?.from.forEach((x) => used.add(x)));
+  // `from` (a leaf index): only leaves from there on — a page's continuation. A node reaching back past it is
+  // opened instead (leaf indexes stay put when merges complete between pages: no leaf repeated or skipped).
   const expand = (start: number, size: number, top: boolean) => {
+    if (start + size <= from) return;
+    if (start < from) {
+      complete = false;
+      expand(start, size / 2, false);
+      expand(start + size / 2, size / 2, false);
+      return;
+    }
     if (size === 1) {
       const sm = sums.get(leaves[start]);
       if (!sm || !top) complete = false;

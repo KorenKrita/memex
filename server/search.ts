@@ -801,15 +801,29 @@ export async function zoom(db: Db, body: any): Promise<Guarded> {
         // (Today that follows from the view being valid: its leaves come from this source or its fork
         // ancestors, which share its scope and whose versions its projection vector holds. The check and
         // the deps of the sources used keep it true if a summary's inputs ever reach further.)
-        const f = await forestView(q, leaves, (x) => b.valid.has(x), sel ?? undefined);
+        // Paged by leaf index (`offset`): a continuation needs the view key it was given (a revised view is refused).
+        if (offset > 0 && !vkIn) throw new HttpError(400, "a continuation needs view_key");
+        const f = await forestView(q, leaves, (x) => b.valid.has(x), sel ?? undefined, offset);
+        let room = ZOOM_PAGE, next: number | null = null;
+        const page: typeof f.items = [];
+        for (const x of f.items) {
+          const cost = Buffer.byteLength(x.text ?? "") + 64;
+          if (page.length && cost > room) {
+            next = x.start;
+            break;
+          }
+          page.push(x);
+          room -= cost;
+        }
         // A session also carries its card (the stored one if current for this view, else a degraded one).
         const card = node ? null : await readCard(q, src, leaves, v.tip, (x) => b.valid.has(x));
         return {
           deps: depsOf(b, [src, ...f.used, ...(card?.used ?? [])]),
           body: {
             id, view_key, view_basis: vb, complete: f.complete,
-            ...(card ? { card: card.card, card_degraded: card.degraded } : {}),
-            items: f.items.map((x) => ({ id: x.node ? "node:" + x.node : "span:" + x.span, leaves: [x.start, x.start + x.size], summary: x.text })),
+            ...(card && offset === 0 ? { card: card.card, card_degraded: card.degraded } : {}),
+            items: page.map((x) => ({ id: x.node ? "node:" + x.node : "span:" + x.span, leaves: [x.start, x.start + x.size], summary: x.text })),
+            more: next !== null, next_offset: next,
           },
           want: f.complete && !card?.degraded ? null : src, // merges or the card not ready: asked for after the read
         };
