@@ -34,6 +34,8 @@ export async function syncFile(t: Transport, policy: Policy, path: string, harne
   } catch (e) {
     return { status: "failed", reason: String((e as Error).message ?? e) }; // e.g. "410 source forgotten"
   }
+  // Every way out before a commit lets the lease go (an accepted commit ends it on the server).
+  let committed = false;
   try {
     let granted = false;
     for (let i = 0; i < 600 && !granted; i++) {
@@ -75,16 +77,16 @@ export async function syncFile(t: Transport, policy: Policy, path: string, harne
     // (the server drops its rows past that); the next segment continues from there.
     if (hitLimit && !changes.length) return { status: "failed", reason: "record-too-large" };
     const length = hitLimit ? changes[changes.length - 1].pos + 1 : local.length;
-    if (!changes.length && m.length === local.length) {
-      await t("POST", `/v1/sync/lease/${lease}/release`);
+    // Unchanged: the same records, and no leaf to report or the one the server already has for this collector.
+    if (!changes.length && m.length === local.length && (opts.leaf === undefined || opts.leaf === m.leaf))
       return { status: "unchanged", length: local.length };
-    }
     const commitId = crypto.randomUUID();
     const body = { commitId, length, changes, leaf: opts.leaf, scanChunks: opts.scanChunks ? mine.length : undefined };
     let r: any;
     for (let i = 0; i < 3; i++) {
       try {
         r = await t("POST", `/v1/sync/lease/${lease}/commit`, body);
+        committed = true;
         break;
       } catch (e) {
         if (i === 2) throw e; // same commit id: the server returns the stored result if it had committed
@@ -93,7 +95,8 @@ export async function syncFile(t: Transport, policy: Policy, path: string, harne
     if (!r.ok) return { status: "failed", reason: r.reason };
     return { status: "synced", sent: changes.length, length: r.length, refused: r.refused, more: hitLimit };
   } catch (e) {
-    await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
     return { status: "failed", reason: String((e as Error).message ?? e) };
+  } finally {
+    if (!committed) await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
   }
 }

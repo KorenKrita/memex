@@ -1,6 +1,6 @@
 // L0 sync end to end over HTTP against a real Postgres (MEMEX_PG_URL, a throwaway database: tests truncate it).
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, migrate, type Db } from "./db.ts";
@@ -70,6 +70,39 @@ test("sync is idempotent; appended lines go up; a partial last line waits", asyn
   expect(await records(src)).toEqual(["header", "e0", "e1", "e2", "e3", "e4", "e5"]);
   const [b] = await db`select count(*)::int n from body where source = ${src}`;
   expect(b.n).toBe(7);
+});
+
+test("a leaf change with the file unchanged is reported; an unchanged leaf with an unchanged file sends no commit", async () => {
+  const p = piFile(allowDir, "lf", 3);
+  const t = transport(base, key);
+  const src = sourceIdOf("pi", "s-lf");
+  expect(await syncFile(t, policy, p, "pi", { collector: "m1", leaf: "e2" })).toMatchObject({ status: "synced" });
+  const leaf = async () => (await db`select leaf from collector_view where source = ${src} and collector = 'm1'`)[0]?.leaf;
+  expect(await leaf()).toBe("e2");
+  // Navigated back in the tree: no new entry, only the leaf moved.
+  expect(await syncFile(t, policy, p, "pi", { collector: "m1", leaf: "e0" })).toMatchObject({ status: "synced", sent: 0 });
+  expect(await leaf()).toBe("e0");
+  const before = (await db`select count(*)::int n from commit_result`)[0].n;
+  expect(await syncFile(t, policy, p, "pi", { collector: "m1", leaf: "e0" })).toEqual({ status: "unchanged", length: 4 });
+  expect((await db`select count(*)::int n from commit_result`)[0].n).toBe(before);
+});
+
+test("a sync that gives up after its lease was granted lets the lease go", async () => {
+  const p = piFile(allowDir, "rl", 2);
+  const src = sourceIdOf("pi", "s-rl");
+  // The file turns into another session between the first read and the read under the lease.
+  let flip = false;
+  const base0 = transport(base, key);
+  const t: typeof base0 = async (method, path, body) => {
+    const r = await base0(method, path, body);
+    if (!flip && path.endsWith("/poll") && r.granted) {
+      flip = true;
+      writeFileSync(p, readFileSync(p, "utf8").replace('"id":"s-rl"', '"id":"s-other"'));
+    }
+    return r;
+  };
+  expect(await syncFile(t, policy, p, "pi", { collector: "m1" })).toEqual({ status: "failed", reason: "file-changed-identity" });
+  expect((await db`select count(*)::int n from lease where source = ${src} and not done`)[0].n).toBe(0);
 });
 
 test("same-length rewrite of the first record is found (slow path), body keeps both versions", async () => {

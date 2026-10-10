@@ -94,7 +94,9 @@ export async function manifest(db: Db, leaseId: number) {
   const rows = await db`select rec as id, hash from projection where source = ${l.source} and collector = ${l.collector} order by pos`;
   const blocks = blockHashes(rows);
   const lastStart = Math.max(0, (blocks.length - 1) * CHUNK);
-  return { length: rows.length, chunk: CHUNK, blocks, last: { start: lastStart, records: rows.slice(lastStart) } };
+  // The leaf this collector last reported (null: none, or reported as none): a leaf-only change still commits.
+  const [v] = await db`select leaf from collector_view where source = ${l.source} and collector = ${l.collector}`;
+  return { length: rows.length, chunk: CHUNK, blocks, last: { start: lastStart, records: rows.slice(lastStart) }, leaf: v ? v.leaf : undefined };
 }
 
 /** Records of the given blocks, for the slow path (a block hash differs). */
