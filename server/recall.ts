@@ -106,8 +106,11 @@ const out = (row: any, visible: boolean) =>
 
 /** POST /v1/recall: { source, scope, user_rec, input, prev_user?, prev_user_ref?, prev_assistant?, prev_assistant_ref?, dests, leaf?, inContext? }
  *  (a ref = { rec: the host record id, hash: sha256 of the line as uploaded }). */
-export async function recall(db: Db, body: any): Promise<Guarded | object> {
-  const until = Date.now() + BUDGET_MS();
+export async function recall(db: Db, body: any, until0?: number): Promise<Guarded | object> {
+  // One absolute deadline for the whole answer: the search, the save and the hand-over (a recomputation after a
+  // withdrawal keeps it, never starting a new budget).
+  const until = until0 ?? Date.now() + BUDGET_MS();
+  const late = { state: "timeout" };
   const r = validate(body);
   const input = r.input.trim();
   if (!input || input.startsWith("/")) return { state: "skipped" };
@@ -162,7 +165,7 @@ export async function recall(db: Db, body: any): Promise<Guarded | object> {
   }
   const found = first.found;
   if (!found && "stale" in first) return { state: "query-stale" }; // nothing sent
-  if (found) return new Guarded(found.deps, found.body, async () => (await recall(db, body)) as Guarded);
+  if (found) return new Guarded(found.deps, found.body, () => recall(db, body, until), until, late);
   const tau = TAU();
   if (!Number.isFinite(tau)) return { state: "not-ready" }; // τ not calibrated: no automatic injection, nothing stored
   let res: Guarded;
@@ -231,7 +234,7 @@ export async function recall(db: Db, body: any): Promise<Guarded | object> {
     throw e;
   }
   if (!again) return { state: "timeout" };
-  return new Guarded(again.deps, again.body, async () => (await recall(db, body)) as Guarded);
+  return new Guarded(again.deps, again.body, () => recall(db, body, until), until, late);
 }
 
 /** POST /v1/recall/blocks: { source, scope, cursor? } → { cursor, replace, blocks: [{ user_rec, text }] }. */

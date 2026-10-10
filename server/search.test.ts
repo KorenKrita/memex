@@ -326,7 +326,7 @@ test("a forget that commits after the snapshot but before delivery is not answer
   // The deps compared at delivery no longer hold; the recomputed body has nothing from h1.
   const { unchanged } = await import("./derive.ts");
   expect(await db.begin((tx: any) => unchanged(tx, g.deps))).toBe(false);
-  expect(((await g.again()).body as any).results.length).toBe(0);
+  expect((((await g.again()) as any).body as any).results.length).toBe(0);
 });
 
 test("base documents over the budget: rerank is skipped, no candidate is dropped", async () => {

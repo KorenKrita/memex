@@ -20,7 +20,10 @@ export const DELIVER_DEADLINE_MS = 5_000; // lock wait + comparison + handing th
 const GUARD_TRIES = 3;
 /** A response valid while `deps` hold; `again` recomputes it from a newer snapshot. */
 export class Guarded {
-  constructor(readonly deps: Record<string, number>, readonly body: unknown, readonly again: () => Promise<Guarded>) {}
+  /** `until` (epoch ms): an absolute deadline the answer must be handed over by (a recall's); past it, `late`
+   *  is answered instead. `again` recomputes after a withdrawal and may answer a plain body. */
+  constructor(readonly deps: Record<string, number>, readonly body: unknown, readonly again: () => Promise<Guarded | object>,
+              readonly until?: number, readonly late?: object) {}
 }
 /** Test seam: runs after the comparison, before the body is written (where a writer must wait). */
 export const httpHooks = { beforeGuard: async () => {}, beforeDeliver: async () => {} };
@@ -86,12 +89,18 @@ const json = (status: number, body: unknown) => Response.json(body, { status });
 /** A guarded response: compare under the shared barrier, stream the body out, release once handed over.
  *  One deadline covers the lock wait, the comparison and the hand-over. */
 async function deliver(db: Db, g: Guarded): Promise<Response> {
+  const lateOr = (e: unknown) => {
+    if (g.until !== undefined && Date.now() >= g.until && g.late) return json(200, g.late);
+    throw e;
+  };
   for (let i = 0; i < GUARD_TRIES; i++) {
     await httpHooks.beforeGuard();
+    if (g.until !== undefined && Date.now() >= g.until) return lateOr(new HttpError(503, "busy; retry"));
     let respond!: (r: Response) => void;
     const response = new Promise<Response>((ok) => (respond = ok));
     const held = db.begin(async (tx: Tx) => {
-      const until = Date.now() + DELIVER_DEADLINE_MS;
+      const until = Math.min(Date.now() + DELIVER_DEADLINE_MS, g.until ?? Infinity);
+      if (until <= Date.now()) throw new Error("deadline passed");
       let timer: ReturnType<typeof setTimeout> | undefined;
       const left = () => Math.max(1, until - Date.now()) + "ms";
       await tx`select set_config('lock_timeout', ${left()}, true), set_config('statement_timeout', ${left()}, true)`;
@@ -99,6 +108,7 @@ async function deliver(db: Db, g: Guarded): Promise<Response> {
       await tx`select set_config('statement_timeout', ${left()}, true)`;
       if (!(await unchanged(tx, g.deps))) return false;
       await httpHooks.beforeDeliver();
+      if (Date.now() >= until) throw new Error("deadline passed"); // nothing handed over past the deadline
       const data = Buffer.from(JSON.stringify(g.body));
       await new Promise<void>((done, fail) => {
         let at = 0;
@@ -125,15 +135,27 @@ async function deliver(db: Db, g: Guarded): Promise<Response> {
       });
       return true;
     });
-    const out = await Promise.race([held.then((ok) => (ok ? "held" : "stale")), response]).catch((e) => {
+    // The wait for a connection is bounded by the deadline too.
+    let tm: ReturnType<typeof setTimeout> | undefined;
+    const late = g.until === undefined ? null : new Promise<never>((_, bad) => (tm = setTimeout(() => bad(new Error("deadline passed")), Math.max(1, g.until! - Date.now()))));
+    held.catch(() => {});
+    let out: Response | "held" | "stale";
+    try {
+      out = await Promise.race([held.then((ok) => (ok ? ("held" as const) : ("stale" as const))), response, ...(late ? [late] : [])]);
+    } catch (e) {
+      if (g.until !== undefined && Date.now() >= g.until && g.late) return json(200, g.late);
       throw e instanceof HttpError ? e : new HttpError(503, "busy; retry");
-    });
+    } finally {
+      clearTimeout(tm);
+    }
     if (out instanceof Response) {
       held.catch(() => {}); // the hand-over failed after the head went out: the stream already errored
       return out;
     }
     if (out === "stale") {
-      g = await g.again();
+      const next = await g.again();
+      if (!(next instanceof Guarded)) return json(200, next);
+      g = next;
       continue;
     }
   }

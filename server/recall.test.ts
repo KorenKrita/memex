@@ -784,3 +784,43 @@ test("a recall block's source scope revoked then granted again: the block stays 
   expect((await ask(R("u1", "zx-7781"))).state).toBe("withdrawn");
   expect((await replay()).blocks.map((b: any) => b.text).join("")).not.toContain("zx-7781");
 });
+
+test("over HTTP, a decision delivered past the recall deadline is not shown; a retry reads the saved decision", async () => {
+  const { BARRIER } = await import("./sync.ts");
+  process.env.MEMEX_RECALL_MS = "600";
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await drain(db);
+  const api = await serve(db, { port: 0 });
+  const key = await addApiKey(db, "t");
+  let release!: () => void;
+  const hold = new Promise<void>((ok) => (release = ok));
+  let held: Promise<unknown> | null = null;
+  recallHooks.beforeSave = async () => {}; // saved in time
+  httpHooks.beforeGuard = async () => {
+    httpHooks.beforeGuard = async () => {};
+    // A writer holds the barrier exclusively past the deadline, while the answer waits to be delivered.
+    let got!: () => void;
+    const taken = new Promise<void>((ok) => (got = ok));
+    held = db.begin(async (tx: any) => {
+      await tx`select pg_advisory_xact_lock(${BARRIER})`;
+      got();
+      await hold;
+    });
+    await taken;
+    setTimeout(release, 1200);
+  };
+  try {
+    const t0 = Date.now();
+    const r = await transport(`http://127.0.0.1:${api.port}`, key)("POST", "/v1/recall", R("u1", "zx-7781")).catch((e: any) => ({ error: String(e) }));
+    expect(Date.now() - t0).toBeLessThan(1100);
+    expect((r as any).state === "shown").toBe(false);
+    await held;
+    delete process.env.MEMEX_RECALL_MS;
+    const again = await ask(R("u1", "zx-7781"));
+    expect(again.state).toBe("shown"); // the timely decision stays
+  } finally {
+    httpHooks.beforeGuard = async () => {};
+    release();
+    await api.stop();
+  }
+});
