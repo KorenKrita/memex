@@ -131,14 +131,34 @@ export async function ancestorsOf(tx: Tx, source: string): Promise<string[]> {
                      where s.parent_id is not null and not s.id = any(a.path))
                    select distinct id from a`).map((x: any) => x.id as string);
 }
+/** A content tomb's fingerprint of a record version: Pi by content without the parent link (projection's copy
+ *  rule, looseOf: Pi re-chains a copied entry past a dropped label), Codex by the whole line. A line that does
+ *  not parse (an older database's) by its bytes, so a byte-identical copy still matches and nothing throws. */
+const tombHash = (harness: string, raw: string) => {
+  let e: any;
+  try {
+    e = JSON.parse(raw);
+  } catch {
+    return "raw-" + new Bun.CryptoHasher("sha256").update(raw).digest("hex");
+  }
+  if (harness === "pi" && e && typeof e === "object" && !Array.isArray(e)) {
+    const { parentId: _, ...rest } = e;
+    return contentHash(rest);
+  }
+  return contentHash(e);
+};
 /** A forgotten source's content tomb for one of its own record versions (forget.ts). */
-export const copyTomb = (owner: string, rec: string, raw: string) => `copy:${owner}:${rec}:${contentHash(JSON.parse(raw))}`;
+export const copyTomb = (harness: string, owner: string, rec: string, raw: string) => `copy:${owner}:${rec}:${tombHash(harness, raw)}`;
 /** Content tombs a record may be a copy under: its lineage's (`anc`, from ancestorsOf), plus the ownerless
  *  `copy:<rec>:<hash>` a database from before tombs named their source may hold (its owner unknown: still
- *  refusing, never guessed into a lineage). */
-export const copyTombsOf = (anc: string[], rec: string, raw: string) => {
-  const h = contentHash(JSON.parse(raw));
-  return [`copy:${rec}:${h}`, ...anc.map((g) => `copy:${g}:${rec}:${h}`)];
+ *  refusing, never guessed into a lineage). Both fingerprints: tombs written before Pi's left out the parent
+ *  link hashed the whole line. */
+export const copyTombsOf = (harness: string, anc: string[], rec: string, raw: string) => {
+  const hs = new Set([tombHash(harness, raw)]);
+  try {
+    hs.add(contentHash(JSON.parse(raw)));
+  } catch {}
+  return [...hs].flatMap((h) => [`copy:${rec}:${h}`, ...anc.map((g) => `copy:${g}:${rec}:${h}`)]);
 };
 export async function commit(db: Db, c: Commit): Promise<CommitResult> {
   if (!Number.isInteger(c.length) || c.length < 0 || c.changes.length > MAX_COMMIT_RECORDS)
@@ -172,7 +192,7 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       await tx`update lease set done = true where id = ${c.leaseId}`;
       return { ok: false, reason: "forgotten" } as const;
     }
-    const [src] = await tx`select scope from source where id = ${l.source}`;
+    const [src] = await tx`select scope, harness from source where id = ${l.source}`;
     if (!(await granted(tx, src.scope, "sync", "memex"))) {
       await tx`update lease set done = true where id = ${c.leaseId}`;
       return { ok: false, reason: "not-granted" } as const;
@@ -184,7 +204,7 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
     const anc = await ancestorsOf(tx, l.source);
     const copyKeys = (ch: Change) => {
       try {
-        return copyTombsOf(anc, ch.id, ch.raw);
+        return copyTombsOf(src.harness, anc, ch.id, ch.raw);
       } catch {
         return [];
       }

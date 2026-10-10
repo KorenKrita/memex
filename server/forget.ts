@@ -52,9 +52,21 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     const piFork = headKnown && src?.harness === "pi" && !!sHead.parentSession;
     const [pr] = await tx`select keys from projected where source = ${source}`;
     const inherited = new Set<string>(((pr?.keys ?? []) as [string, string][]).filter(([, k]) => !k.startsWith(src.native_id + "/")).map(([m]) => m));
-    const own = versions.filter((r: any) => r.rec !== "header" && (!headKnown ||
-      (piFork ? !isCopyTime(JSON.parse(r.raw), sHead) : !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`))));
-    const tombs = [...new Set<string>(own.map((r: any) => copyTomb(source, r.rec, r.raw)))];
+    // A stored line that does not parse (an older database's): counted as S's own, so it is tombed too.
+    const parsed = (raw: string) => {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return undefined;
+      }
+    };
+    const own = versions.filter((r: any) => {
+      if (r.rec === "header") return false;
+      const e = parsed(r.raw);
+      if (!headKnown || !e) return true;
+      return piFork ? !isCopyTime(e, sHead) : !inherited.has(`${r.rec}:${contentHash(e)}`);
+    });
+    const tombs = [...new Set<string>(own.map((r: any) => copyTomb(src.harness, source, r.rec, r.raw)))];
     if (tombs.length) await tx`insert into tomb select x from unnest(${tx.array(tombs, "text")}::text[]) x on conflict do nothing`;
     const match = new Set(tombs);
     // Fork descendants: drop their copies, move their version, project them again.
@@ -67,9 +79,14 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
       // to have a forgotten record's id and content stays.
       const [hd] = await tx`select b.raw from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                             where r.source = ${id} and r.rec = 'header'`;
-      const head = hd ? JSON.parse(hd.raw) : undefined;
+      // A header that does not parse as one (an older database's) tells no fork time: every match goes.
+      const head = hd ? parsed(hd.raw) : undefined;
       const pi = head?.type === "session";
-      const hit = rows.filter((r: any) => match.has(copyTomb(source, r.rec, r.raw)) && (!pi || isCopyTime(JSON.parse(r.raw), head)));
+      const hit = rows.filter((r: any) => {
+        if (!match.has(copyTomb(src.harness, source, r.rec, r.raw))) return false;
+        const e = parsed(r.raw);
+        return !pi || !e || isCopyTime(e, head);
+      });
       if (hit.length) {
         copies += new Set(hit.map((r: any) => r.rec)).size;
         for (const r of hit) {

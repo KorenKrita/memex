@@ -184,7 +184,7 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           // A content tomb (`copy:`) speaks only of copies, of this lineage's forgotten sources: a Pi record the
           // current projection holds as this session's own is not one (DESIGN §4.1: newer than the fork).
           const own = cur.harness === "pi" && src === r.source;
-          const tk = ["source:" + src, "canon:" + canon, ...(own ? [] : copyTombsOf(keys.map((x: string) => x.slice(2)), ref.rec, cur.raw))];
+          const tk = ["source:" + src, "canon:" + canon, ...(own ? [] : copyTombsOf(cur.harness, keys.map((x: string) => x.slice(2)), ref.rec, cur.raw))];
           const tombed = await q`select 1 from tomb where key = any(${q.array(tk, "text")}) limit 1`;
           if (tombed.length) return { found: null, pin, stale: true };
         }

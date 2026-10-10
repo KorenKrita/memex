@@ -830,6 +830,52 @@ test("an unlinked fork is no usable parent: its own entry stays readable in it, 
   expect(recs).toContain("c");
 });
 
+for (const order of ["C before the forget", "C after the forget"])
+  test(`A → B → C, B's own entry re-chained in C (${order}): forget of B withdraws C's copy, never handed to A`, async () => {
+    const A = sourceIdOf("pi", "rA"), B = sourceIdOf("pi", "rB");
+    const at = (o: object) => JSON.stringify(o);
+    const m = (id: string, parentId: string | null, ts: string, text: string) =>
+      at({ type: "message", id, parentId, timestamp: ts, message: { role: "user", content: [{ type: "text", text }] } });
+    const hd = (id: string, ts: string, parent?: string) => at({ type: "session", version: 3, id, timestamp: ts, cwd: "/x", ...(parent ? { parentSession: parent } : {}) });
+    // A holds u and e (e's parent the label l); B forks A before e's time, so B's identical e is B's own.
+    const u = m("u", null, "2026-01-01T00:00:00Z", "rc-root");
+    const l = at({ type: "label", id: "l", parentId: "u", timestamp: "2026-01-01T00:00:01Z", targetId: "u", label: "x" });
+    const eL = m("e", "l", "2026-01-03T00:00:00Z", "rc-e-text");
+    await put("rA", [hd("rA", "2026-01-01T00:00:00Z"), u, l, eL]);
+    await drain(db);
+    await put("rB", [hd("rB", "2026-01-02T00:00:00Z", "/x/rA.jsonl"), u, l, eL], "personal", A);
+    await drain(db);
+    // C forks B after e; Pi dropped the label and re-chained e to u.
+    const cLines = [hd("rC", "2026-01-04T00:00:00Z", "/x/rB.jsonl"), u, m("e", "u", "2026-01-03T00:00:00Z", "rc-e-text"), m("c", "e", "2026-01-05T00:00:00Z", "rc-c-own")];
+    const C = sourceIdOf("pi", "rC");
+    const inView = async () => (await db`select recs from view where source = ${C}`).flatMap((v: any) => (v.recs as { id: string }[]).map((x) => x.id));
+    if (order === "C before the forget") {
+      await put("rC", cLines, "personal", B);
+      await drain(db);
+      expect(await inView()).toContain("e");
+    }
+    await forgetSource(db, B);
+    if (order === "C after the forget") await put("rC", cLines, "personal", B);
+    await drain(db);
+    expect(await inView()).not.toContain("e");
+    expect(await inView()).toContain("c");
+    expect((await db`select count(*)::int n from record where source = ${C} and rec = 'e'`)[0].n).toBe(0);
+  });
+
+test("forget of a parent whose descendant's stored header is unreadable (an older database): completes, the copies go", async () => {
+  const P = sourceIdOf("pi", "dP"), D = sourceIdOf("pi", "dD");
+  const e = msg("user", "e", null, "dh-entry");
+  await put("dP", [header("dP"), e]);
+  await drain(db);
+  await put("dD", [header("dD", { parentSession: "/x/dP.jsonl" }), e, msg("user", "k", "e", "dh-own")], "personal", P);
+  await drain(db);
+  await db`insert into body (source, rec, hash, raw) values (${D}, 'header', ${sha("{")}, ${"{"})`;
+  await db`update record set hash = ${sha("{")} where source = ${D} and rec = 'header'`;
+  await forgetSource(db, P);
+  expect((await db`select 1 from tomb where key = ${"source:" + P}`).length).toBe(1);
+  expect((await db`select count(*)::int n from record where source = ${D} and rec = 'e'`)[0].n).toBe(0);
+});
+
 test("sync refuses a record that is not one JSON object", async () => {
   const decl = { source: sourceIdOf("pi", "nj"), harness: "pi" as const, nativeId: "nj", scope: "personal", parent: null };
   const l = await requestLease(db, decl, "m1");
