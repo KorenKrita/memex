@@ -37,7 +37,7 @@ beforeAll(async () => {
       if (new URL(req.url).pathname.endsWith("/embeddings")) return Response.json({ data: [{ embedding: Array.from({ length: 1024 }, (_, i) => (i === 0 ? 1 : 0)) }] });
       const sys = body.messages[0].content as string;
       const content = body.messages[1].content as string;
-      requests.push({ sys, content });
+      requests.push({ sys, content: body.messages.slice(1).map((m: any) => m.content).join("\n") });
       const reply = async (o: object) => {
         if (before) await before.finally(() => (before = null));
         return Response.json({ choices: [{ message: { content: JSON.stringify(o) } }] });
@@ -554,4 +554,38 @@ test("a revoke while the pair request is out: no relation is stored", async () =
   await drain(db, ["l3pair"]);
   expect(requests.some((r) => r.sys.startsWith("You compare"))).toBe(true);
   expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(0);
+});
+
+test("retry feedback never echoes the model's output", async () => {
+  let k = 0;
+  extract = (recs) => {
+    k++;
+    if (k === 1) return [{ record_id: "SECRET_FROM_CONTEXT", text: "x", scope: "SECRET_SCOPE", retraction: false, effective_from: null, effective_phrase: null }];
+    return [];
+  };
+  await put("a", [["PREF TOPICpm use npm", "ok", T0]]);
+  await drain(db);
+  const ex = requests.filter((r) => r.sys.startsWith("You extract"));
+  expect(ex.length).toBeGreaterThan(1);
+  expect(JSON.stringify(requests)).not.toContain("SECRET_");
+});
+
+test("retry feedback is dropped once the input it was about moved", async () => {
+  // Appending does not move a session's version; revising an earlier record (the later span's <context>) does.
+  await put("a", [["context one", "ok", T0], ["PREF TOPICpm use npm", "ok", T1]]);
+  await drain(db, ["project", "summarize", "embed"]);
+  let k = 0;
+  extract = (recs) => {
+    if (!recs.some((r) => r.citable && r.text.includes("PREF"))) return [];
+    if (++k === 1) {
+      before = put("a", [["context two", "ok", T0], ["PREF TOPICpm use npm", "ok", T1]]).then(() => drain(db, ["project"]));
+      return [{ record_id: "nope", text: "x", scope: "global", retraction: false, effective_from: null, effective_phrase: null }];
+    }
+    return [];
+  };
+  await drain(db, ["l3"]);
+  const ex = requests.filter((r) => r.sys.startsWith("You extract") && r.content.includes("PREF"));
+  expect(ex.length).toBeGreaterThan(1);
+  expect(ex[1].content).toContain("context two");
+  expect(ex[1].content).not.toContain("previous answer");
 });

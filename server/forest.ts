@@ -18,7 +18,7 @@
 // the vector before the write.
 import { type Db, type Job, type Tx, addMigration, enqueue, finishJob } from "./db.ts";
 import { BARRIER } from "./sync.ts";
-import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot, unchanged } from "./derive.ts";
+import { checkSpan, env, guardedPost, parseJson, publish, sameDeps, skip, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
 
 export const FOREST_VERSION = "forest-merge-v1";
@@ -195,6 +195,7 @@ export async function runMerge(db: Db, job: Job) {
   const model = env("MEMEX_LLM_MODEL");
   const key = env("MEMEX_LLM_KEY");
   let problem = "";
+  let about: Record<string, number> | null = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
       const [n] = await q`select text, text_hash, deps, kids, model, prompt_v, spans from forest_node where id = ${job.key}`;
@@ -230,6 +231,8 @@ export async function runMerge(db: Db, job: Job) {
       { role: "system", content: FOREST_SYSTEM },
       { role: "user", content: c.texts.map((t, j) => `<part n="${j + 1}">\n${t}\n</part>`).join("\n") },
     ];
+    if (!sameDeps(about, c.deps)) problem = "";
+    about = c.deps;
     if (problem) messages.push({ role: "user", content: "Your previous answer was invalid: " + problem + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
     if (r === "stale") continue;
@@ -417,6 +420,7 @@ export async function runCard(db: Db, job: Job) {
   const model = env("MEMEX_LLM_MODEL");
   const key = env("MEMEX_LLM_KEY");
   let problem = "";
+  let about: Record<string, number> | null = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
       const [v] = await q`select spans, closed_end from view where source = ${source} and tip = ${tip}`;
@@ -450,6 +454,8 @@ export async function runCard(db: Db, job: Job) {
     if (c.current) return publish(db, job, c.deps, write(null));
     const body = [...c.input.roots.map((r) => `<part>\n${r.text}\n</part>`), ...c.input.recent.map((r) => `<recent>\n${r.text}\n</recent>`)].join("\n");
     const messages = [{ role: "system", content: CARD_SYSTEM }, { role: "user", content: body }];
+    if (!sameDeps(about, c.deps)) problem = "";
+    about = c.deps;
     if (problem) messages.push({ role: "user", content: "Your previous answer was invalid: " + problem + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
     if (r === "stale") continue;

@@ -91,7 +91,7 @@ export function nextBoundary(stmts: Stmt[], now: number): number | null {
 // - Readable = the canonical record still holds that content, nothing of it is tombed, the scope is granted
 //   for the reader's purpose; forget removes statements, relations and extraction marks of the source.
 import { type Db, type Job, type Tx, addMigration, enqueue, finishJob } from "./db.ts";
-import { checkSpan, env, guardedPost, parseJson, publish, skip, snapshot, unchanged } from "./derive.ts";
+import { checkSpan, env, guardedPost, parseJson, publish, sameDeps, skip, snapshot, unchanged } from "./derive.ts";
 import { canonOf } from "./project.ts";
 
 addMigration(`
@@ -195,11 +195,11 @@ export function checkExtract(s: any, cands: Map<string, Cand & { citable: boolea
   for (const x of s.statements) {
     const c = cands.get(x?.record_id);
     if (!c || !c.citable) {
-      problems.push(`cites ${JSON.stringify(x?.record_id)}, not a citable user record of <input>`);
+      problems.push("a statement cites something that is not a citable user record of <input>"); // never echo model output: it may carry input text
       continue;
     }
     if (typeof x.text !== "string" || !x.text.trim() || bytes(x.text) > STMT_MAX) problems.push(`text not a non-empty string of at most ${STMT_MAX} bytes`);
-    if (x.scope !== "global" && x.scope !== "repo") problems.push(`scope ${JSON.stringify(x.scope)} not global or repo`);
+    if (x.scope !== "global" && x.scope !== "repo") problems.push("scope not global or repo");
     if (typeof x.retraction !== "boolean") problems.push("retraction not a boolean");
     let eff: number | null = null;
     if ((x.effective_from ?? null) === null) {
@@ -225,6 +225,7 @@ export async function runL3(db: Db, job: Job) {
   const model = env("MEMEX_LLM_MODEL");
   const key = env("MEMEX_LLM_KEY");
   let problems: string[] = [];
+  let about: Record<string, number> | null = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
       const r = await checkSpan(q, job.key, "llm");
@@ -232,6 +233,8 @@ export async function runL3(db: Db, job: Job) {
       const cands = await candidates(q, (r.span as any).harness, r.span.records);
       return { ...r, cands: new Map(cands.map((x) => [x.id, x])) };
     });
+    if (c.ok && !sameDeps(about, c.deps)) problems = [];
+    if (c.ok) about = c.deps;
     if (!c.ok) return skip(db, job, c.reason, c.scopes);
     if (![...c.cands.values()].some((x) => x.citable)) return db.begin((tx: Tx) => finishJob(tx, job)); // nothing new to read
     const messages = [{ role: "system", content: EXTRACT_SYSTEM }, { role: "user", content: renderExtract(c.span, c.cands) }];
@@ -323,6 +326,7 @@ export async function runL3Pair(db: Db, job: Job) {
   const key = env("MEMEX_LLM_KEY");
   const [x, y] = job.key.split("|");
   let problems: string[] = [];
+  let about: Record<string, number> | null = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
       const rows = await q`select * from l3_stmt where id = any(${q.array([x, y], "text")}) order by id`;
@@ -343,6 +347,8 @@ export async function runL3Pair(db: Db, job: Job) {
     }
     const show = (r: any, n: number) =>
       `<statement n="${n}" stated_at="${local(+new Date(r.stated_at))}"${r.effective_from ? ` effective_from="${local(+new Date(r.effective_from))}"` : ""}${r.retraction ? ' retraction="yes"' : ""}>\n${esc(r.text)}\n</statement>`;
+    if (!sameDeps(about, c.deps)) problems = [];
+    about = c.deps;
     const messages = [{ role: "system", content: PAIR_SYSTEM }, { role: "user", content: c.rows.map((r: any, n: number) => show(r, n + 1)).join("\n") }];
     if (problems.length) messages.push({ role: "user", content: "Your previous answer was invalid: " + problems.join("; ") + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });

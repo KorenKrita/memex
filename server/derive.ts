@@ -265,7 +265,7 @@ export function render(span: { records: any[]; context: any[] }) {
 export function validate(s: any, span: { records: any[] }): string[] {
   if (!s || typeof s !== "object" || Array.isArray(s)) return ["not a JSON object"];
   const keys = ["summary", "user_asked", "assistant_chose", "verified", "tasks", "kind", "anchors"];
-  const p = [...keys.filter((k) => !(k in s)).map((k) => `missing ${k}`), ...Object.keys(s).filter((k) => !keys.includes(k)).map((k) => `extra key ${k}`)];
+  const p = [...keys.filter((k) => !(k in s)).map((k) => `missing ${k}`), ...(Object.keys(s).some((k) => !keys.includes(k)) ? ["extra keys"] : [])];
   if (typeof s.summary !== "string" || !s.summary.trim()) p.push("summary not a non-empty string");
   else if (Buffer.byteLength(s.summary) > SUMMARY_MAX) p.push(`summary ${Buffer.byteLength(s.summary)}B > ${SUMMARY_MAX}B`);
   for (const k of ["user_asked", "assistant_chose", "anchors"])
@@ -277,7 +277,7 @@ export function validate(s: any, span: { records: any[] }): string[] {
   else
     for (const v of s.verified ?? []) {
       if (!v || typeof v.claim !== "string") p.push("verified item malformed");
-      else if (!kindOf.has(v.record_id)) p.push(`verified cites ${JSON.stringify(v.record_id)}, not a record of <input>`);
+      else if (!kindOf.has(v.record_id)) p.push("verified cites something that is not a record of <input>"); // never echo model output: it may carry input text
       else if (kindOf.get(v.record_id) !== "tool_result") p.push(`verified cites a ${kindOf.get(v.record_id)} record, not a tool_result`);
     }
   return p;
@@ -294,6 +294,10 @@ export const env = (k: string) => {
   return v;
 };
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
+
+/** Retry feedback belongs to the input it was about: dropped once the version vector it was made under moved. */
+export const sameDeps = (a: Record<string, number> | null, b: Record<string, number>) =>
+  !!a && Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([k, v]) => b[k] === v);
 
 /** Finish without a result, remembering a liftable reason. No barrier needed: nothing is published. */
 export async function skip(db: Db, job: Job, reason: string, scopes: string[] = []) {
@@ -352,6 +356,7 @@ export async function runSummarize(db: Db, job: Job) {
   const model = env("MEMEX_LLM_MODEL");
   const key = env("MEMEX_LLM_KEY");
   let problems: string[] = [];
+  let about: Record<string, number> | null = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     const c = await snapshot(db, async (q) => {
       const r = await checkSpan(q, job.key, "llm");
@@ -368,6 +373,8 @@ export async function runSummarize(db: Db, job: Job) {
         await queueForests(tx, job.key);
       });
     const messages = [{ role: "system", content: SYSTEM }, { role: "user", content: render(c.span) }];
+    if (!sameDeps(about, c.deps)) problems = [];
+    about = c.deps;
     if (problems.length) messages.push({ role: "user", content: "Your previous answer was invalid: " + problems.slice(0, 4).join("; ") + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
     if (r === "stale") continue; // an input moved before sending: check again
