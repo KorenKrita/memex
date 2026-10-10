@@ -1058,6 +1058,41 @@ test("a collector conflict on a label between the previous exchange and the sync
   expect(outbound()).not.toContain("one");
 });
 
+// ---------- review round 6 (N1): an already synced current input is sent only as its readable record ----------
+
+test("a fork child's input withdrawn by the parent's revision: refused with or without the previous exchange, nothing sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const P = sourceIdOf("pi", "wpar");
+  const u0 = msg("user", "u0", null, "w question"), a0 = msg("assistant", "a0", "u0", "w reply"), u1 = msg("user", "u1", "a0", "OLD_WITHDRAWN zx-7781");
+  await putRaw("wpar", [header("wpar"), u0, a0, u1]);
+  await drain(db);
+  await putRaw("me", [header("me", { parentSession: "/x/wpar.jsonl" }), u0, a0, u1], undefined, P);
+  await drain(db);
+  // A recall now for the child's u1 is fine (its inherited, readable text).
+  expect((await ask(R("u1", "OLD_WITHDRAWN zx-7781"))).state).toBe("shown");
+  // The parent revises u1: the child's copy of the old version is withdrawn.
+  await putRaw("wpar", [header("wpar"), u0, a0, msg("user", "u1", "a0", "NEW_TEXT zx-7781")]);
+  await drain(db);
+  expect(JSON.stringify(await db`select keys from view where source = ${me}`)).not.toContain("u1:");
+  await db`delete from recall_block`;
+  calls = [];
+  expect((await ask(R("u1", "OLD_WITHDRAWN zx-7781"))).state).toBe("query-stale");
+  expect((await ask(R("u1", "OLD_WITHDRAWN zx-7781", { prev_user: "w question", prev_user_ref: ref(u0), prev_assistant: "w reply", prev_assistant_ref: ref(a0) }))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
+test("a synced, readable input id with another text: refused; with its own text: sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await put("me", [["first", "reply one"], ["zx-7781 real input", "pending"]]);
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u1", "zx-7781 some other text"))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+  expect((await ask(R("u1", "zx-7781 real input"))).state).toBe("shown");
+  // Not yet synced: the authorised query as before.
+  expect((await ask(R("u7", "zx-7781 not yet synced"))).state).toBe("shown");
+});
+
 test("a collector conflict on the parent link of an entry on the path: no trusted path, refused", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   const base = [header("me"), msg("user", "u0", null, "pc question"), msg("assistant", "a0", "u0", "pc reply"), msg("assistant", "a9", "u0", "pc other")];
