@@ -20,7 +20,7 @@ import { type Db, type Tx } from "./db.ts";
 import { Guarded } from "./http.ts";
 import { BARRIER, HttpError } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
-import { basis, search, targetView } from "./search.ts";
+import { basis, search } from "./search.ts";
 import { canonOf } from "./project.ts";
 import { copyTomb } from "./forget.ts";
 import { contentHash } from "../dryrun/dryrun.ts";
@@ -159,15 +159,45 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           if (tombed.length) return { found: null, pin, stale: true };
         }
         // The text sent is the referenced records' own, and they are the most recent exchange of the querying
-        // branch: the view of `leaf` (else the session's inferred tail), up to the current input if already
-        // synced. Keys come from that view as projected (harness-specific), never rebuilt here.
+        // branch, before the current input. The branch (Pi) is the uploaded tree's path to: the current input's
+        // parent when the input is already synced (a `leaf` must then lie on that path), else `leaf`, else the
+        // last uploaded entry (the inferred tail; a collector's saved leaf is not the request's). Any view through
+        // the deepest point of that path holds the path up to it; a leaf inside a view (navigated back) cuts it.
+        // Codex: one linear view. Keys come from the view as projected (harness-specific), never rebuilt here.
         if (r.prev_user_ref || r.prev_assistant_ref) {
-          const t = await targetView(q, r.source, r.leaf ? { tip: r.leaf, at: null } : undefined);
-          if (!t.v) return { found: null, pin, stale: true };
-          const [vr] = await q`select recs from view where source = ${r.source} and tip = ${t.v.tip}`;
-          const all = (vr?.recs ?? []) as { key: string; id: string; kind: string }[];
-          const at = all.findIndex((x) => x.id === r.user_rec);
-          const recs = at < 0 ? all : all.slice(0, at);
+          const [hs] = await q`select harness from source where id = ${r.source}`;
+          type VRec = { key: string; id: string; kind: string };
+          const views: VRec[][] = (await q`select recs from view where source = ${r.source} order by ord`).map((v: any) => v.recs as VRec[]);
+          let recs: { key: string; id: string; kind: string }[] = [];
+          if (hs?.harness === "pi") {
+            const chain = async (start: string) =>
+              (await q`with recursive p(rec, parent, d) as (
+                         select r.rec, (b.raw::jsonb)->>'parentId', 0 from record r join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
+                         where r.source = ${r.source} and r.rec = ${start} and r.rec <> 'header'
+                         union all
+                         select r.rec, (b.raw::jsonb)->>'parentId', p.d + 1 from p join record r on r.source = ${r.source} and r.rec = p.parent
+                         join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash where p.d < 1000000)
+                       select rec, parent from p order by d`) as { rec: string; parent: string | null }[];
+            const input = await chain(r.user_rec);
+            let path: string[];
+            if (input.length) {
+              path = input.slice(1).map((x) => x.rec);
+              if (r.leaf && r.leaf !== r.user_rec && !path.includes(r.leaf)) return { found: null, pin, stale: true };
+            } else {
+              const [last] = r.leaf ? [{ rec: r.leaf }] : await q`select rec from record where source = ${r.source} and rec <> 'header' order by first_pos desc limit 1`;
+              path = last ? (await chain(last.rec)).map((x) => x.rec) : [];
+              if (!path.length) return { found: null, pin, stale: true }; // an unknown leaf: no branch
+            }
+            const on = new Set(path);
+            const deepest = path.find((id) => views.some((v) => v.some((x) => x.id === id)));
+            const v = deepest && views.find((v) => v.some((x) => x.id === deepest));
+            recs = v ? v.slice(0, v.findLastIndex((x) => x.id === deepest) + 1) : [];
+            if (recs.some((x) => !on.has(x.id))) return { found: null, pin, stale: true }; // not that path after all
+          } else {
+            const all = views[0] ?? [];
+            const at = all.findIndex((x) => x.id === r.user_rec);
+            recs = at < 0 ? all : all.slice(0, at);
+          }
           const u = recs.findLastIndex((x) => x.kind === "user");
           const a = recs.findLastIndex((x) => x.kind === "assistant");
           const lastUser = u >= 0 ? recs[u].id : null;

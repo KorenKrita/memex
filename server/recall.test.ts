@@ -956,6 +956,50 @@ test("the current input already synced: the previous exchange is the one before 
   expect((await ask(R("u1", "zx-7781 now", { prev_user: "first", prev_user_ref: ref(u0), prev_assistant: "reply one", prev_assistant_ref: ref(a0) }))).state).toBe("shown");
 });
 
+// ---------- review round 4: the querying path, not a saved or terminal view ----------
+
+/** Branch L: u0 → a0 → u1 → a1; branch R: u0 → a0 → u2 → a2 (uploaded last: the inferred tail). */
+const twoBranches = () => [header("me"), msg("user", "u0", null, "root"), msg("assistant", "a0", "u0", "root reply"),
+  msg("user", "u1", "a0", "LEFT_Q"), msg("assistant", "a1", "u1", "LEFT_R"),
+  msg("user", "u2", "a0", "RIGHT_Q"), msg("assistant", "a2", "u2", "RIGHT_R")];
+
+test("no leaf in the request: the inferred tail's exchange, not a collector's saved leaf", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const L = twoBranches();
+  await putRaw("me", L, "a1"); // the collector last reported branch L
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u9", "zx-7781", { prev_user: "LEFT_Q", prev_user_ref: ref(L[3]), prev_assistant: "LEFT_R", prev_assistant_ref: ref(L[4]) }))).state).toBe("query-stale");
+  expect(outbound()).not.toContain("LEFT_");
+  expect((await ask(R("u8", "zx-7781", { prev_user: "RIGHT_Q", prev_user_ref: ref(L[5]), prev_assistant: "RIGHT_R", prev_assistant_ref: ref(L[6]) }))).state).toBe("shown");
+  expect(outbound()).toContain("RIGHT_R");
+});
+
+test("a leaf inside a view (the user navigated back): that point's exchange is used, not a descendant's", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const L = [header("me"), msg("user", "u0", null, "first q"), msg("assistant", "a0", "u0", "first r"),
+    msg("user", "u1", "a0", "later q"), msg("assistant", "a1", "u1", "later r")];
+  await putRaw("me", L);
+  await drain(db);
+  calls = [];
+  expect((await ask(R("u9", "zx-7781", { leaf: "a0", prev_user: "first q", prev_user_ref: ref(L[1]), prev_assistant: "first r", prev_assistant_ref: ref(L[2]) }))).state).toBe("shown");
+  expect(outbound()).toContain("first r");
+  expect((await ask(R("u8", "zx-7781", { leaf: "a0", prev_user: "later q", prev_user_ref: ref(L[3]) }))).state).toBe("query-stale");
+});
+
+test("the current input already synced on another branch than the leaf: refused, nothing sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const L = [...twoBranches(), msg("user", "u3", "a1", "zx-7781 on L")];
+  await putRaw("me", L);
+  await drain(db);
+  calls = [];
+  // The input u3 hangs under a1 (branch L): the request's leaf a2 is not on its path.
+  expect((await ask(R("u3", "zx-7781 on L", { leaf: "a2", prev_user: "RIGHT_Q", prev_user_ref: ref(L[5]) }))).state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+  // Its own path's exchange is the previous one.
+  expect((await ask(R("u3", "zx-7781 on L", { prev_user: "LEFT_Q", prev_user_ref: ref(L[3]), prev_assistant: "LEFT_R", prev_assistant_ref: ref(L[4]) }))).state).toBe("shown");
+});
+
 test("a Codex session's previous exchange with valid references: sent", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   const cid = "22222222-2222-2222-2222-222222222222";
