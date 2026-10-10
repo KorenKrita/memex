@@ -64,15 +64,15 @@ create index if not exists lexical_key on lexical (key);
 create index if not exists view_keys on view using gin (keys);
 -- One-time semantic migrations, each applied once (its mark inserted with it).
 create table if not exists migration_mark (key text primary key, at timestamptz not null default now());
--- fork-copy-v3 (DESIGN §4.1; v2 before it): projections from before the Pi fork copy rule (a copy told by its
--- time, through the whole ancestry, also after a forget) may hold a withdrawn copy as the child's own, or a
--- newer own entry as inherited. Every Pi fork child's version moves now, in this transaction (its old
+-- fork-copy-v4 (DESIGN §4.1; v2, v3 before it): projections from before the Pi fork copy rule (a copy told by its
+-- own time against the child's fork time, whatever the ancestors hold) may hold a withdrawn copy as the child's
+-- own, or a newer own entry as inherited. Every Pi fork child's version moves now, in this transaction (its old
 -- projection, summaries, statements and frozen blocks stop counting as current before any worker runs), and
--- it is projected again. Once: a later start moves nothing (a database that ran v2 runs v3 once more).
+-- it is projected again. Once: a later start moves nothing (a database that ran v2 or v3 runs v4 once more).
 do $$
 begin
-  if exists (select 1 from migration_mark where key = 'fork-copy-v3') then return; end if;
-  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3') on conflict do nothing;
+  if exists (select 1 from migration_mark where key = 'fork-copy-v4') then return; end if;
+  insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3'), ('fork-copy-v4') on conflict do nothing;
   insert into vis_version select 's:' || s.id, 2 from source s where s.harness = 'pi' and s.parent_id is not null
     on conflict (key) do update set v = vis_version.v + 1;
   if to_regclass('recall_block') is not null then
@@ -142,21 +142,9 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
     seen.add(src.parent_id);
     src.parent_id = (await q`select parent_id from source where id = ${src.parent_id}`)[0]?.parent_id ?? null;
   }
-  // Every entry id any declared ancestor has held, living or forgotten, through living forks in between: a
-  // living one's bodies (each received version), a forgotten one's `canon:` tombs. An entry here with one of
-  // them, not newer than the fork, is a copy (DESIGN §4.1); the ids only tell copies apart, they remove nothing.
-  const anc = (await q`with recursive a(id, path) as (
-                         select parent_id, array[id] from source where id = ${source} and parent_id is not null
-                         union all
-                         select s.parent_id, a.path || s.id from a join source s on s.id = a.id
-                         where s.parent_id is not null and not s.id = any(a.path))
-                       select distinct id from a`).map((r: any) => r.id as string);
-  const ancIds = anc.length
-    ? [
-        ...(await q`select distinct rec from body where source = any(${q.array(anc, "text")}) and rec <> 'header'`).map((r: any) => r.rec as string),
-        ...(await q`select key from tomb where key like any(${q.array(anc.map((g: string) => `canon:${g}:%`), "text")})`).map((r: any) => (r.key as string).slice((r.key as string).indexOf(":", 6) + 1)),
-      ]
-    : [];
+  // Whether a fork child ever declared a parent (living or forgotten): its copies are told by their own times.
+  const [decl] = await q`select parent_id from source where id = ${source}`;
+  const forked = !!decl?.parent_id;
   const empty = { views: [], spans: new Map(), lexical: [], keys: null };
   const { lines, blocked, idle, idleMs } = await load(q, source, src.harness);
   const base = { harness: src.harness, scope: src.scope, idle, idleMs, parentId: src.parent_id };
@@ -165,11 +153,11 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
   // Fork parent (Pi): the header names it by file path, the server by source id.
   let parent: ParentInfo | "invalid" | undefined;
   if (src.harness === "pi" && lines[0].type === "session") {
-    // Unknown or no living ancestor: a root session (records whose parent entry was forgotten are orphan roots),
-    // whose copies of a forgotten ancestor's versions still are not its own.
-    if (!src.parent_id && ancIds.length) {
+    // No living ancestor: copies (by their times) have nothing to be inherited from — withdrawn; the child's own
+    // entries stay. Never a declared parent: a root session.
+    if (!src.parent_id && forked) {
       lines[0].parentSession = "/memex/forgotten";
-      parent = parentInfo([], [], spanIdOf, ancIds, new Map());
+      parent = parentInfo([], [], spanIdOf, new Map());
     } else if (!src.parent_id) delete lines[0].parentSession;
     else {
       lines[0].parentSession = "/memex/source/" + src.parent_id;
@@ -181,7 +169,7 @@ async function analyse(q: Tx, source: string): Promise<Result & { harness: strin
         // A copy is inherited only while the nearest living ancestor still has its content.
         const keys = new Map<string, string>(p.keys);
         const cur = (await load(q, src.parent_id, "pi")).lines.slice(1);
-        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf, ancIds, looseKeys(cur, keys));
+        parent = parentInfo(p.keys, vs.map((v: any) => ({ keys: v.keys, spans: v.spans })), spanIdOf, looseKeys(cur, keys));
       }
     }
   }

@@ -79,15 +79,17 @@ beforeEach(async () => {
 });
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
-// A fork child's header time is when Pi forked it: after the copied prefix (the latest time of a fixture).
-const header = (id: string, parentSession?: string) =>
-  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? "2026-12-31T00:00:00Z" : "2026-01-01T00:00:00Z", cwd: "/w/" + id, ...(parentSession ? { parentSession } : {}) });
+// A fork child's header time is when Pi forked it: the copied prefix's latest time (DESIGN §4.1: an entry not newer
+// than it is a copy); the child's own turns are dated after it.
+const header = (id: string, parentSession?: string, ts = "2026-01-01T00:00:00Z") =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: ts, cwd: "/w/" + id, ...(parentSession ? { parentSession } : {}) });
 const msg = (role: string, id: string, parent: string | null, text: string, ts: string) =>
   JSON.stringify({ type: "message", id, parentId: parent, timestamp: ts, message: { role, content: [{ type: "text", text }] } });
 let n = 0;
 /** A session of (user, assistant) exchanges; `turns[i]` = [user text, assistant text, timestamp]. */
 async function put(native: string, turns: [string, string, string][], o: { repo?: string | null; parent?: string | null; parentNative?: string; prefix?: string[] } = {}) {
-  const lines = [header(native, o.parentNative ? `/x/${o.parentNative}.jsonl` : undefined), ...(o.prefix ?? [])];
+  const forkAt = (o.prefix ?? []).map((l) => JSON.parse(l).timestamp as string).sort().at(-1);
+  const lines = [header(native, o.parentNative ? `/x/${o.parentNative}.jsonl` : undefined, forkAt), ...(o.prefix ?? [])];
   let prev: string | null = o.prefix?.length ? JSON.parse(o.prefix[o.prefix.length - 1]).id : null;
   turns.forEach(([u, a, ts], i) => {
     lines.push(msg("user", `${native}u${i}`, prev, u, ts), msg("assistant", `${native}a${i}`, `${native}u${i}`, a, ts));

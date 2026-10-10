@@ -565,10 +565,9 @@ function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally):
 }
 
 // A resolved fork parent: its entries by match key (id + content) → canonical record key, its family's
-// shared span / node identity, and its own views' partition (the source for the child's views). `ids`: every
-// entry id the parent has or had (any version, forgotten ancestors' too). `loose`: its current entries by id +
-// content without the parent link (Pi re-chains a copied entry past a dropped label) → canonical record key.
-type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; ids: Set<string>; loose: Map<string, string> };
+// shared span / node identity, and its own views' partition (the source for the child's views). `loose`: its
+// current entries by id + content without the parent link (Pi re-chains a copied entry past a dropped label).
+type ParentInfo = { keys: Map<string, string>; family: Family; views: FileViews; loose: Map<string, string> };
 const matchOf = (e: Record<string, any>) => `${e.id}:${contentHash(e)}`;
 /** Pi content equivalence of a copy and its original: everything but the parent link (Pi re-chains a copied
  *  entry past a dropped label). The one rule for projection, recall, forget and sync. */
@@ -661,13 +660,12 @@ function piFile(lines: Record<string, any>[], res: FileResult, parent: ParentLoo
       navOf.set(e.id, []);
       continue;
     }
-    // A copy (DESIGN §4.1): Pi copies the parent's entries with their ids and times, so an entry is one when an
-    // ancestor has held its id (any version, forgotten ancestors too) and it is not newer than the fork (the
-    // header's time; an unreadable time counts as a copy). A copy is inherited while the parent still has its
-    // content — its parent link aside, which Pi re-chains past dropped labels — else withdrawn with the old
-    // version, never this file's own record. Any other entry (newer, or an id no ancestor held) is this file's
-    // own, even with the very content of a parent entry.
-    const copied = !!from?.ids.has(e.id) && isCopyTime(e, header);
+    // A copy (DESIGN §4.1, user decision): Pi copies the parent's entries with their ids and times, so in a fork
+    // child an entry not newer than the fork (the header's time; an unreadable time counts) is a copy — told from
+    // this file alone, whatever its ancestors hold. A copy is inherited while the nearest living ancestor has its
+    // content (its parent link aside: Pi re-chains past dropped labels), else withdrawn, never this file's own.
+    // An entry newer than the fork is this file's own, even with the very content of a parent entry.
+    const copied = !!from && isCopyTime(e, header);
     const inheritedKey = copied ? (from?.keys.get(m) ?? from?.loose.get(looseOf(e))) : undefined;
     if (!inheritedKey && copied) {
       res.unresolved++;
@@ -926,9 +924,8 @@ function analyzeLines(path: string, lines: Record<string, any>[], res: FileResul
     // Only a file whose own ancestry is resolved (or that is no fork) can be a parent; anything else would
     // put quarantined history back into a descendant's spans.
     const usable = parsed.keys && (res.forkStatus === "none" || res.forkStatus === "resolved");
-    const ids = new Set<string>(lines.slice(1).flatMap((e) => (typeof e.id === "string" ? [e.id] : [])));
     const loose = parsed.keys ? looseKeys(lines.slice(1), parsed.keys) : new Map<string, string>();
-    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, ids, loose } : undefined, views: parsed.views, fileViews };
+    return { res, parent: usable ? { keys: parsed.keys!, family, views: fileViews, loose } : undefined, views: parsed.views, fileViews };
   }
 }
 
@@ -956,8 +953,8 @@ export function projectLines(label: string, lines: Record<string, any>[], opts: 
   return { res: a.res, parent: a.parent, views };
 }
 export type { ParentInfo };
-export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], ids: Iterable<string>, loose: Map<string, string>): ParentInfo {
-  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }), ids: new Set(ids), loose };
+export function parentInfo(keys: [string, string][], views: PriorView[], idOf: ProjectOptions["idOf"], loose: Map<string, string>): ParentInfo {
+  return { keys: new Map(keys), family: newFamily(idOf), views: joinViews({ paths: views.map((v) => v.keys), viewSpans: views.map((v) => v.spans) }), loose };
 }
 
 // Regular files under the inputs; symlinks are never followed (reported instead), paths deduplicated.

@@ -62,6 +62,7 @@ afterAll(async () => {
   delete process.env.MEMEX_RECALL_MS;
 });
 beforeEach(async () => {
+  stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
                    forest_node, forest_access, session_card, recall_state, recall_block restart identity cascade`);
@@ -83,9 +84,21 @@ beforeEach(async () => {
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
-const header = (id: string, extra = {}) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...extra });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+const tick = () => new Date(Date.parse(T) + ++tickN * 1000).toISOString();
+const stamp = (...k: unknown[]) => {
+  const key = JSON.stringify([T, ...k]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return stampOf.get(key)!;
+};
+const header = (id: string, extra: Record<string, unknown> = {}) =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: extra.parentSession ? tick() : T, cwd: "/x", ...extra });
 const msg = (role: string, id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp(role, id, parent, text), message: { role, content: [{ type: "text", text }] } });
 let n = 0;
 async function put(native: string, ex: [string, string][]) {
   const lines = [header(native)];

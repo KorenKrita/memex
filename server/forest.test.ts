@@ -58,6 +58,7 @@ afterAll(async () => {
   await db.close();
 });
 beforeEach(async () => {
+  stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, forest_node, forest_access, session_card
                    restart identity cascade`);
@@ -71,9 +72,21 @@ beforeEach(async () => {
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 let T = new Date().toISOString(); // recent: a hot session
-const header = (id: string, parentSession?: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+const tick = () => new Date(Date.parse(T) + ++tickN * 1000).toISOString();
+const stamp = (...k: unknown[]) => {
+  const key = JSON.stringify([T, ...k]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return stampOf.get(key)!;
+};
+const header = (id: string, parentSession?: string) =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
 const msg = (role: string, id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp(role, id, parent, text), message: { role, content: [{ type: "text", text }] } });
 let commitN = 0;
 async function put(native: string, lines: string[], parent: string | null = null) {
   const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope: "personal", parent };
@@ -349,23 +362,19 @@ test("between the check and the send — forget, revoke, revision, canonical rem
   expect(await betweenCheckAndSend(pair.id, () => put("cs3", rev))).toBe(0);
 });
 
-test("canonical remap between the check and the send: the child's mixed merge is not sent", async () => {
-  // The child holds records the parent has not synced yet (its own for now); the parent catches up.
+test("a child's copies the parent has not synced yet: never in the child's forest; inherited once it catches up", async () => {
+  // Copies (not newer than the fork) are withdrawn until the parent has them (DESIGN §4.1): never the child's own,
+  // so no node is built from them under the child and there is no remap to race.
   const pl = linear("rm", 4);
   const P = await put("rm", pl.slice(0, 3));
   await drain(db);
   const C = await put("rn", [header("rn", "/x/rm.jsonl"), ...pl.slice(1), msg("user", "k1", "a4", "kid")], P);
   await coldThenStructure();
-  // A pair over the child's records that the parent will take over (u1..a2 are the child's own for now).
-  const [pair] = await db`select f.id from forest_node f where size = 2 and f.text is null
-                            and exists (select 1 from span sp where sp.id = any(f.spans) and sp.source = ${C} and sp.keys[1] like 'rn/u1:%')`;
-  expect(pair).toBeTruthy();
-  const sent = await betweenCheckAndSend(pair.id, async () => {
-    await put("rm", pl);
-    await drain(db, ["project"]);
-  });
-  expect(sent).toBe(0);
-  expect((await db`select text from forest_node where id = ${pair.id}`)[0]?.text ?? null).toBe(null);
+  expect((await db`select id from span where source = ${C} and keys[1] like 'rn/u%'`).length).toBe(0);
+  expect(JSON.stringify(await db`select text from forest_node`)).not.toMatch(/S\(t[1-4]\)/);
+  await put("rm", pl);
+  await drain(db);
+  expect((await db`select id from span where keys[1] like 'rm/u1:%'`).length).toBe(1); // now the parent's, inherited
 });
 
 test("forget of the parent while the child's mixed root is with the model: not published", async () => {

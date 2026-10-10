@@ -46,6 +46,7 @@ afterAll(async () => {
   await db.close();
 });
 beforeEach(async () => {
+  stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('personal', 'derive', 'llm'), ('personal', 'derive', 'embedding'), ('work', 'sync', 'memex')`;
@@ -57,9 +58,21 @@ beforeEach(async () => {
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
-const header = (id: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x" });
+const header = (id: string, parentSession?: string) =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+const tick = () => new Date(Date.parse(T) + ++tickN * 1000).toISOString();
+const stamp = (...k: unknown[]) => {
+  const key = JSON.stringify([T, ...k]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return stampOf.get(key)!;
+};
 const msg = (role: string, id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp(role, id, parent, text), message: { role, content: [{ type: "text", text }] } });
 let commitN = 0;
 async function put(native: string, lines: string[], scope = "personal") {
   const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope, parent: null };
@@ -227,31 +240,26 @@ test("an open span is never sent, even if a summarize job names it", async () =>
 
 // ---- regressions from the 2a review ----
 
-test("a canonical remap after the check: the request built from the old mapping is not sent", async () => {
-  const { hooks } = await import("./derive.ts");
+test("a child's copies the parent has not synced yet: nothing built from them is sent; inherited once it catches up", async () => {
   const P = sourceIdOf("pi", "rp");
   const pl = [header("rp"), msg("user", "x0", null, "q0"), msg("assistant", "y0", "x0", "r0"), msg("user", "u1", "y0", "q1"), msg("assistant", "a1", "u1", "r1"),
               msg("user", "u2", "a1", "q2 child-native-for-now"), msg("assistant", "a2", "u2", "r2")];
   await put("rp", pl.slice(0, 3)); // the parent has synced only its first exchange so far
-  const kid = [JSON.stringify({ ...JSON.parse(header("rk")), parentSession: "/x/rp.jsonl" }), ...pl.slice(1), msg("user", "k1", "a2", "child turn")];
+  const kid = [header("rk", "/x/rp.jsonl"), ...pl.slice(1), msg("user", "k1", "a2", "child turn")];
   const decl = { source: sourceIdOf("pi", "rk"), harness: "pi" as const, nativeId: "rk", scope: "personal", parent: P };
   const l = await requestLease(db, decl, "m1");
   await tryGrant(db, l);
   await commit(db, { leaseId: l, commitId: "rk0", length: kid.length, changes: kid.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) });
   await drain(db, ["project"]);
-  // [u2 a2]: records and <context> (u1, a1) all native to the child for now, so its vector has no parent entry.
-  const [target] = (await db`select id from span where keys[1] like 'rk/u2:%'`).map((r: any) => r.id);
-  expect(target).toBeTruthy();
-  hooks.afterCheck = async () => {
-    hooks.afterCheck = async () => {};
-    await put("rp", pl); // the parent catches up: u1..a2 are the parent's records
-    await drain(db, ["project"]);
-  };
-  await db`update job set not_before = now() + interval '1 hour' where kind = 'summarize' and key <> ${target}`;
-  const j = (await claimJob(db, ["summarize"]))!;
-  expect(j.key).toBe(target);
-  await runSummarize(db, j);
+  // u1..a2 are copies (not newer than the fork) the parent has not synced yet: withdrawn, never the child's own —
+  // so nothing built from them is sent before the parent catches up (DESIGN §4.1; no remap race to guard).
+  expect((await db`select id from span where keys[1] like 'rk/u2:%' or keys[1] like 'rk/u1:%'`).length).toBe(0);
+  await drain(db);
   expect(chats().filter((r) => JSON.stringify(r.body).includes("child-native-for-now")).length).toBe(0);
+  expect((await db`select id from span where keys[1] like 'rk/k1:%'`).length).toBe(1); // the child's own still is
+  await put("rp", pl); // the parent catches up: u1..a2 are the parent's records, inherited by the child
+  await drain(db);
+  expect((await db`select id from span where keys[1] like 'rp/u2:%'`).length).toBe(1);
 });
 
 test("an unchanged input is not summarized again", async () => {
@@ -311,7 +319,7 @@ test("a child's prefix cut from the parent's span is a representation of that sp
   await put("up", pl);
   await drain(db, ["project"]);
   const [S] = (await db`select id from span where source = ${P} and keys[1] like '%/u1:%'`).map((r: any) => r.id);
-  const kid = [JSON.stringify({ ...JSON.parse(header("uk")), parentSession: "/x/up.jsonl" }), pl[1], pl[2], msg("assistant", "b2", "a1", "child branch")];
+  const kid = [header("uk", "/x/up.jsonl"), pl[1], pl[2], msg("assistant", "b2", "a1", "child branch")];
   const decl = { source: sourceIdOf("pi", "uk"), harness: "pi" as const, nativeId: "uk", scope: "personal", parent: P };
   const l = await requestLease(db, decl, "m1");
   await tryGrant(db, l);

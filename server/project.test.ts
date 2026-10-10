@@ -19,6 +19,7 @@ afterAll(async () => {
   await db.close();
 });
 beforeEach(async () => {
+  stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical restart identity cascade`);
   await db`insert into grant_rule values ('personal', 'sync', 'memex'), ('work', 'sync', 'memex')`;
@@ -27,11 +28,23 @@ beforeEach(async () => {
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
-const header = (id: string, parentSession?: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+const tick = () => new Date(Date.parse(T) + ++tickN * 1000).toISOString();
+const stamp = (...k: unknown[]) => {
+  const key = JSON.stringify([T, ...k]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return stampOf.get(key)!;
+};
+const header = (id: string, parentSession?: string) =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: parentSession ? tick() : T, cwd: "/x", ...(parentSession ? { parentSession } : {}) });
 const user = (id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role: "user", content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp("user", id, parent, text), message: { role: "user", content: [{ type: "text", text }] } });
 const asst = (id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role: "assistant", content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp("assistant", id, parent, text), message: { role: "assistant", content: [{ type: "text", text }] } });
 
 let commitN = 0;
 /** Commit the whole file content as one collector's copy (positions = line order). */
@@ -167,7 +180,7 @@ test("appending exchanges does not move the session version; a revision of a clo
   expect(await ver()).toBeGreaterThan(v0);
 });
 
-test("a child's records taken over by a parent that catches up: a remap, the child's version moves", async () => {
+test("a child's copies the parent has not synced yet: withdrawn until it catches up, then inherited", async () => {
   const P = sourceIdOf("pi", "rp");
   const pl = [header("rp"), user("x0", null, "q0"), asst("y0", "x0", "r0"), user("u1", "y0", "q1"), asst("a1", "u1", "r1")];
   await put("rp", pl.slice(0, 3)); // the parent has its first exchange only
@@ -176,7 +189,8 @@ test("a child's records taken over by a parent that catches up: a remap, the chi
   const ver = async () => Number((await db`select v from vis_version where key = ${"s:" + C}`)[0]?.v ?? 1);
   const v0 = await ver();
   const own = (await db`select keys from projected where source = ${C}`)[0].keys as [string, string][];
-  expect(own.find(([k]) => k.startsWith("u1:"))![1].startsWith("rk/")).toBe(true); // the child's own, for now
+  expect(own.find(([k]) => k.startsWith("u1:"))).toBeUndefined(); // a copy (not newer than the fork), never the child's own
+  expect(own.find(([k]) => k.startsWith("k1:"))![1].startsWith("rk/")).toBe(true);
   await put("rp", pl);
   await drain(db);
   const now = (await db`select keys from projected where source = ${C}`)[0].keys as [string, string][];

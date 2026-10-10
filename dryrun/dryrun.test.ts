@@ -1,5 +1,5 @@
 // Synthetic fixtures only: every log here is written by the test into a temp dir.
-import { describe, expect, spyOn, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,8 +20,20 @@ const B = (s: string) => Buffer.byteLength(s);
 
 // ---------- Pi fixtures ----------
 let headerN = 0; // every header gets its own session id unless a test names one (same id = copies of one session)
-const piHeader = (extra: object = {}) => ({ type: "session", version: 3, id: `s${++headerN}`, timestamp: "2026-10-01T00:00:00Z", cwd: "/w", ...extra });
-const piMsg = (id: string, parentId: string | null, message: object) => ({ type: "message", id, parentId, timestamp: "2026-10-01T00:00:00Z", message });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+beforeEach(() => stampOf.clear()); // a fixture's times are its own: an entry built in another test is not a copy here
+const tick = () => new Date(Date.parse("2026-10-01T00:00:00Z") + ++tickN * 1000).toISOString();
+const piHeader = (extra: Record<string, unknown> = {}) =>
+  ({ type: "session", version: 3, id: `s${++headerN}`, timestamp: extra.parentSession ? tick() : "2026-10-01T00:00:00Z", cwd: "/w", ...extra });
+const piMsg = (id: string, parentId: string | null, message: object) => {
+  const key = JSON.stringify([id, parentId, message]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return { type: "message", id, parentId, timestamp: stampOf.get(key)!, message };
+};
 const user = (text: unknown) => ({ role: "user", content: text, timestamp: 1 });
 const asst = (content: unknown[]) => ({ role: "assistant", content, api: "x", provider: "x", model: "x", timestamp: 1 });
 const say = (text: string) => asst([{ type: "text", text }]);
@@ -596,6 +608,7 @@ describe("fourth review", () => {
   // shared afterwards; records new in different sessions are different records.
   test("sibling forks cut at different places: totals do not depend on file names", () => {
     const run = (d: string, shortName: string, longName: string) => {
+      stampOf.clear(); // each run is its own fixture
       const P = file(`${d}/P.jsonl`, [piHeader(), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("x", "a", say("x"))]);
       file(`${d}/${shortName}.jsonl`, [piHeader({ id: "s-short", parentSession: P }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
       file(`${d}/${longName}.jsonl`, [piHeader({ id: "s-long", parentSession: P }), piMsg("u", null, user("u")), piMsg("a", "u", say("a")), piMsg("y", "a", say("y"))]);
@@ -609,9 +622,10 @@ describe("fourth review", () => {
 
   test("records new in two sibling forks are distinct even when byte-identical", () => {
     const P = file("pi/collide/P.jsonl", [piHeader(), piMsg("u", null, user("u"))]);
+    const hA = piHeader({ id: "sA", parentSession: P }), hB = piHeader({ id: "sB", parentSession: P }); // forked, then z written in each
     const z = piMsg("z", "u", user("same"));
-    file("pi/collide/A.jsonl", [piHeader({ id: "sA", parentSession: P }), piMsg("u", null, user("u")), z]);
-    file("pi/collide/B.jsonl", [piHeader({ id: "sB", parentSession: P }), piMsg("u", null, user("u")), z]);
+    file("pi/collide/A.jsonl", [hA, piMsg("u", null, user("u")), z]);
+    file("pi/collide/B.jsonl", [hB, piMsg("u", null, user("u")), z]);
     const r = dryRun([join(dir, "pi/collide")]).total;
     expect(r).toMatchObject({ evidence: 3, spans: 3, digestBytes: 30, summaryInputBytes: 30 });
   });
@@ -720,6 +734,7 @@ describe("fourth review", () => {
 
   test("a span counted as a prefix span once, whichever file meets it first and in which role", () => {
     const run = (d: string, gName: string, sName: string) => {
+      stampOf.clear(); // each run is its own fixture
       const P = file(`${d}/P.jsonl`, [piHeader({ id: "sP" }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r0", "c", result("t", "A"))]);
       const C = file(`${d}/C.jsonl`, [piHeader({ id: "sC", parentSession: P }), piMsg("u", null, user("u")), piMsg("c", "u", call("t")), piMsg("r1", "c", result("t", "B"))]);
       file(`${d}/${gName}.jsonl`, [
@@ -762,10 +777,10 @@ describe("fourth review", () => {
     const rows = [piHeader({ id: "par" }), piMsg("u", null, user("u")), piMsg("a", "u", say("a"))];
     const p1 = file("pi/copyparent/p1.jsonl", rows);
     const p2 = file("pi/copyparent/p2.jsonl", rows);
-    const kid = (name: string, parentSession: string) =>
-      file(`pi/copyparent/${name}.jsonl`, [piHeader({ id: name, parentSession }), piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
-    const k1 = kid("k1", p1);
-    const k2 = kid("k2", p2);
+    const h1 = piHeader({ id: "k1", parentSession: p1 }), h2 = piHeader({ id: "k2", parentSession: p2 }); // both forked before b is written
+    const kid = (name: string, h: object) => file(`pi/copyparent/${name}.jsonl`, [h, piMsg("u", null, user("u")), piMsg("b", "u", say("b"))]);
+    const k1 = kid("k1", h1);
+    const k2 = kid("k2", h2);
     const r = dryRun([join(dir, "pi/copyparent")]);
     for (const k of [k1, k2]) expect(r.perFile.find((f) => f.path === k)).toMatchObject({ forkStatus: "resolved", inherited: 1, evidence: 1 });
     // S = [u a], P = [u], [b] from k1, [b] from k2 (two native records)

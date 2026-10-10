@@ -76,6 +76,7 @@ const ALL = [
   ["work", "sync", "memex"], ["work", "derive", "llm"], ["work", "derive", "embedding"],
 ];
 beforeEach(async () => {
+  stampOf.clear(); // a fixture's times are its own: an entry built in another test is not a copy here
   await db.unsafe(`truncate api_key, grant_rule, source, vis_version, tomb, lease, commit_result, body, projection, record,
                    scan_progress, collector_view, job, span, view, projected, lexical, span_summary, derive_skip, search_trace,
                    forest_node, forest_access, session_card restart identity cascade`);
@@ -96,9 +97,21 @@ beforeEach(async () => {
 const inputs = (d: any) => d.pool.filter((c: any) => c.selected).sort((a: any, b: any) => a.selected_pos - b.selected_pos);
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const T = "2026-01-01T00:00:00Z";
-const header = (id: string, extra = {}) => JSON.stringify({ type: "session", version: 3, id, timestamp: T, cwd: "/x", ...extra });
+// Fixture clock (DESIGN §4.1: a fork child's entry not newer than its header is a copy): the same entry built
+// again gets the same time (a copy keeps the parent's); a fork header takes the next tick, so entries built
+// after it are the child's own.
+let tickN = 0;
+const stampOf = new Map<string, string>();
+const tick = () => new Date(Date.parse(T) + ++tickN * 1000).toISOString();
+const stamp = (...k: unknown[]) => {
+  const key = JSON.stringify([T, ...k]);
+  if (!stampOf.has(key)) stampOf.set(key, tick());
+  return stampOf.get(key)!;
+};
+const header = (id: string, extra: Record<string, unknown> = {}) =>
+  JSON.stringify({ type: "session", version: 3, id, timestamp: extra.parentSession ? tick() : T, cwd: "/x", ...extra });
 const msg = (role: string, id: string, parent: string | null, text: string) =>
-  JSON.stringify({ type: "message", id, parentId: parent, timestamp: T, message: { role, content: [{ type: "text", text }] } });
+  JSON.stringify({ type: "message", id, parentId: parent, timestamp: stamp(role, id, parent, text), message: { role, content: [{ type: "text", text }] } });
 let commitN = 0;
 async function put(native: string, lines: string[], scope = "personal", parent: string | null = null, leaf?: string) {
   const decl = { source: sourceIdOf("pi", native), harness: "pi" as const, nativeId: native, scope, parent };
@@ -1029,9 +1042,9 @@ test("an upgrade from projections that kept a revised parent's copy as the child
   await db`insert into lexical (source, key, part, rec, kind, text, canon) values (${C}, ${"upk/a0:old#0"}, 0, 'a0', 'assistant', 'upgrade-old-copy', ${C + ":a0"})`;
   expect(k).toBeDefined();
   expect(await hasText("upgrade-old-copy")).toBe(true);
-  // A database that already ran fork-copy-v2 (only its mark): v3 still runs, once.
-  await db`delete from migration_mark where key = 'fork-copy-v3'`;
-  await db`insert into migration_mark values ('fork-copy-v2') on conflict do nothing`;
+  // A database that already ran fork-copy-v2 and v3 (their marks only): v4 still runs, once.
+  await db`delete from migration_mark where key = 'fork-copy-v4'`;
+  await db`insert into migration_mark values ('fork-copy-v2'), ('fork-copy-v3') on conflict do nothing`;
   await migrate(db);
   expect(await hasText("upgrade-old-copy")).toBe(false); // before any worker ran
   const v = (await db`select v from vis_version where key = ${"s:" + C}`)[0].v;
