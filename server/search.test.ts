@@ -830,6 +830,32 @@ test("an unlinked fork is no usable parent: its own entry stays readable in it, 
   expect(recs).toContain("c");
 });
 
+test("sync refuses a record that is not one JSON object", async () => {
+  const decl = { source: sourceIdOf("pi", "nj"), harness: "pi" as const, nativeId: "nj", scope: "personal", parent: null };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  for (const raw of ["{", "[1]", "3"]) {
+    const r = await commit(db, { leaseId: l, commitId: `nj${commitN++}`, length: 1, changes: [{ pos: 0, id: "header", hash: sha(raw), raw }] });
+    expect(r).toMatchObject({ ok: false, reason: "bad-request" });
+  }
+});
+
+for (const kind of ["unreadable", "not a session"])
+  test(`forget of a fork whose stored current header is ${kind} (an older database): every version counts as its own`, async () => {
+    const A = sourceIdOf("pi", "ua"), B = sourceIdOf("pi", "uh");
+    const e = msg("user", "e", null, "uh-entry");
+    await put("ua", [header("ua"), e]);
+    await drain(db);
+    await put("uh", [header("uh", { parentSession: "/x/ua.jsonl" }), e], "personal", A);
+    await drain(db);
+    // As a server that did not check records left it: B's current header replaced by a line it cannot read as one.
+    const raw = kind === "unreadable" ? "{" : '{"type":"x"}';
+    await db`insert into body (source, rec, hash, raw) values (${B}, 'header', ${sha(raw)}, ${raw})`;
+    await db`update record set hash = ${sha(raw)} where source = ${B} and rec = 'header'`;
+    await forgetSource(db, B);
+    expect((await db`select count(*)::int n from tomb where key like ${"copy:" + B + ":e:%"}`)[0].n).toBe(1);
+  });
+
 for (const dir of ["earlier", "later"])
   test(`forget of a fork whose header was revised (fork time moved ${dir}): the current header decides which versions were its own`, async () => {
     const A = sourceIdOf("pi", "fa"), B = sourceIdOf("pi", "fb");

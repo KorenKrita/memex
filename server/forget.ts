@@ -40,16 +40,17 @@ export async function forgetSource(db: Db, source: string): Promise<{ records: n
     // The fork time is the current header's, as projection reads it (body keeps every header version ever received).
     // No single current header (absent, in conflict, unreadable): every version counts as S's own — a forget
     // removes more, never less.
+    const [src] = await tx`select native_id, harness from source where id = ${source}`;
     const [cur] = await tx`select r.state, b.raw from record r left join body b on b.source = r.source and b.rec = r.rec and b.hash = r.hash
                            where r.source = ${source} and r.rec = 'header'`;
     let sHead: any;
     try {
       sHead = cur?.state === "ok" && cur.raw ? JSON.parse(cur.raw) : undefined;
     } catch {}
-    const headKnown = sHead?.type === "session" || (cur?.state === "ok" && !!cur.raw);
-    const piFork = sHead?.type === "session" && !!sHead.parentSession;
+    // Pi only (a Codex rollout has no header record: its copies are told by the projection's mapping).
+    const headKnown = src?.harness !== "pi" || sHead?.type === "session";
+    const piFork = headKnown && src?.harness === "pi" && !!sHead.parentSession;
     const [pr] = await tx`select keys from projected where source = ${source}`;
-    const [src] = await tx`select native_id from source where id = ${source}`;
     const inherited = new Set<string>(((pr?.keys ?? []) as [string, string][]).filter(([, k]) => !k.startsWith(src.native_id + "/")).map(([m]) => m));
     const own = versions.filter((r: any) => r.rec !== "header" && (!headKnown ||
       (piFork ? !isCopyTime(JSON.parse(r.raw), sHead) : !inherited.has(`${r.rec}:${contentHash(JSON.parse(r.raw))}`))));

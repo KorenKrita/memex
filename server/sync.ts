@@ -148,6 +148,12 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
     bytes += ch.raw.length;
     if (!(ch.pos >= 0 && ch.pos < c.length) || typeof ch.id !== "string" || !ch.id) return { ok: false, reason: "bad-request", detail: "change outside the copy" };
     if (new Bun.CryptoHasher("sha256").update(ch.raw).digest("hex") !== ch.hash) return { ok: false, reason: "bad-request", detail: `hash of ${ch.id}` };
+    // Every record is one JSON object (the collector refuses other lines): what the server parses later is.
+    let obj: unknown;
+    try {
+      obj = JSON.parse(ch.raw);
+    } catch {}
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return { ok: false, reason: "bad-request", detail: `${ch.id} is not a JSON object` };
   }
   if (bytes > MAX_COMMIT_BYTES) return { ok: false, reason: "bad-request", detail: "commit too large" };
   return db.begin(async (tx: Tx) => {
