@@ -236,7 +236,9 @@ export async function runL3(db: Db, job: Job) {
     if (c.ok && !sameDeps(about, c.deps)) problems = [];
     if (c.ok) about = c.deps;
     if (!c.ok) return skip(db, job, c.reason, c.scopes);
-    if (![...c.cands.values()].some((x) => x.citable)) return db.begin((tx: Tx) => finishJob(tx, job)); // nothing new to read
+    // Nothing new to read: the statements already made from this very input only have their conservative vector
+    // renewed (an unrelated revision elsewhere moved a source's version), no model call, their text unchanged.
+    if (![...c.cands.values()].some((x) => x.citable)) return publish(db, job, c.deps, (tx) => renew(tx, job.key, c.span.input_fp, c.deps, c.scopes));
     const messages = [{ role: "system", content: EXTRACT_SYSTEM }, { role: "user", content: renderExtract(c.span, c.cands) }];
     if (problems.length) messages.push({ role: "user", content: "Your previous answer was invalid: " + problems.slice(0, 4).join("; ") + ". Return a corrected JSON object." });
     const r = await guardedPost(db, c.deps, url, key, { model, messages, temperature: 0, reasoning_effort: "none", response_format: { type: "json_object" } });
@@ -267,6 +269,7 @@ export async function runL3(db: Db, job: Job) {
         await dropStale(tx, x.src, x.rec);
       }
       const stmts = chk.stmts.filter((x) => mine.has(x.cand.id));
+      await renew(tx, job.key, c.span.input_fp, c.deps, c.scopes);
       await planAndInsert(tx, stmts, job.key, c.span.input_fp, c.deps, c.scopes, model);
     });
   }
@@ -290,6 +293,10 @@ async function planAndInsert(tx: Tx, stmts: NewStmt[], span: string, inputFp: st
     for (const a of fresh) for (const b of all) if (b !== a && !(fresh.has(b) && b < a)) await enqueue(tx, "l3pair", pairKey(a, b));
   }
 }
+
+/** Statements made from exactly this input (span and fingerprint) get the vector it was just checked under. */
+const renew = (tx: Tx, span: string, inputFp: string, deps: Record<string, number>, scopes: string[]) =>
+  tx`update l3_stmt set deps = ${deps}, scopes = ${tx.array([...scopes].sort(), "text")} where span = ${span} and input_fp = ${inputFp}`;
 
 /** A claim's statements once its input moved: unreadable for good, removed with their relations. */
 async function dropStale(tx: Tx, src: string, rec: string) {

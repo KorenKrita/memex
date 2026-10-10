@@ -589,3 +589,20 @@ test("retry feedback is dropped once the input it was about moved", async () => 
   expect(ex[1].content).toContain("context two");
   expect(ex[1].content).not.toContain("previous answer");
 });
+
+test("an unrelated revision elsewhere in the session: the statement is readable again once projected, without a model call", async () => {
+  // Three exchanges, each its own span; the statement is in the first, the third is revised.
+  const turns: [string, string, string][] = [["PREF TOPICpm use pnpm", "ok", T0], ["middle", "ok", T1], ["last", "ok", T2]];
+  await put("a", turns);
+  await drain(db);
+  expect(await texts()).toEqual(["PREF TOPICpm use pnpm"]);
+  const k = requests.filter((r) => r.sys.startsWith("You extract")).length;
+  await put("a", [turns[0], turns[1], ["last revised", "ok", T2]]);
+  await drain(db);
+  const st = (await db`select span, input_fp, deps from l3_stmt`)[0];
+  expect(await texts()).toEqual(["PREF TOPICpm use pnpm"]);
+  // Only the revised part was read again; the statement itself was not extracted again.
+  const asked = requests.filter((r) => r.sys.startsWith("You extract") && /citable="yes">\n\w+: PREF/.test(r.content));
+  expect(asked.length).toBe(1);
+  void k;
+});

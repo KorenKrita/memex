@@ -269,7 +269,12 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
     const remapped = !!before && (before.status !== a.status || (before.keys === null) !== (a.keys === null)
       || [...oldMap].some(([k, v]) => newMap.get(k) !== v));
     const grown = !!before && newMap.size > oldMap.size;
-    if (withdrawn || remapped) await bump(tx, "s:" + source);
+    if (withdrawn || remapped) {
+      await bump(tx, "s:" + source);
+      // L3 statements whose vector holds this source: looked at again (renewed if their input is the same,
+      // read again otherwise) — a version moved by a change elsewhere must not hide them for good.
+      for (const r of await tx`select distinct span from l3_stmt where deps ? ${"s:" + source}`) await enqueue(tx, "l3", r.span);
+    }
     // Read-side validity (search.ts): what this projection was built from. It holds while every entry is
     // current; any later commit, forget or parent change makes it stale until the next projection.
     const [sv] = await tx`select v from vis_version where key = ${"s:" + source}`;
