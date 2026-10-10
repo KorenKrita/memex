@@ -57,6 +57,26 @@ local Pi and Codex logs; mean input 9,837 B, mean `<context>` 638 B.
   SessionEnd or on the shell's environment.
 - Codex cold-file compression: the binary has it, but feature `local_thread_store_compression` is off
   ("under development") in this build; source (b12ac84) compresses rollouts older than 7 days when on.
+- **Codex MCP identity** (`probes/codex-mcp-meta-probe.ts`, 2026-10-10, `codex exec` ×2 in parallel, isolated
+  `CODEX_HOME`): every `tools/call` carries `_meta` with `threadId`, `sessionId` (both equal to that run's
+  `session_meta.payload.id`), `callId`, `itemId`, `windowId`, `progressToken`, `x-codex-turn-metadata`; the two
+  runs each got their own id (one stdio server process per run). `CODEX_THREAD_ID` / `CODEX_SESSION_ID` are
+  not in the MCP server's environment. Verified for separate `codex exec` processes only (each its own MCP
+  server); a shared app-server serving several threads through one MCP process is not covered. In this
+  isolated run (`approval_policy = "never"`) the tool call was refused until the probe server set
+  `default_tools_approval_mode = "approve"`.
+- **Pi `context` ↔ entries** (`probes/pi-context-map-probe.ts`, Pi 1.1.0, a two-turn print session, both
+  prompts the same text): the `context` messages exclude the system message, the projection's include it
+  (positions do not line up). Each user message matched exactly one projection entry by (role, timestamp,
+  content) — its `message` entry id — including the two same-text inputs (different timestamps). Same
+  timestamps, tree moves, compaction and other extensions' edits were not covered by this run.
+- **Pi edits and sources** (`probes/pi-context-edit-probe.ts` loaded before the map probe, same session shape;
+  logs `/tmp/memex-eval/pi-edit.hQUi`): a message sent by an extension (`sendUserMessage`, follow-up) fires
+  `input` with `source: "extension"` (the typed one `interactive`) and no second `before_agent_start`; when an
+  earlier extension appends text to the latest user message in `context`, the content match finds no entry
+  (`matches: []`) while the message's `timestamp` is unchanged. So the plugin ties a `context` user message to
+  its entry by (role, timestamp) unique on both sides, and omits injection otherwise. At the first `context` of
+  a run the leaf is the new user entry.
 
 ## FTS comparison (`/tmp/memex-eval/fts-v4.json`)
 
