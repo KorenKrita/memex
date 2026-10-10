@@ -479,6 +479,11 @@ const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 function piRecords(entry: Record<string, any>, res: FileResult, key: string): Rec[] {
   return perRecord(res, (ex) => piRecordsInner(entry, res, ex)).map((r, j) => ({ ...r, key: `${key}#${j}` }));
 }
+/** A Pi entry's indexed text of `kind` ("user" / "assistant"), exactly as the lexical index holds it (the
+ *  plugins send the previous exchange as this text; the server checks it against the index). */
+export function piTextOf(entry: Record<string, any>, kind: "user" | "assistant"): string {
+  return piRecordsInner(entry, emptyResult(""), {}).filter((r) => r.kind === kind).map((r) => r.text).join("");
+}
 
 type Draft = Omit<Rec, "key">;
 function piRecordsInner(entry: Record<string, any>, res: FileResult, ex: Tally): Draft[] {

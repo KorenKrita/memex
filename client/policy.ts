@@ -12,7 +12,7 @@
 // query text to (the server checks these again on its own grant table; the client only narrows).
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, sep } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 export type Purpose = "sync" | "import" | "snapshot" | "recall" | "tool";
 export type Dest = "memex" | "llm" | "embedding" | "rerank";
@@ -33,11 +33,14 @@ export function loadPolicy(path = policyPath()): Policy {
   return p as Policy;
 }
 
-const real = (p: string) => {
+/** The real path; for a path not created yet (a host writes its session file after the first reply), its
+ *  closest existing ancestor's real path with the rest appended — so a symlinked directory still matches. */
+const real = (p: string): string => {
   try {
     return realpathSync(p);
   } catch {
-    return p;
+    const up = dirname(p);
+    return up === p ? p : join(real(up), basename(p));
   }
 };
 

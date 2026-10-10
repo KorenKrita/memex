@@ -11,6 +11,8 @@ import { resolve } from "node:path";
 import { blockHashes, CHUNK, piHeaderId, readHead, readRange, readSession, sha256, sourceIdOf, type Harness, type ReadResult } from "./records.ts";
 import type { Policy } from "./policy.ts";
 import { allowed, scopeOf } from "./policy.ts";
+// Also runs in the hosts' runtime (Pi: Node), not only Bun.
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export type { Transport } from "./api.ts";
 import type { Transport } from "./api.ts";
@@ -57,7 +59,7 @@ async function acquire(t: Transport, decl: object, collector: string, deadline: 
     for (let i = 0; ; i++) {
       if ((await t("POST", `/v1/sync/lease/${lease}/poll`, undefined, { deadline })).granted) return { lease, granted: true };
       if (Date.now() + 50 >= deadline) return { lease, granted: false };
-      await Bun.sleep(Math.min(50 * (i + 1), 500, Math.max(0, deadline - Date.now())));
+      await sleep(Math.min(50 * (i + 1), 500, Math.max(0, deadline - Date.now())));
     }
   } catch (e) {
     await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
@@ -231,7 +233,7 @@ async function scanBatch(t: Transport, policy: Policy, jobs: Job[],
         for (const i of wait) if (!granted.has(i)) out[i] = { status: "failed", reason: "lease-timeout" };
         break;
       }
-      await Bun.sleep(Math.min(50 * (k + 1), 500, Math.max(0, o.deadline - Date.now())));
+      await sleep(Math.min(50 * (k + 1), 500, Math.max(0, o.deadline - Date.now())));
     }
     // Under each lease: the file's identity again, then its range.
     const reads: any[] = [];
