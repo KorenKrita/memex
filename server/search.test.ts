@@ -423,6 +423,33 @@ test("since / until / repo filter search and grep by record time and the session
   await expect(grep(db, T0({ pattern: "x", repo: 3 }))).rejects.toThrow("repo must be");
 });
 
+test("since / until: the vector channel is filtered too, and an upgrade fills the times of spans kept from an earlier partition", async () => {
+  const at = (raw: string, ts: string) => JSON.stringify({ ...JSON.parse(raw), timestamp: ts });
+  // "zeta" is a vector marker: these sessions are found by the vector channel (and the others).
+  const lines = (n: string, ts: string) => [header(n), at(msg("user", "u0", null, "zeta vecfilter " + n), ts), at(msg("assistant", "a0", "u0", "ok"), ts)];
+  const jan = await put("vjan", lines("vjan", "2026-01-05T00:00:00Z"));
+  const mar = await put("vmar", lines("vmar", "2026-03-05T00:00:00Z"));
+  await drain(db);
+  const vecTop = async (extra: object) => {
+    await db`delete from search_trace`;
+    await body(Q("zeta", { dests: ["embedding"], ...extra }));
+    const [t] = await db`select data from search_trace`;
+    const units = t.data.top.vec as string[];
+    const srcOf = async (u: string) => (await db`select source from span where unit = ${u.slice(5)} limit 1`)[0]?.source;
+    return [...new Set(await Promise.all(units.map(srcOf)))].sort();
+  };
+  expect(await vecTop({})).toEqual([jan, mar].sort());
+  expect(await vecTop({ since: "2026-02-01T00:00:00Z" })).toEqual([mar]);
+  // As a database from before the time columns: kept spans without times, the migration run again.
+  await db`update span set t0 = null, t1 = null`;
+  await db`update lexical set at = null`;
+  await db`delete from migration_mark where key = 'record-times-v1'`;
+  await migrate(db);
+  await drain(db);
+  expect((await db`select count(*)::int n from span where source = any(${db.array([jan, mar], "text")}) and t0 is null`)[0].n).toBe(0);
+  expect(await vecTop({ until: "2026-02-01T00:00:00Z" })).toEqual([jan]);
+});
+
 test("zoom: a span's records with paging and neighbours on its view; a record by canonical id", async () => {
   const s = await put("z1", linear("z1", [["first " + "f".repeat(300), "r1"], ["second", "r2"], ["third", "r3"]]));
   await drain(db);

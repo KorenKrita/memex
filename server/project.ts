@@ -323,11 +323,12 @@ export async function runProject(db: Db, job: Job): Promise<"done" | "rerun" | "
         }
       }
       // Record times of every span (content-addressed: the same records, the same times; kept ones filled in too).
+      // Every span of this source, re-emitted or kept from an earlier partition, from the records it holds.
       const at = (ids: string[]) => ids.map((x) => a.times?.get(x)).filter((t): t is number => t !== undefined);
-      for (const [id, s] of a.spans) {
-        const ts = at(s.records.map((r: SpanRecord) => r.id));
+      for (const sp of await tx`select id, records, t0, t1 from span where source = ${source}`) {
+        const ts = at((sp.records as SpanRecord[]).map((r) => r.id));
         const t0 = ts.length ? new Date(Math.min(...ts)) : null, t1 = ts.length ? new Date(Math.max(...ts)) : null;
-        await tx`update span set t0 = ${t0}, t1 = ${t1} where id = ${id} and (t0 is distinct from ${t0} or t1 is distinct from ${t1})`;
+        if (+(sp.t0 ?? 0) !== +(t0 ?? 0) || +(sp.t1 ?? 0) !== +(t1 ?? 0)) await tx`update span set t0 = ${t0}, t1 = ${t1} where id = ${sp.id}`;
       }
       // Spans kept from an earlier partition (not re-emitted) written before `canons` existed: fill them in.
       for (const r of await tx`select id, keys from span where source = ${source} and canons = '{}' and cardinality(keys) > 0`)
