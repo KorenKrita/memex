@@ -274,7 +274,7 @@ export async function runL3(db: Db, job: Job) {
         await dropStale(tx, x.src, x.rec);
       }
       const stmts = chk.stmts.filter((x) => mine.has(x.cand.id));
-      await renew(tx, job.key, c.span.input_fp, c.deps, c.scopes);
+      await renew(tx, job.key, c.span.input_fp, c.deps, c.scopes, stmts.map((x) => x.scope));
       await planAndInsert(tx, stmts, job.key, c.span.input_fp, c.deps, c.scopes, model);
     });
   }
@@ -299,9 +299,22 @@ async function planAndInsert(tx: Tx, stmts: NewStmt[], span: string, inputFp: st
   }
 }
 
-/** Statements made from exactly this input (span and fingerprint) get the vector it was just checked under. */
-const renew = (tx: Tx, span: string, inputFp: string, deps: Record<string, number>, scopes: string[]) =>
-  tx`update l3_stmt set deps = ${deps}, scopes = ${tx.array([...scopes].sort(), "text")} where span = ${span} and input_fp = ${inputFp}`;
+/** Statements made from exactly this input (span and fingerprint) get the vector it was just checked under; every
+ *  pair they make in their scopes that has no judgment yet is queued again (a pair job that met one of them while
+ *  it was passingly unreadable — a collector conflict since resolved — finished without judging). */
+async function renew(tx: Tx, span: string, inputFp: string, deps: Record<string, number>, scopes: string[], lockAlso: string[] = []) {
+  // Every scope lock this transaction takes (here and in a following planAndInsert), once, in one sorted order.
+  const held = (await tx`select distinct scope from l3_stmt where span = ${span} and input_fp = ${inputFp}`).map((r: any) => r.scope as string);
+  for (const s of [...new Set([...held, ...lockAlso])].sort()) await tx`select pg_advisory_xact_lock(hashtextextended(${"l3:" + s}, 0))`;
+  const mine = await tx`update l3_stmt set deps = ${deps}, scopes = ${tx.array([...scopes].sort(), "text")}
+                        where span = ${span} and input_fp = ${inputFp} returning id, scope`;
+  for (const s of [...new Set<string>(mine.map((r: any) => r.scope))].sort()) {
+    const all = (await tx`select id from l3_stmt where scope = ${s}`).map((r: any) => r.id as string);
+    const judged = new Set((await tx`select key from l3_rel where a = any(${tx.array(all, "text")})`).map((r: any) => r.key as string));
+    for (const a of mine.filter((r: any) => r.scope === s).map((r: any) => r.id as string))
+      for (const b of all) if (b !== a && !judged.has(pairKey(a, b))) await enqueue(tx, "l3pair", pairKey(a, b));
+  }
+}
 
 /** A claim's statements once its input moved: unreadable for good, removed with their relations. */
 async function dropStale(tx: Tx, src: string, rec: string) {

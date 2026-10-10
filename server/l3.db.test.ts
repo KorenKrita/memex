@@ -655,6 +655,38 @@ test("a pair job meeting a statement whose vector is only stale waits and is jud
   expect(await texts()).toEqual(["PREF TOPICpm NEW use pnpm"]);
 });
 
+test("a pair job meeting a record in a passing collector conflict: the pair is still judged once the collectors agree again", async () => {
+  const turns: [string, string, string][] = [["PREF TOPICpm use npm", "ok", T0], ["PREF TOPICpm NEW use pnpm", "ok", T1], ["last", "ok", T2]];
+  const s = await put("a", turns);
+  await drain(db, ["project", "summarize", "embed", "l3"]); // the pair is queued, not judged
+  expect((await db`select count(*)::int n from job where kind = 'l3pair' and state = 'queued'`)[0].n).toBe(1);
+  // A second collector uploads another version of A's record: the record is in conflict.
+  const decl = { source: s.source, harness: "pi" as const, nativeId: "a", scope: "personal", parent: null, meta: { repo: "repo-a" } };
+  const up = async (collector: string, lines: string[]) => {
+    const l = await requestLease(db, decl, collector);
+    await tryGrant(db, l);
+    expect((await commit(db, { leaseId: l, commitId: `c${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: pos === 0 ? "header" : JSON.parse(raw).id, hash: sha(raw), raw })) })).ok).toBe(true);
+  };
+  // Conflict on the record whose statement is checked first (pair members are read in id order), so the pair
+  // job sees the conflict itself, not only a version moved by it.
+  const ids = (await db`select id, rec from l3_stmt order by id`) as any[];
+  const pos = s.lines.findIndex((x) => x !== s.lines[0] && JSON.parse(x).id === ids[0].rec);
+  const other = [...s.lines];
+  other[pos] = JSON.stringify({ ...JSON.parse(other[pos]), message: { ...JSON.parse(other[pos]).message, content: [{ type: "text", text: "other copy" }] } });
+  await up("m2", other);
+  expect((await db`select state from record where source = ${s.source} and rec = ${ids[0].rec}`)[0].state).toBe("conflict");
+  await drain(db, ["l3pair"]); // the pair meets the conflicting record
+  await up("m2", s.lines); // the collectors agree again, before any projection
+  expect((await db`select state from record where source = ${s.source} and rec = ${ids[0].rec}`)[0].state).toBe("ok");
+  for (let i = 0; i < 3; i++) {
+    await drain(db);
+    await db`update job set not_before = now() where state = 'queued'`;
+  }
+  await drain(db);
+  expect((await db`select count(*)::int n from l3_rel`)[0].n).toBe(1);
+  expect(await texts()).toEqual(["PREF TOPICpm NEW use pnpm"]);
+});
+
 test("an upgrade from statements without generation data: they are read again, not stranded", async () => {
   await put("a", [["PREF TOPICpm use pnpm", "ok", T0]]);
   await drain(db);
