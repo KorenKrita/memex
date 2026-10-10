@@ -175,7 +175,8 @@ export function readRange(path: string, harness: Harness, o: { from: number; bou
     if (!r.ok) return r;
     const to = o.from + end;
     let eof = true;
-    for (let at = to; at < size && eof; at += 64 * 1024) if (read(at, 64 * 1024).includes(0x0a)) eof = false;
+    // Bounded probe: a complete line past `to` within MAX_LINE (a line longer than that is never a record).
+    for (let at = to; at < Math.min(size, to + MAX_LINE + 1) && eof; at += 64 * 1024) if (read(at, 64 * 1024).includes(0x0a)) eof = false;
     const last = stop >= Math.min(o.bound, size);
     return { ok: true, prev, records: r.records, ends: r.ends, to, eof, last } as const;
   } finally {

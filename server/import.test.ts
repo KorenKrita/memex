@@ -1,7 +1,7 @@
 // History import (DESIGN §5.4) end to end over HTTP against a real Postgres (MEMEX_PG_URL, a throwaway
 // database: tests truncate it).
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, migrate, type Db } from "./db.ts";
@@ -72,6 +72,35 @@ test("the plan covers only scopes allowed to import, sorted by harness, filtered
   expect(recent.pi.map((f) => f.path.split("/").pop())).toEqual(["new.jsonl"]);
 });
 
+test("the plan reads the whole header: a Codex header with timestamp first is found; symlinked dirs are not followed", async () => {
+  const p = join(codexDir, "rollout-ts.jsonl");
+  writeFileSync(p, JSON.stringify({ timestamp: "2026-01-01T00:00:00Z", type: "session_meta", ordinal: 0,
+                                    payload: { id: "c-ts", history_mode: "paginated", cwd: "/x", note: "x".repeat(2000) } }) + "\n");
+  const outside = mkdtempSync(join(tmpdir(), "memex-import-outside-"));
+  pi(outside, "linked", 2, 1);
+  symlinkSync(outside, join(piDir, "link"));
+  const plan = importPlan(policy);
+  expect(plan.codex.map((f) => f.path.split("/").pop())).toEqual(["rollout-ts.jsonl"]);
+  expect(plan.pi).toEqual([]);
+});
+
+test("an import round sends only what import allows now, and an item left out of a later plan stays pending", async () => {
+  const a = pi(piDir, "ia", 3, 1);
+  pi(piDir, "ib", 3, 2);
+  const plan = importPlan(policy);
+  // The policy loses import for this scope after the plan was made: nothing is sent for it.
+  const narrowed: Policy = { scopes: [{ ...policy.scopes[0], allow: { sync: ["memex"] } }, policy.scopes[1]] };
+  const calls: string[] = [];
+  const t: Transport = async (m, path, body) => (calls.push(path), transport(base, key)(m, path, body));
+  expect(await importFiles(t, narrowed, plan, { machine: "mac" })).toEqual({});
+  expect(calls).toEqual([]);
+  // A round over both files, then a run with only one of them: the other is not closed as missing.
+  const r = await importFiles(transport(base, key), policy, { pi: [plan.pi[0], plan.pi[1]], codex: [] }, { machine: "mac", maxRecs: 1, maxIdle: 1 });
+  expect(r.pi?.total).toBe(2);
+  await importFiles(transport(base, key), policy, { pi: plan.pi.filter((f) => f.path === a), codex: [] }, { machine: "mac" });
+  expect((await db`select count(*)::int n from scan_item where reason = 'missing' or reason = 'not-listed'`)[0].n).toBe(0);
+});
+
 test("dry run: local statistics, no request", async () => {
   pi(piDir, "a", 4, 1);
   codex("c2", 3, 1);
@@ -112,6 +141,10 @@ test("a file that keeps failing does not hang the import: it stops and reports w
   pi(piDir, "bad", 3, 1);
   const t: Transport = async (m, path, body: any) => {
     if (path === "/v1/sync/lease" && body?.nativeId === "s-bad") throw new Error("503 busy");
+    if (path === "/v1/sync/batch/lease") {
+      const r = await transport(base, key)(m, path, body);
+      return { results: r.results.map((x: any, i: number) => (body.requests[i].nativeId === "s-bad" ? { error: "503 busy" } : x)) };
+    }
     return transport(base, key)(m, path, body);
   };
   const r = await importFiles(t, policy, importPlan(policy), { machine: "mac", maxIdle: 3 });

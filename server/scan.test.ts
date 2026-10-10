@@ -8,12 +8,12 @@ import { connect, migrate, type Db } from "./db.ts";
 import { addApiKey, serve, transport } from "./http.ts";
 import { scanConfig } from "./sync.ts";
 import { fileKey, scanOnce, scanSegment, syncFile, type ScanItem, type Transport } from "../client/sync.ts";
-import { sourceIdOf } from "../client/records.ts";
+import { readSession, sourceIdOf } from "../client/records.ts";
 import type { Policy } from "../client/policy.ts";
 
 let db: Db, server: Awaited<ReturnType<typeof serve>>, key: string, base: string;
 const dir = mkdtempSync(join(tmpdir(), "memex-scan-"));
-const policy: Policy = { scopes: [{ name: "personal", paths: [dir], allow: { sync: ["memex"] } }] };
+const policy: Policy = { scopes: [{ name: "personal", paths: [dir], allow: { sync: ["memex"], import: ["memex"] } }] };
 
 beforeAll(async () => {
   db = connect();
@@ -139,6 +139,44 @@ test("a rewrite before the scanned point restarts the item; the round then uploa
   expect(h.raw).toContain("TEXT 254");
 });
 
+test("a record removed from the prefix: after the round, the copy is the file, position by position", async () => {
+  const p = piFile("del", 599);
+  await syncFile(t(), policy, p, "pi", { collector: "m1" });
+  const lines = readFileSync(p, "utf8").split("\n");
+  lines.splice(11, 1); // e10 goes; e11.. move up one
+  writeFileSync(p, lines.join("\n"));
+  const { round } = await open([p]);
+  for (let i = 0; i < 10 && (await item(round, p)).state === "pending"; i++) {
+    const [x] = (await t()("POST", "/v1/scan/next", { round, limit: 50 })).items as ScanItem[];
+    await seg(t(), p, round, x);
+  }
+  expect(await item(round, p)).toMatchObject({ state: "done" });
+  const local = (readSession(p, "pi") as any).records.map((r: any, pos: number) => `${pos}:${r.id}:${r.hash}`);
+  const remote = (await db`select pos, rec, hash from projection where source = ${sourceIdOf("pi", "s-del")} and collector = 'm1' order by pos`)
+    .map((r: any) => `${r.pos}:${r.rec}:${r.hash}`);
+  expect(remote).toEqual(local);
+});
+
+test("a refused record leaves a hole: segments past it still compare by position, the round finishes, nothing is resent twice", async () => {
+  const p = piFile("hole", 599);
+  const src = sourceIdOf("pi", "s-hole");
+  await db`insert into tomb (key) values (${"canon:" + src + ":e300"})`;
+  expect(await syncFile(t(), policy, p, "pi", { collector: "m1" })).toMatchObject({ status: "synced", refused: 1 });
+  const { round } = await open([p]);
+  const sent: number[] = [];
+  for (let i = 0; i < 10 && (await item(round, p)).state === "pending"; i++) {
+    const [x] = (await t()("POST", "/v1/scan/next", { round, limit: 50 })).items as ScanItem[];
+    const r: any = await seg(t(), p, round, x);
+    sent.push(r.sent ?? -1);
+  }
+  expect(await item(round, p)).toMatchObject({ state: "done", done_recs: 600 });
+  expect(sent).toEqual([0, 1, 0]); // only the refused record is offered again (and refused again)
+  const remote = (await db`select pos, rec from projection where source = ${src} and collector = 'm1' order by pos`).map((r: any) => `${r.pos}:${r.rec}`);
+  expect(remote).toHaveLength(599);
+  expect(remote).not.toContain("301:e300");
+  expect(remote.at(-1)).toBe("599:e598");
+});
+
 test("a cold file rewritten in place (mtime kept, same length) is found by the next round", async () => {
   const p = piFile("cold", 10);
   await syncFile(t(), policy, p, "pi", { collector: "m1" });
@@ -159,6 +197,10 @@ test("a hot file that keeps failing does not starve a cold one", async () => {
   const hotSrc = sourceIdOf("pi", "s-hot");
   const tr: Transport = async (m, path, body: any) => {
     if (path === "/v1/sync/lease" && body?.source === hotSrc) throw new Error("503 busy");
+    if (path === "/v1/sync/batch/lease") {
+      const r = await t()(m, path, body);
+      return { results: r.results.map((x: any, i: number) => (body.requests[i].source === hotSrc ? { error: "503 busy" } : x)) };
+    }
     return t()(m, path, body);
   };
   const files = [{ path: hot, harness: "pi" as const }, { path: cold, harness: "pi" as const }];

@@ -5,58 +5,48 @@
 // if its `allow.import` lists "memex" (on top of `allow.sync`); `--dry-run` only counts locally (no network,
 // no model) with the phase 0 statistics. The import is the reconciliation link's third entry (§5.2): an
 // import round per collector (machine + harness), newest files first, resumable (progress is on the server).
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { hostname } from "node:os";
-import { join } from "node:path";
-import { dryRun } from "../dryrun/dryrun.ts";
+import { collect, dryRun } from "../dryrun/dryrun.ts";
+import { fromEnv } from "./api.ts";
 import { allowed, loadPolicy, scopeOf, type Policy } from "./policy.ts";
-import type { Harness } from "./records.ts";
+import { readHead, type Harness } from "./records.ts";
 import { scanOnce, type ScanFile, type Transport } from "./sync.ts";
 
 const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 /** Collector of this machine for a harness: what the plugins report as well (§5.2: machine + host). */
 export const collectorOf = (machine: string, harness: Harness) => `${machine}:${harness}`;
 
-/** Harness of a log from its first line (Pi header `session`, Codex `session_meta`), or undefined. */
+/** Harness of a log from its header line (whole line parsed: key order does not matter), or undefined. A
+ *  Codex Legacy or child-thread file is still Codex: its round item is closed with that reason. */
 function harnessOf(path: string): Harness | undefined {
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, "r");
-    const b = Buffer.alloc(512);
-    const s = b.subarray(0, readSync(fd, b, 0, b.length, 0)).toString("utf8");
-    const m = /^\{\s*"type"\s*:\s*"(session|session_meta)"/.exec(s);
-    return m ? (m[1] === "session" ? "pi" : "codex") : undefined;
-  } catch {
-    return undefined;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
+  for (const h of ["pi", "codex"] as const) {
+    const r = readHead(path, h);
+    if (r.ok || r.reason === "legacy" || r.reason === "child-thread") return h;
   }
+  return undefined;
 }
 
-/** Files to import: logs under the scopes allowed to import (and sync), modified since `since`, newest first. */
+/** Files to import: logs under the scopes allowed to import (and sync), modified since `since`, newest first.
+ *  Discovery is the phase 0 one (dryrun::collect): regular files only, symlinks never followed, real paths. */
 export function importPlan(policy: Policy, o: { since?: number } = {}) {
   const out: Record<Harness, (ScanFile & { mtime: number })[]> = { pi: [], codex: [] };
-  const seen = new Set<string>();
-  const walk = (p: string) => {
-    let st;
-    try {
-      st = statSync(p);
-    } catch {
-      return;
-    }
-    if (st.isDirectory()) {
-      for (const n of readdirSync(p).sort()) walk(join(p, n));
-      return;
-    }
-    if (!st.isFile() || !p.endsWith(".jsonl") || PI_SUBAGENT.test(p) || seen.has(p)) return;
-    seen.add(p);
+  const roots = policy.scopes.filter((s) => s.allow?.import?.includes("memex")).flatMap((s) => s.paths);
+  const { files } = collect(roots);
+  for (const p of files) {
+    if (!p.endsWith(".jsonl") || PI_SUBAGENT.test(p)) continue;
     const scope = scopeOf(policy, p);
-    if (!allowed(policy, scope, "import", "memex") || !allowed(policy, scope, "sync", "memex")) return;
-    if (o.since !== undefined && st.mtimeMs < o.since) return;
+    if (!allowed(policy, scope, "import", "memex") || !allowed(policy, scope, "sync", "memex")) continue;
+    let mtime: number;
+    try {
+      mtime = statSync(p).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (o.since !== undefined && mtime < o.since) continue;
     const h = harnessOf(p);
-    if (h) out[h].push({ path: p, harness: h, mtime: st.mtimeMs });
-  };
-  for (const s of policy.scopes) if (s.allow?.import?.includes("memex")) for (const p of s.paths) walk(p);
+    if (h) out[h].push({ path: p, harness: h, mtime });
+  }
   for (const h of ["pi", "codex"] as const) out[h].sort((a, b) => b.mtime - a.mtime);
   return out;
 }
@@ -77,16 +67,15 @@ export async function importFiles(t: Transport, policy: Policy, plan: ReturnType
   const res: Partial<Record<Harness, Summary>> = {};
   for (const h of ["pi", "codex"] as const) {
     if (!plan[h].length) continue;
-    let idle = 0, last = "";
+    let idle = 0;
     for (;;) {
       const r: any = await scanOnce(t, policy, plan[h], { collector: collectorOf(o.machine, h), kind: "import", maxRecs: o.maxRecs });
       if (r.round === null) break;
       res[h] = { finished: r.finished, total: r.total, done: r.done, skipped: r.skipped, pending: r.pending };
       log(`${h}: ${r.done + r.skipped}/${r.total} (${r.skipped} skipped)`);
       if (r.finished) break;
-      const at = `${r.done}/${r.skipped}/${r.pending}`;
-      idle = at === last ? idle + 1 : 0;
-      last = at;
+      // Progress = accepted segments (a large file advances many segments before it is done).
+      idle = r.advanced ? 0 : idle + 1;
       if (idle >= (o.maxIdle ?? 20)) break;
     }
   }
@@ -95,7 +84,7 @@ export async function importFiles(t: Transport, policy: Policy, plan: ReturnType
 
 if (import.meta.main) {
   const [cmd, ...args] = process.argv.slice(2);
-  const t: Transport = (await import("../server/http.ts")).transport(process.env.MEMEX_URL ?? "", process.env.MEMEX_KEY ?? "");
+  const t: Transport = fromEnv() ?? (async () => { throw new Error("MEMEX_URL and MEMEX_KEY"); });
   const machine = process.env.MEMEX_MACHINE ?? hostname();
   if (cmd === "import") {
     const days = args.includes("--since") ? Number(args[args.indexOf("--since") + 1]) : undefined;

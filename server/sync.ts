@@ -179,21 +179,33 @@ export async function scanStatus(db: Db, collector: string) {
 export async function manifest(db: Db, leaseId: number) {
   const l = await validLease(db, leaseId);
   if (!l) throw new HttpError(409, "lease not held");
-  const rows = await db`select rec as id, hash from projection where source = ${l.source} and collector = ${l.collector} order by pos`;
-  const blocks = blockHashes(rows);
+  const rows = await db`select pos, rec as id, hash from projection where source = ${l.source} and collector = ${l.collector} order by pos`;
+  // Blocks by position: block b covers positions [b*CHUNK, (b+1)*CHUNK); a position the copy does not hold (a
+  // refused record) is a hole, so the block cannot equal a local block whose record there exists. `length` is
+  // one past the last held position.
+  const length = rows.length ? rows[rows.length - 1].pos + 1 : 0;
+  const byBlock: { id: string; hash: string }[][] = [];
+  for (const r of rows) (byBlock[Math.floor(r.pos / CHUNK)] ??= []).push(r);
+  const blocks: string[] = [];
+  for (let b = 0; b * CHUNK < length; b++) {
+    const rs = byBlock[b] ?? [];
+    const full = rs.length === Math.min(CHUNK, length - b * CHUNK);
+    blocks.push(full ? blockHashes(rs)[0] : "hole");
+  }
   const lastStart = Math.max(0, (blocks.length - 1) * CHUNK);
   // The leaf this collector last reported (null: none, or reported as none): a leaf-only change still commits.
   const [v] = await db`select leaf from collector_view where source = ${l.source} and collector = ${l.collector}`;
-  return { length: rows.length, chunk: CHUNK, blocks, last: { start: lastStart, records: rows.slice(lastStart) }, leaf: v ? v.leaf : undefined };
+  return { length, chunk: CHUNK, blocks, last: { start: lastStart, records: rows.filter((r: any) => r.pos >= lastStart) }, leaf: v ? v.leaf : undefined };
 }
 
 /** Records of the given blocks, for the slow path (a block hash differs). */
 export async function blockRecords(db: Db, leaseId: number, blocks: number[]) {
   const l = await validLease(db, leaseId);
   if (!l) throw new HttpError(409, "lease not held");
-  const out: Record<number, { id: string; hash: string }[]> = {};
+  // Each row carries its position: a copy may have holes (a refused record, a segment that moved a record).
+  const out: Record<number, { pos: number; id: string; hash: string }[]> = {};
   for (const b of blocks.slice(0, 64))
-    out[b] = await db`select rec as id, hash from projection where source = ${l.source} and collector = ${l.collector}
+    out[b] = await db`select pos, rec as id, hash from projection where source = ${l.source} and collector = ${l.collector}
                       and pos >= ${b * CHUNK} and pos < ${(b + 1) * CHUNK} order by pos`;
   return out;
 }
@@ -302,6 +314,8 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
       [item] = await tx`select i.state, i.done_recs, i.done_bytes, i.bound, i.source from scan_item i join scan_round r on r.id = i.round
                         where i.round = ${s.round} and i.key = ${s.key} and r.collector = ${l.collector} for update of i`;
       const stale = !item || item.state !== "pending" || item.done_recs !== s.fromRec || Number(item.done_bytes) !== s.fromByte;
+      // The range stays within the round's bound: growth past it is the next round's (live sync has the tail).
+      if (!stale && s.toByte > Number(item.bound)) return { ok: false, reason: "bad-request", detail: "scan range past the round's bound" } as const;
       let restart = false;
       if (!stale && item.source && item.source !== l.source) restart = true;
       else if (!stale && s.fromRec > 0) {
@@ -395,7 +409,9 @@ export async function commit(db: Db, c: Commit): Promise<CommitResult> {
     let scan: { state: string; doneRecs: number } | undefined;
     if (s) {
       // Done when the checked range reaches the round's bound: the bound itself, nothing complete before it
-      // (`last`: it falls inside a line still being written), or the end of the file.
+      // (`last`: it falls inside a line still being written), or the end of the file. `last` and `eof` are
+      // the collector's reading of its own file (the server never sees the file); what the server holds it
+      // to is the range: from the accepted point, within the bound, continuous with the copy (prev).
       const state = s.toByte >= Number(item.bound) || s.last === true || s.eof ? "done" : "pending";
       await tx`update scan_item set done_recs = ${s.toRec}, done_bytes = ${s.toByte}, source = ${l.source}, state = ${state}, reason = null
                where round = ${s.round} and key = ${s.key}`;

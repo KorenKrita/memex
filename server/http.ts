@@ -69,6 +69,30 @@ route("POST", /^\/v1\/sync\/lease\/(\d+)\/commit$/, async (db, b, p) =>
     leaf: b.leaf === undefined ? undefined : b.leaf === null ? null : String(b.leaf),
   }));
 
+// Batched forms of the lease steps (DESIGN §5.4: an import does not take one round trip per file). Each entry
+// runs exactly as its single route, in its own transaction; one entry's error does not stop the others.
+const MAX_BATCH = 64;
+const each = async (list: unknown, fn: (x: any) => Promise<unknown>) => {
+  if (!Array.isArray(list) || list.length > MAX_BATCH) throw new HttpError(400, `a list of at most ${MAX_BATCH}`);
+  const out: unknown[] = [];
+  for (const x of list)
+    try {
+      out.push(await fn(x));
+    } catch (e) {
+      if (!(e instanceof HttpError)) throw e;
+      out.push({ error: `${e.status} ${e.message}` });
+    }
+  return { results: out };
+};
+const leaseRoute = routes.find(([m, re]) => m === "POST" && re.source === "^\\/v1\\/sync\\/lease$")![2];
+const commitRoute = routes.find(([m, re]) => m === "POST" && re.source === "^\\/v1\\/sync\\/lease\\/(\\d+)\\/commit$")![2];
+route("POST", /^\/v1\/sync\/batch\/lease$/, async (db, b) => each(b.requests, (x) => leaseRoute(db, x ?? {}, [], null as any)));
+route("POST", /^\/v1\/sync\/batch\/poll$/, async (db, b) => each(b.leases, (id) => tryGrant(db, Number(id))));
+route("POST", /^\/v1\/sync\/batch\/release$/, async (db, b) => each(b.leases, async (id) => (await releaseLease(db, Number(id)), { ok: true })));
+route("POST", /^\/v1\/sync\/batch\/blocks$/, async (db, b) =>
+  each(b.requests, (x) => blockRecords(db, Number(x?.lease), Array.isArray(x?.blocks) ? x.blocks.filter((y: unknown) => Number.isInteger(y) && (y as number) >= 0) : [])));
+route("POST", /^\/v1\/sync\/batch\/commit$/, async (db, b) => each(b.commits, (x) => commitRoute(db, x?.body ?? {}, [String(x?.lease)], null as any)));
+
 route("POST", /^\/v1\/scan\/open$/, async (db, b) => openRound(db, b));
 route("POST", /^\/v1\/scan\/next$/, async (db, b) => nextItems(db, b));
 route("POST", /^\/v1\/scan\/skip$/, async (db, b) => markItem(db, b, "skip"));
@@ -204,16 +228,5 @@ export function serve(db: Db, opts: { port: number; hostname?: string }) {
   return Promise.resolve({ port: server.port as number, stop: async () => void (await server.stop(true)) });
 }
 
-/** Client transport for tests and plugins: JSON over fetch with the API key. */
-export function transport(base: string, key: string, f: typeof fetch = fetch) {
-  return async (method: string, path: string, body?: unknown) => {
-    const r = await f(base + path, {
-      method,
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
-    });
-    const j: any = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(`${r.status} ${j.error ?? ""}`.trim());
-    return j;
-  };
-}
+/** Client transport (client/api.ts), re-exported for the server tests. */
+export { transport } from "../client/api.ts";
