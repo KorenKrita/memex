@@ -315,24 +315,18 @@ async function scanBatch(t: Transport, policy: Policy, jobs: Job[],
   return out;
 }
 
-/** Scan calls until the round is finished, nothing moved (every pending item failing: tried again next time),
- *  no round is due, or the deadline. The plugins call this at session start and on later lifecycle events:
- *  the server keeps the progress and only opens a new auto round once its interval has passed. */
+/** Scan calls until the round is finished, every pending item was tried in this run (failing ones stay pending,
+ *  tried again next run), no round is due, or the deadline. The plugins call this at session start and on later
+ *  lifecycle events: the server keeps the progress and only opens a new auto round once its interval has passed,
+ *  so what one run's budget does not reach is continued by the next. */
 export async function scanAll(t: Transport, policy: Policy, files: ScanFile[],
                               opts: { collector: string; kind?: "auto" | "import"; limit?: number; deadlineMs?: number }) {
   const deadline = Date.now() + (opts.deadlineMs ?? 60_000);
-  let r: Awaited<ReturnType<typeof scanOnce>>;
-  // A call that moves nothing only tells about the page it took (the least-tried pending items): failing ones
-  // count a try and sink, so the next page holds others. It stops once a whole pass over what is pending moved
-  // nothing — every pending item was tried and failed (tried again next run).
-  let still = 0, closed = -1;
+  const tried = new Set<string>();
   for (;;) {
-    r = await scanOnce(t, policy, files, { ...opts, deadlineMs: Math.max(1, deadline - Date.now()) });
-    if (r.round === null || r.finished || Date.now() >= deadline) return r;
-    const now = r.done + r.skipped;
-    still = r.advanced > 0 || now !== closed ? 0 : still + 1;
-    closed = now;
-    if (still >= Math.ceil(r.pending / (opts.limit ?? 50))) return r;
+    const r = await scanOnce(t, policy, files, { ...opts, exclude: [...tried], deadlineMs: Math.max(1, deadline - Date.now()) });
+    if (r.round === null || r.finished || Date.now() >= deadline || !r.tried.length) return r;
+    for (const k of r.tried) tried.add(k);
   }
 }
 
@@ -341,7 +335,8 @@ export type ScanFile = { path: string; harness: Harness };
  *  open one), then run segments on at most `limit` pending items until `deadlineMs`. Call again to go on;
  *  a new auto round opens only once the server's interval has passed since the last one finished. */
 export async function scanOnce(t: Transport, policy: Policy, files: ScanFile[],
-                               opts: { collector: string; kind?: "auto" | "import"; limit?: number; deadlineMs?: number; maxRecs?: number }) {
+                               opts: { collector: string; kind?: "auto" | "import"; limit?: number; deadlineMs?: number; maxRecs?: number;
+                                       exclude?: string[] }) {
   const deadline = Date.now() + (opts.deadlineMs ?? 10_000);
   const kind = opts.kind ?? "auto";
   const ok = (p: string) => {
@@ -365,7 +360,7 @@ export async function scanOnce(t: Transport, policy: Policy, files: ScanFile[],
   // An item this call has no file for: an auto round lists every authorized file each time, so the file is
   // gone or no longer authorized and the item is closed as not-listed (otherwise the round never ends). An
   // import plan may be a subset (--since), so there the item is left pending: not listing it is no evidence.
-  const { items } = await t("POST", "/v1/scan/next", { round, limit: opts.limit ?? 50 }, d);
+  const { items } = await t("POST", "/v1/scan/next", { round, limit: opts.limit ?? 50, exclude: opts.exclude ?? [] }, d);
   let advanced = 0;
   // Live items: the ones with a file here whose header can be read (identity for the lease request).
   type Live = { it: ScanItem; f: ScanFile; restarts: number; decl: object; head: Head };
@@ -405,5 +400,5 @@ export async function scanOnce(t: Transport, policy: Policy, files: ScanFile[],
   }
   const c = await t("POST", "/v1/scan/next", { round, limit: 0 }, { deadline: Math.max(deadline, Date.now() + 2_000) });
   return { round, finished: c.finished as boolean, total: c.total as number, done: c.done as number, skipped: c.skipped as number,
-           pending: c.pending as number, advanced };
+           pending: c.pending as number, advanced, tried: (items as ScanItem[]).map((i) => i.key) };
 }

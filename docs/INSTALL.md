@@ -91,8 +91,10 @@ What it does:
 - Syncs the session file on `turn_end`, `session_tree`, `session_compact` and `session_shutdown`.
 - Scans this machine's authorized Pi logs in the background to reconcile missed syncs: 2 s after start
   (`MEMEX_SCAN_DELAY_MS`; negative turns it off), then again after a turn at most every 10 minutes
-  (`MEMEX_SCAN_EVERY_MS`). Each run continues the server-side round until it is finished; the server opens a
-  new round only once its interval (`MEMEX_SCAN_INTERVAL_MS`, 1 h) has passed.
+  (`MEMEX_SCAN_EVERY_MS`). Each run works through the server-side round within its budget (60 s), trying every
+  pending file once; what fails or does not fit is left for the next run. The server opens a new round only
+  once its interval (`MEMEX_SCAN_INTERVAL_MS`, 1 h) has passed. The Codex plugin runs the same at
+  `SessionStart` and `Stop`.
 - Puts the start-of-session snapshot in the system prompt.
 - Recalls once per user input. The recall goes on that message in what the model sees (never into the
   session file) and is replayed as frozen on later turns.

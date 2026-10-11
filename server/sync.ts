@@ -142,8 +142,10 @@ const counts = async (q: Db | Tx, round: number) => {
 export async function nextItems(db: Db, b: any) {
   const round = Number(b.round), limit = Math.min(Math.max(Number.isInteger(b.limit) ? b.limit : 50, 0), 200);
   if (!Number.isSafeInteger(round)) throw new HttpError(400, "round");
+  // exclude: keys the caller already tried in this run (its next page holds only others).
+  const ex = (Array.isArray(b.exclude) ? b.exclude : []).filter((k: unknown) => typeof k === "string").slice(0, scanConfig.maxFiles);
   const items = await db`select key, bound, done_recs, done_bytes, tries from scan_item where round = ${round} and state = 'pending'
-                         order by tries, ord limit ${limit}`;
+                         and not (key = any(${db.array(ex, "text")})) order by tries, ord limit ${limit}`;
   return { items: items.map((i: any) => ({ key: i.key, bound: Number(i.bound), doneRecs: i.done_recs, doneBytes: Number(i.done_bytes), tries: i.tries })),
            ...(await counts(db, round)) };
 }

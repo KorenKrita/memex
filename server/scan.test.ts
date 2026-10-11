@@ -295,3 +295,35 @@ test("scanAll goes past a page whose files all fail to an untried healthy file",
   expect((await db`select state from scan_item where key = ${fileKey(good)}`)[0].state).toBe("done");
   expect(r.finished).toBe(false); // the failing ones stay pending, tried again next run
 });
+
+test("scanAll reaches a healthy file with many past tries behind failing files with none", async () => {
+  const { scanAll } = await import("../client/sync.ts");
+  const bad = [piFile("ufail0", 2), piFile("ufail1", 2)], good = piFile("ugood", 2);
+  const badSrc = new Set(["s-ufail0", "s-ufail1"].map((n) => sourceIdOf("pi", n)));
+  const tr: Transport = async (m, path, body, o) => {
+    const r = await t()(m, path, body, o);
+    if (path !== "/v1/sync/batch/lease") return r;
+    return { results: r.results.map((x: any, i: number) => (badSrc.has((body as any).requests[i].source) ? { error: "503 busy" } : x)) };
+  };
+  const files = [...bad, good].map((path) => ({ path, harness: "pi" as const }));
+  const { round } = await t()("POST", "/v1/scan/open", { collector: "m-uneven", kind: "auto",
+    files: files.map((f) => ({ key: fileKey(f.path), size: statSync(f.path).size, mtime: statSync(f.path).mtimeMs })) });
+  await db`update scan_item set tries = 10 where round = ${round} and key = ${fileKey(good)}`; // tries [0, 0, 10]
+  await scanAll(tr, policy, files, { collector: "m-uneven", limit: 2, deadlineMs: 20_000 });
+  expect((await db`select state from scan_item where key = ${fileKey(good)}`)[0].state).toBe("done");
+});
+
+test("scanAll goes past a page that was all skipped to a healthy file", async () => {
+  const { scanAll } = await import("../client/sync.ts");
+  const junk = [0, 1].map((i) => {
+    const p = join(dir, `junk${i}.jsonl`);
+    writeFileSync(p, "not a session\n");
+    return p;
+  });
+  const good = piFile("sgood", 2);
+  for (const p of junk) writeFileSync(p, readFileSync(p)); // newest: first in the round's order
+  const files = [...junk, good].map((path) => ({ path, harness: "pi" as const }));
+  const r: any = await scanAll(t(), policy, files, { collector: "m-skip", limit: 2, deadlineMs: 20_000 });
+  expect((await db`select state from scan_item where key = ${fileKey(good)}`)[0].state).toBe("done");
+  expect(r.finished).toBe(true);
+});
