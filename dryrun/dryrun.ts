@@ -760,6 +760,18 @@ export function codexTextOf(line: Record<string, any>, kind: "user" | "assistant
   return codexRecordsInner(line, emptyResult(""), new Map(), {}).filter((r) => r.kind === kind).map((r) => r.text).join("");
 }
 
+/** A Codex user line's prompt as its hook saw it (UserMessageItem::message(): text parts joined with nothing),
+ *  from the user fragments the index keeps (context and memory blocks left out); undefined when one of them
+ *  lost text to memory stripping (then the prompt is not what the index holds). */
+export function codexPromptOf(line: Record<string, any>): string | undefined {
+  if (line.type !== "response_item" || line.payload?.type !== "message" || line.payload.role !== "user") return undefined;
+  const ex: Tally = {};
+  const { user } = codexFragments(line.payload, ex);
+  const kept = user.map((u) => stripMemory(u, ex));
+  // stripMemory also trims: a fragment counts as stripped only when more than its edge whitespace went.
+  return kept.some((k, i) => k !== user[i].trim()) ? undefined : user.join("");
+}
+
 function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<string, string>): Rec[] {
   return perRecord(res, (ex) => codexRecordsInner(line, res, calls, ex)).map((r, j) => ({ ...r, key: `${line.ordinal}#${j}` }));
 }

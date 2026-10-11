@@ -22,7 +22,7 @@ import { BARRIER, HttpError, copyTombsOf } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 import { canonOf, load } from "./project.ts";
-import { contentHash, looseOf } from "../dryrun/dryrun.ts";
+import { codexPromptOf, contentHash, looseOf } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
 const TAU = () => (process.env.MEMEX_RECALL_TAU ? Number(process.env.MEMEX_RECALL_TAU) : NaN); // [待标定] unset: not ready
@@ -174,10 +174,11 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const rows = await q`select key, text from lexical where source = any(${q.array(owners, "text")}) and key = any(${q.array(ks, "text")})
                                and kind = 'user' order by part`;
           // The indexed text joins a Codex message's parts with "\n"; a turn-bound input is the hook's serialization
-          // (parts joined with nothing): compared as that, on the record's current line.
+          // (parts joined with nothing): compared as that, on the record's current line, over the same user
+          // fragments the index keeps (context and memory blocks out), so nothing the index left out is sent.
           const text = r.turn
-            ? prompt(JSON.parse((await q`select b.raw from record x join body b on b.source = x.source and b.rec = x.rec and b.hash = x.hash
-                                         where x.source = ${r.source} and x.rec = ${self}`)[0]?.raw ?? "{}"))
+            ? codexPromptOf(JSON.parse((await q`select b.raw from record x join body b on b.source = x.source and b.rec = x.rec and b.hash = x.hash
+                                                where x.source = ${r.source} and x.rec = ${self}`)[0]?.raw ?? "{}")) ?? ""
             : ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
           if (text.trim() !== input) return { found: null, pin, stale: true };
         }

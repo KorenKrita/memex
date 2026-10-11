@@ -1271,6 +1271,32 @@ test("Codex turn binding: a readable multi-part prompt already uploaded is recal
   expect(d.state).toBe("shown");
 });
 
+test("Codex turn binding: a part the current line marks as context is not part of the input sent", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const line = (k2: string) => JSON.stringify({ timestamp: T, ordinal: 1, type: "response_item", payload: { type: "message", role: "user",
+    content: [{ type: "input_text", text: "zx-7781 first" }, { type: "input_text", text: " SECRET-CTX" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-rv", content_item_kinds: ["user.text", k2] } } });
+  await putCodex([cmeta, line("user.text")]);
+  await putCodex([cmeta, line("hooks.additional_context")]); // revised: the second part is context now
+  await drain(db);
+  calls = [];
+  const prompt = "zx-7781 first SECRET-CTX";
+  const d = await ask({ ...R(turnRec("turn-rv", prompt), prompt), source: csrc });
+  expect(d.state).toBe("query-stale");
+  expect(outbound()).not.toContain("SECRET-CTX");
+});
+
+test("Codex turn binding: a memex block inside the user's text is not sent as part of the input", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const prompt = "zx-7781 where <memex-recall>OLD-HINT</memex-recall>";
+  await putCodex([cmeta, cline(1, "user", prompt, "turn-mb")]);
+  await drain(db);
+  calls = [];
+  const d = await ask({ ...R(turnRec("turn-mb", prompt), prompt), source: csrc });
+  expect(d.state).toBe("query-stale");
+  expect(outbound()).not.toContain("OLD-HINT");
+});
+
 test("Codex turn binding: steering while the turn's first prompt is uploaded is a new input, recalled", async () => {
   await put("a", [["q", "ANSWER zx-7781"]]);
   await putCodex([cmeta, cline(1, "user", "zx-7781 first ask", "turn-st")]);
