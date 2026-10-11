@@ -8,7 +8,20 @@ Tested with: Pi 1.1.0, codex-cli 0.162.0-alpha.2, Bun 1.4.2, Postgres 17 with pg
 
 ## 1. Server
 
-Postgres 17 with the `vector` and `pg_trgm` extensions, then:
+With Docker (its own compose project and Postgres volume; the API on loopback only):
+
+```sh
+cp deploy/memex.env.example deploy/memex.env      # model endpoints; not committed
+export MEMEX_PG_PASSWORD=…                        # the database password, kept by you
+MEMEX_BIND_PORT=18787 docker compose -f deploy/compose.yaml up -d --build
+curl http://127.0.0.1:18787/healthz               # {"ok":true}
+docker compose -f deploy/compose.yaml exec api bun server/admin.ts key add laptop
+```
+
+Memory limits default to 384 MB (Postgres) and 256 MB (API); set `MEMEX_PG_MEM` / `MEMEX_API_MEM`. An empty
+model group in `memex.env` keeps that destination off.
+
+Without Docker: Postgres 17 with the `vector` and `pg_trgm` extensions, then:
 
 ```sh
 MEMEX_PG_URL=postgres://… MEMEX_HOST=127.0.0.1 MEMEX_PORT=8787 \

@@ -1,0 +1,45 @@
+# memex: its own project, its own Postgres. From the repository root:
+#   cp deploy/memex.env.example deploy/memex.env   # fill in the model endpoints
+#   docker compose -f deploy/compose.yaml up -d --build
+# The API listens on loopback only (MEMEX_BIND_PORT, default 18787); put TLS in front before exposing it.
+name: memex
+services:
+  db:
+    image: pgvector/pgvector:pg17 # 17.11, vector 0.8.7 at the time of writing; pin a digest for production
+    environment:
+      POSTGRES_DB: memex
+      POSTGRES_USER: memex
+      POSTGRES_PASSWORD: ${MEMEX_PG_PASSWORD:?set MEMEX_PG_PASSWORD}
+    volumes:
+      - pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memex -d memex"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: ${MEMEX_PG_MEM:-384m}
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: memex-server:local
+    env_file: memex.env
+    environment:
+      MEMEX_PG_URL: postgres://memex:${MEMEX_PG_PASSWORD}@db:5432/memex
+      MEMEX_HOST: 0.0.0.0
+      MEMEX_PORT: "8787"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${MEMEX_BIND_PORT:-18787}:8787"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    mem_limit: ${MEMEX_API_MEM:-256m}
+volumes:
+  pg:

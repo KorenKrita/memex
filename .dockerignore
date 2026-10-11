@@ -1,0 +1,7 @@
+*
+!server/
+!client/
+!dryrun/dryrun.ts
+!tsconfig.json
+!package.json
+**/*.test.ts
