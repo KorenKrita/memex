@@ -30,6 +30,19 @@ export async function drain(db: Db, kinds?: string[], max = 10_000) {
   return n;
 }
 
+/** The worker loop. A database error (Postgres restarting, the connection gone) is not the process's end: the
+ *  loop waits and tries again (the job's lock lapses and it is claimed again), up to 30 s apart. */
 export async function loop(db: Db, signal: AbortSignal, idleMs = 1000) {
-  while (!signal.aborted) if (!(await runOne(db))) await Bun.sleep(idleMs);
+  let errWait = 0;
+  while (!signal.aborted) {
+    let ran = false;
+    try {
+      ran = await runOne(db);
+      errWait = 0;
+    } catch (e) {
+      errWait = Math.min(Math.max(errWait * 2, idleMs), 30_000);
+      console.error(`worker: ${(e as Error).message?.slice(0, 300)}; retrying in ${errWait} ms`);
+    }
+    if (!ran) await Bun.sleep(errWait || idleMs);
+  }
 }

@@ -207,7 +207,8 @@ export function serve(db: Db, opts: { port: number; hostname?: string }) {
     async fetch(req) {
       const url = new URL(req.url);
       try {
-        if (url.pathname === "/healthz") return json(200, { ok: true });
+        if (url.pathname === "/healthz") // the database too: a server that cannot reach it is not healthy
+          return await db`select 1`.then(() => json(200, { ok: true }), () => json(503, { ok: false, error: "database unavailable" }));
         const m = (req.headers.get("authorization") ?? "").match(/^Bearer (\S+)$/);
         const [k] = m ? await db`select 1 from api_key where hash = ${sha(m[1])} and not revoked` : [];
         if (!k) return json(401, { error: "unauthorized" });

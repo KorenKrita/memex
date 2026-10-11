@@ -10,7 +10,9 @@ export type Db = SQL;
 export type Tx = any;
 
 export function connect(url = process.env.MEMEX_PG_URL ?? "postgres://postgres:memex@127.0.0.1:55433/memex", max = 8): Db {
-  return new SQL({ url, max, idleTimeout: 30 });
+  // connectionTimeout: with Postgres down, a request fails in 5 s instead of the driver's 30 s (a hook's budget
+  // is a few seconds; the client sees an error, not a hang).
+  return new SQL({ url, max, idleTimeout: 30, connectionTimeout: 5 });
 }
 
 const L0 = `
