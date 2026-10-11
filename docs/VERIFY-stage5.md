@@ -51,21 +51,31 @@ At a5485a2: `bunx tsc -p .` exit 0; `bun run test` 426 pass, 1 skip, 0 fail; `bu
 - Observed, not changed: jobs run in `not_before, id` order, so a derivation backlog delays projection of
   newly synced sessions (what grep reads). On the local instance with no model configured (about 24 000
   queued l3 jobs, each failing quickly) a session synced after the pause test was not projected within 80 s.
-  With models configured the backlog drains instead, but its effect on projection delay is not measured.
+  With models configured, how fast a backlog is worked off and how much it delays projection are not measured.
 - Pi `/tree` and compaction followed by recall in a real Pi; Codex with a shared app-server (several
   threads, one MCP process); a Codex fork's first turn.
 - server itself (1.9 GB memory), the shared reverse proxy, and turning off OV's automatic recall.
 
-## Independent review (da62c15..2720a7a)
+## Independent reviews
 
-Report: `/tmp/memex-review/stage5-215853.md`. All seven findings held and were in this range.
+First review (da62c15..2720a7a): `/tmp/memex-review/stage5-215853.md`, 7 findings, all in this range.
+Findings 1-3 and 5-7 held and were fixed. Finding 4 held for `/healthz` (no deadline of its own); its claim
+that the worker would hang on a silent database was disproved under Bun 1.4.2 (see the table above).
 
 | # | Finding | Status |
 | --- | --- | --- |
 | 1 | shutdown waited for outstanding queries after the worker budget | fixed f5ffe8a: one `MEMEX_STOP_MS` budget, connections cut at its end |
 | 2 | `restore ... 'dbname=memex'` passed the guard and restored into the live database | fixed 2601d2e: plain name `[a-z_][a-z0-9_]{0,62}`, never the live database |
 | 3 | special characters in the password broke the URL | fixed 2601d2e: `PGPASSWORD` |
-| 4 | `/healthz` and worker queries hung on a database that stops answering | `/healthz`: fixed 158c68c (2 s) and, after the second review, single-flight on its own connection; the worker: not a hang under Bun 1.4.2 (queries fail at the 30 s idle timeout and the process recovers, tested). A watchdog added in 5d86ac3 rested on the wrong premise and was removed |
+| 4 | `/healthz` and worker queries hung on a database that stops answering | `/healthz` part held: fixed 158c68c (2 s deadline), then a5485a2 (single-flight on its own connection). Worker part disproved: under Bun 1.4.2 queries on a silent connection fail at the 30 s idle timeout and the same process recovers (tested). The watchdog added for it in 5d86ac3 was removed in a5485a2 |
 | 5 | repeated `load.ts` runs reused ids | fixed b2ac73f: ids per run, counts asserted |
 | 6 | grep checks accepted hits from any session | fixed b2ac73f: one hit in the expected session; the final probe must hit too |
 | 7 | INSTALL's database switch did nothing under compose | fixed 2601d2e: `MEMEX_PG_DB` |
+
+Second review (2720a7a..beb59ab): `/tmp/memex-review/stage5-r2-223738.md`. It confirmed findings 1-3 and 5-7
+as resolved, and 4 as partly resolved, and found two problems in the watchdog:
+
+| # | Finding | Status |
+| --- | --- | --- |
+| r2-1 | timed-out probes stayed outstanding and accumulated (watchdog and each `/healthz`) | held: a5485a2 shares one in-flight probe across requests; the watchdog is gone |
+| r2-2 | the watchdog, on the shared pool, took a busy pool for a silent database and killed the process | held: a5485a2 removed the watchdog; the probe has its own 1-connection pool (test: 8 connections blocked, `/healthz` 200) |

@@ -37,9 +37,10 @@ default; put TLS in front (a reverse proxy) before exposing it.
 Failure behaviour: with Postgres down the process stays up, `/healthz` answers 503 and the worker retries
 (backoff up to 30 s). If the database stops answering on open connections (a frozen host, a network black
 hole), `/healthz` answers 503 within 2 s from a connection of its own, and the queries on silent
-connections fail once they have gone 30 s without traffic (Bun 1.4.2's `idleTimeout`, which applies with a
-query running too); the same process then reconnects. A consequence: no single statement can run longer
-than 30 s. SIGTERM ends the process within `MEMEX_STOP_MS` (default 5 s): an interrupted job runs again
+connections failed after about 30 s in tests with the pinned Bun 1.4.2 (its `idleTimeout`, 30 s in db.ts),
+after which the same process reconnected. This is observed driver behaviour, not a documented limit on how
+long any SQL statement may run: rerun the "default settings" test in `server/main.test.ts` after upgrading
+Bun. SIGTERM ends the process within `MEMEX_STOP_MS` (default 5 s): an interrupted job runs again
 once its lock lapses (`MEMEX_JOB_LOCK_MS`).
 
 Per-turn recall injects nothing until `MEMEX_RECALL_TAU` (the rerank score bar) is set: it is not calibrated
