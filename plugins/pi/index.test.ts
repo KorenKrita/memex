@@ -131,7 +131,7 @@ function host(native: string, from?: { entries: Entry[]; leaf: () => string | nu
     source: sourceIdOf("pi", native),
     /** One run: input → before_agent_start → user entry → context → reply → turn_end. Returns the system
      *  prompt sections and the messages sent to the model. */
-    async run(input: string, reply: string, o: { source?: string; beforeContext?: () => Promise<void>; noInput?: boolean } = {}) {
+    async run(input: string, reply: string, o: { source?: string; beforeContext?: () => Promise<void>; noInput?: boolean; running?: boolean } = {}) {
       if (!o.noInput) await emit("input", { text: input, source: o.source ?? "interactive" }); // noInput: emitted earlier
       const sections: Record<string, string> = {};
       await emit("before_agent_start", { prompt: input, systemPrompt: "", systemPromptOptions: { sections } });
@@ -142,6 +142,7 @@ function host(native: string, from?: { entries: Entry[]; leaf: () => string | nu
       add({ role: "assistant", content: text(reply) }, false);
       appendFileSync(file, branch().slice(-2).map((e) => JSON.stringify(e)).join("\n") + "\n");
       await emit("turn_end", { messageEntryId: leaf });
+      if (!o.running) await emit("agent_end", { messages: [] }); // running: more turns follow (steering, follow-ups)
       return { sections, sent: r?.messages ?? messages, user: u };
     },
   };
@@ -490,57 +491,84 @@ test("MEMEX_SCAN_DELAY_MS < 0 turns reconciliation off after turns too", async (
   }
 });
 
-test("interleaved inputs: a delayed extension follow-up is not recalled, the human steering input is", async () => {
+/** The recall requests' user_rec while `f` runs; fetch replaced before the host is made (its transport takes
+ *  fetch when it is made). */
+async function recallsAsked(f: () => Promise<void>) {
+  const asked: string[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
+  try {
+    await f();
+  } finally {
+    globalThis.fetch = orig;
+  }
+  return asked;
+}
+
+test("two inputs before the agent is idle: neither entry is recalled (an extension's delayed follow-up among them)", async () => {
   const a = host("past4");
   await a.run("where is the port", "ANSWER the port is zx-7781");
   await flush(a);
-  const asked: string[] = [];
-  const orig = globalThis.fetch; // before the host: its transport takes fetch when it is made
-  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
-  try {
+  let human: any, ext: any;
+  const asked = await recallsAsked(async () => {
     const h = host("now4");
     await h.run("hello", "hi");
-    await h.emit("input", { text: "AUTOMATED delayed follow-up about the zx-7781 port", source: "extension" }); // its handlers still running
-    const human = await h.run("which port is zx-7781?", "ok"); // delivered first
+    await h.emit("input", { text: "AUTOMATED delayed follow-up about the zx-7781 port", source: "extension" }); // handlers still running
+    human = await h.run("which port is zx-7781?", "ok", { running: true }); // delivered first
     await h.emit("input", { text: "the zx-7781 port again?", source: "interactive" }); // handled by another extension: no entry
-    const ext = await h.run("AUTOMATED delayed follow-up about the zx-7781 port", "ok", { noInput: true });
-    expect(asked).toContain(human.user.id);
-    expect(asked).not.toContain(ext.user.id);
-    expect(sentText(ext.sent)).not.toContain("memex-recall");
-  } finally {
-    globalThis.fetch = orig;
-  }
+    ext = await h.run("AUTOMATED delayed follow-up about the zx-7781 port", "ok", { noInput: true });
+  });
+  expect(asked).not.toContain(human.user.id);
+  expect(asked).not.toContain(ext.user.id);
 });
 
-test("same text from an extension and the user: neither entry is recalled, whichever comes first", async () => {
-  const asked: string[] = [];
-  const orig = globalThis.fetch;
-  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
-  try {
+test("after the agent is idle, the next lone typed input is recalled again", async () => {
+  const a = host("past4b");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  let next: any;
+  const asked = await recallsAsked(async () => {
+    const h = host("now4b");
+    await h.emit("input", { text: "AUTOMATED ping", source: "extension" });
+    await h.run("which port is zx-7781?", "ok"); // a second input in the window: not recalled; then idle
+    next = await h.run("the zx-7781 port, once more?", "ok");
+  });
+  expect(asked).toContain(next.user.id);
+});
+
+test("same text from an extension and the user, then another typed input handled elsewhere: nothing recalled", async () => {
+  let first: any, second: any;
+  const asked = await recallsAsked(async () => {
     const h = host("same5");
     await h.run("hello", "hi");
     await h.emit("input", { text: "the zx-7781 port?", source: "extension" }); // delayed
-    const first = await h.run("the zx-7781 port?", "ok"); // the user's, delivered first: two matches
-    const second = await h.run("the zx-7781 port?", "ok", { noInput: true }); // the extension's
-    expect(asked).not.toContain(first.user.id);
-    expect(asked).not.toContain(second.user.id);
-  } finally {
-    globalThis.fetch = orig;
-  }
+    first = await h.run("the zx-7781 port?", "ok", { running: true }); // the user's, delivered first
+    await h.emit("input", { text: "the zx-7781 port?", source: "interactive" }); // handled by another extension: no entry
+    second = await h.run("the zx-7781 port?", "ok", { noInput: true }); // the extension's
+  });
+  expect(asked).not.toContain(first.user.id);
+  expect(asked).not.toContain(second.user.id);
 });
 
-test("an extension input dropped past the 50 pending keeps a later same-text entry from being recalled", async () => {
-  const asked: string[] = [];
-  const orig = globalThis.fetch;
-  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
-  try {
-    const h = host("lost6");
+test("a /template whose expansion equals a handled input's text is not recalled", async () => {
+  let r: any;
+  const asked = await recallsAsked(async () => {
+    const h = host("tmpl7");
     await h.run("hello", "hi");
-    await h.emit("input", { text: "the zx-7781 port?", source: "extension" }); // delayed, then pushed out
-    for (let i = 0; i < 50; i++) await h.emit("input", { text: `handled ${i}`, source: "interactive" }); // no entries
-    const r = await h.run("the zx-7781 port?", "ok"); // the user's own, but the extension's could be this one
-    expect(asked).not.toContain(r.user.id);
-  } finally {
-    globalThis.fetch = orig;
-  }
+    await h.emit("input", { text: "port?", source: "interactive" }); // handled by another extension: no entry
+    await h.emit("input", { text: "/port", source: "interactive" }); // Pi expands it to "port?" after this event
+    r = await h.run("port?", "ok", { noInput: true });
+  });
+  expect(asked).not.toContain(r.user.id);
+});
+
+test("an entry whose text only starts with the input's (image hints, a transform) is not recalled", async () => {
+  let r: any;
+  const asked = await recallsAsked(async () => {
+    const h = host("pref8");
+    await h.run("hello", "hi");
+    await h.emit("input", { text: "port?", source: "interactive" });
+    r = await h.run("port?\n\nAUTOMATED payload", "ok", { noInput: true });
+  });
+  expect(asked).not.toContain(r.user.id);
 });

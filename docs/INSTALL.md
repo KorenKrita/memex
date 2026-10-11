@@ -141,6 +141,13 @@ What it does:
 - Codex fork, first turn: the query does not carry the exchange inherited from the parent (DESIGN §6.2).
 - Recall budget: a decision the server saved just within its deadline, after the plugin stopped waiting,
   is not shown in that process but may be shown by a later process's replay (DESIGN §6.2).
+- Pi per-turn recall runs only when the turn is unambiguous: one input since the agent was last idle, typed
+  (not an extension's, not a `/command`, not steering or a follow-up), and the new message's text exactly
+  that input. Turns with a second input, or another extension handling or transforming input, get no recall.
+  Pi does not tie an input to the message it makes; an extension that delays an input past the end of the run,
+  followed by the user typing the same text, can still be taken for the user's (DESIGN §6.2).
+- Codex hook: reading the rollout is not bounded by the budget; on a very large file the hook can take longer
+  than `MEMEX_CODEX_RECALL_MS`, but it makes no recall request after the budget.
 - Not verified in a real host yet: Pi recall after `/tree` navigation or compaction; Codex with one
   app-server serving several threads (MCP identity per call); the first turn of a Codex fork.
 - Uninstall: remove the extension path (Pi), `codex plugin remove memex@memex-local` (Codex). This stops new

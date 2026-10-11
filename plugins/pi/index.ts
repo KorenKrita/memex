@@ -6,7 +6,6 @@
 //   pi -e ~/Coding/memex/plugins/pi/index.ts      (or list it under "extensions" in settings)
 //   MEMEX_URL, MEMEX_KEY: server; MEMEX_POLICY: policy file (default ~/.config/memex/policy.json);
 //   MEMEX_MACHINE: collector name (default hostname).
-import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -33,8 +32,7 @@ type Session = {
   meta: { repo?: string };
   chain: Promise<unknown>; // syncs, one at a time
   lastSync?: { at: string; outcome: SyncOutcome | { status: "error"; reason: string } };
-  inputs: { at: number; text: string; human: boolean }[]; // input events not yet tied to a user entry (last 50)
-  lost: Set<string>; // textKey of pending inputs dropped past 50: an entry with that text is never recalled
+  win: { n: number; cand?: { at: number; text: string } }; // inputs since the agent was last idle; the one recallable
   seen: Set<string>; // user entries already tied to an input, or there before it
   based: boolean; // the baseline (entries there before the first input) taken
   recalls: Map<string, Promise<void>>; // user entry id → its one recall request
@@ -56,7 +54,6 @@ function repoOf(cwd: string): string | undefined {
 }
 
 const err = (e: unknown) => String((e as Error)?.message ?? e);
-const textKey = (s: string) => createHash("sha256").update(s).digest("hex");
 /** The user entry `id` ends the branch's conversation: nothing after it but non-message entries (custom
  *  context an extension added at agent start, labels…) — no reply, no later user message. */
 const tail = (branch: any[], id: string) => {
@@ -88,7 +85,7 @@ export default function memex(pi: ExtensionAPI) {
     s = {
       file, source: sourceIdOf("pi", ctx.sessionManager.getSessionId()), scope: file ? scopeOf(policy, file) : NONE,
       meta: { ...(repoOf(ctx.cwd) ? { repo: repoOf(ctx.cwd) } : {}) },
-      chain: Promise.resolve(), inputs: [], lost: new Set(), seen: new Set(), based: false, recalls: new Map(), late: new Set(), blocks: new Map(),
+      chain: Promise.resolve(), win: { n: 0 }, seen: new Set(), based: false, recalls: new Map(), late: new Set(), blocks: new Map(),
     };
     return s;
   }
@@ -168,11 +165,13 @@ export default function memex(pi: ExtensionAPI) {
     if (text && stateOf(ctx) === x) e.systemPromptOptions.sections.memex = text;
   });
 
-  // An input becomes at most one new user entry, made after it (Pi stamps the message after the input handlers;
-  // another extension may handle the input and make none). Entries that exist when the session is first seen
-  // here (history of a resumed session, other branches) are never an input's entry: the baseline is taken
-  // once, on the first input. Each input is kept with its time, its text and whether it may be recalled: typed
-  // by the user (not an extension's) and not a /command (Pi expands /templates and /skill: after this event).
+  // Which input made a user entry, Pi does not say (an input event carries no id, an entry no source; other
+  // extensions may handle, transform or delay an input, Pi expands /templates after this event). So a turn is
+  // recalled only when nothing is ambiguous (DESIGN §6.2): since the agent was last idle, exactly one input, typed
+  // by the user (not an extension's, not a /command, not queued while running), and the new user entry's text
+  // exactly that input's. Any second input in the window: no recall until the agent is idle again. Entries that
+  // exist when the session is first seen here (history, other branches) are never an input's entry: the baseline
+  // is taken once, on the first input.
   pi.on("input", async (e, ctx) => {
     const x = stateOf(ctx);
     if (!x.based) {
@@ -180,12 +179,12 @@ export default function memex(pi: ExtensionAPI) {
       for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
     }
     const text = String(e.text ?? "");
-    const all = [...x.inputs, { at: Date.now(), text, human: e.source !== "extension" && !text.trimStart().startsWith("/") }];
-    // Past 50 pending inputs the oldest are dropped; their texts are kept (hashed), so an entry carrying one is
-    // ambiguous later and not recalled — a dropped extension input never leaves a same-text human one alone.
-    for (const d of all.slice(0, -50)) x.lost.add(textKey(d.text));
-    while (x.lost.size > 10_000) x.lost.delete(x.lost.values().next().value!);
-    x.inputs = all.slice(-50);
+    x.win.n++;
+    x.win.cand = x.win.n === 1 && e.source !== "extension" && !e.streamingBehavior && !text.trimStart().startsWith("/")
+      ? { at: Date.now(), text } : undefined;
+  });
+  pi.on("agent_end", async (_e, ctx) => {
+    stateOf(ctx).win = { n: 0 };
   });
 
   // §6.2: recall for the latest user message, once per user entry; frozen blocks replayed on their messages.
@@ -201,22 +200,17 @@ export default function memex(pi: ExtensionAPI) {
       const hit = branch.filter((b: any) => b.type === "message" && ts(b.message) === at);
       return hit.length === 1 ? (hit[0] as any) : undefined;
     };
-    // Each new user entry on the branch is tied to the pending input whose text it carries (Pi writes the
-    // input's text as is, image hints after "\n\n"; an input handled with no entry is never matched, and
-    // inputs are delivered in any order). It is the user's only when exactly one pending input made before it
-    // matches and that one may be recalled. Fail closed: no match (another extension transformed it), two
-    // matches (the same text queued twice, whoever sent it: every match is used up, so a later entry with that
-    // text has none) or a dropped input with that text recall none.
+    // The window's one candidate input is taken by the first new user entry after it, whatever its text: recalled
+    // only when the entry's text is exactly the input's (no image hints, no transform). Every other new entry: not.
     let human = false;
     for (const b of branch as any[])
       if (b.type === "message" && b.message?.role === "user" && !x.seen.has(b.id)) {
         x.seen.add(b.id);
-        const at = Number(b.message.timestamp);
         const c = b.message.content;
-        const first = typeof c === "string" ? c : Array.isArray(c) && c[0]?.type === "text" ? String(c[0].text) : undefined;
-        const mine = first === undefined ? [] : x.inputs.filter((i) => i.at <= at && (first === i.text || first.startsWith(i.text + "\n\n")));
-        x.inputs = x.inputs.filter((i) => !mine.includes(i));
-        human = mine.length === 1 && mine[0].human && !x.lost.has(textKey(mine[0].text));
+        const only = typeof c === "string" ? c : Array.isArray(c) && c.length === 1 && c[0]?.type === "text" ? String(c[0].text) : undefined;
+        const cand = x.win.cand;
+        x.win.cand = undefined;
+        human = !!cand && x.win.n === 1 && Number(b.message.timestamp) >= cand.at && only === cand.text;
       }
     const leaf = ctx.sessionManager.getLeafId();
     const latest = [...e.messages].reverse().find((m: any) => m.role === "user");
