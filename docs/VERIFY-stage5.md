@@ -24,7 +24,8 @@ At 158c68c plus this commit: `bunx tsc -p .` exit 0; `bun run test` 424 pass, 1 
 | Postgres stops under a running API (1d0c19a) | `docker stop memex-db-1`, then start | API process lives; `/healthz` 503 within 3.7 s; a client sync fails within 10 s; after start the same process syncs again (before the fix the process exited) |
 | SIGTERM with a model call hanging (e5927c1) | `hang.ts` hang mode, `MEMEX_IDLE_CLOSE_MS=0`, wait for `/chat/completions`, `docker compose stop -t 20 api` | before: 21.4 s, exit 137 (killed); after: 5.6 s, exit 0 |
 | Model recovers after an outage | separate compose project with `hang.ts` as LLM and embedding endpoint; a summarize call hanging; SIGTERM (5.3 s, exit 0); `hang.ts` switched to valid replies; API started | within 4 s every job done: summarize (attempt 2), l3, embed, forest, card; 1 `span_summary` row stored; grep finds the session |
-| Database silent on open connections (5d86ac3) | `server/main.test.ts`: TCP proxy that refuses, then drops all traffic on open sockets; real: `docker pause` on the database container | refusing for 12 s: the process stays (the worker backs off); silent: watchdog (one `select 1` every 10 s, 3 s each, never more than one outstanding) exits 1 after 3 misses. Real: the API exited and compose restarted it 40 s after the pause; after unpause `/healthz` ok and a sync succeeded |
+| Database silent on open connections | `server/main.test.ts` "default settings": API on a TCP proxy that, after a first answer, drops all traffic on open sockets; default settings; then traffic passes again | 3 concurrent `/healthz` 503 within 2.5 s; the silent queries fail after Bun's 30 s `idleTimeout` (the worker logs it and backs off); after traffic resumes the same process (not restarted) answers `/healthz` 200 and syncs a new session, whose own record grep then finds in that session (one sync attempt failed first with a 5 s connect timeout, started while still silent). Also measured directly: a query on a silent connection and a `pg_sleep(33)` both fail at 30.0 s. Real `docker pause` (60 s) on the database of the local instance: `/healthz` 503 within 2.0 s, worker logs the idle timeout then connect timeouts with backoff, no restart (same start time), `/healthz` 200 at once after unpause, a new session synced; the worker went on with its queue (see below) |
+| `/healthz` single-flight and own connection | `server/main.test.ts` | 3 requests against a database that never answers: 3 × 503 within 2.5 s each, 1 query issued; all 8 application connections blocked by a lock: `/healthz` still 200 |
 | Worker backoff vs stop | `server/worker.test.ts` | abort during a 2 s backoff ends the loop in < 200 ms (was 1951 ms) |
 | Backup / restore (b8a3a86, 521542f) | `deploy/backup.sh`, then INSTALL's restore command from the repo root | restore into a new database succeeds, row counts equal; restore over the live database exits 2, database unchanged; missing file exits 2; dumps mode 600, two runs never share a file; no dump is deleted by the script |
 | Forget vs backup | forget a source, re-upload it | 410. A backup taken before the forget brings 3 forgotten bodies back on restore: documented in INSTALL (repeat forgets after a restore) |
@@ -45,8 +46,12 @@ At 158c68c plus this commit: `bunx tsc -p .` exit 0; `bun run test` 424 pass, 1 
   run, about 15 600 summarize/l3 jobs were queued; each fails after its retries with `MEMEX_LLM_URL not
   configured`. The model-recovery check above covers one session with a fake model, not real models.
 - Search / recall latency with summaries and embeddings present (only grep was measured).
-- The watchdog restarts a process whose database went silent; requests in flight at that moment fail, and
-  a database that answers `select 1` but stalls one specific query is not detected.
+- The 30 s connection idle timeout is Bun 1.4.2 behaviour observed here, not documented API: a Bun upgrade
+  must rerun the "default settings" test. Requests in flight while the database is silent fail.
+- Observed, not changed: jobs run in `not_before, id` order, so a derivation backlog delays projection of
+  newly synced sessions (what grep reads). On the local instance with no model configured (about 24 000
+  queued l3 jobs, each failing quickly) a session synced after the pause test was not projected within 80 s.
+  With models configured the backlog drains instead, but its effect on projection delay is not measured.
 - Pi `/tree` and compaction followed by recall in a real Pi; Codex with a shared app-server (several
   threads, one MCP process); a Codex fork's first turn.
 - server itself (1.9 GB memory), the shared reverse proxy, and turning off OV's automatic recall.
@@ -60,7 +65,7 @@ Report: `/tmp/memex-review/stage5-215853.md`. All seven findings held and were i
 | 1 | shutdown waited for outstanding queries after the worker budget | fixed f5ffe8a: one `MEMEX_STOP_MS` budget, connections cut at its end |
 | 2 | `restore ... 'dbname=memex'` passed the guard and restored into the live database | fixed 2601d2e: plain name `[a-z_][a-z0-9_]{0,62}`, never the live database |
 | 3 | special characters in the password broke the URL | fixed 2601d2e: `PGPASSWORD` |
-| 4 | `/healthz` and worker queries hung on a database that stops answering | fixed 158c68c (`/healthz` 2 s) and 5d86ac3 (watchdog exit and restart) |
+| 4 | `/healthz` and worker queries hung on a database that stops answering | `/healthz`: fixed 158c68c (2 s) and, after the second review, single-flight on its own connection; the worker: not a hang under Bun 1.4.2 (queries fail at the 30 s idle timeout and the process recovers, tested). A watchdog added in 5d86ac3 rested on the wrong premise and was removed |
 | 5 | repeated `load.ts` runs reused ids | fixed b2ac73f: ids per run, counts asserted |
 | 6 | grep checks accepted hits from any session | fixed b2ac73f: one hit in the expected session; the final probe must hit too |
 | 7 | INSTALL's database switch did nothing under compose | fixed 2601d2e: `MEMEX_PG_DB` |

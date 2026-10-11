@@ -36,9 +36,11 @@ default; put TLS in front (a reverse proxy) before exposing it.
 
 Failure behaviour: with Postgres down the process stays up, `/healthz` answers 503 and the worker retries
 (backoff up to 30 s). If the database stops answering on open connections (a frozen host, a network black
-hole), a watchdog exits the process after 3 checks without an answer (`MEMEX_WATCHDOG_MS`, default 10 s
-apart, 3 s each), so run it under a supervisor that restarts it (compose does). SIGTERM ends it within
-`MEMEX_STOP_MS` (default 5 s): an interrupted job runs again once its lock lapses (`MEMEX_JOB_LOCK_MS`).
+hole), `/healthz` answers 503 within 2 s from a connection of its own, and the queries on silent
+connections fail once they have gone 30 s without traffic (Bun 1.4.2's `idleTimeout`, which applies with a
+query running too); the same process then reconnects. A consequence: no single statement can run longer
+than 30 s. SIGTERM ends the process within `MEMEX_STOP_MS` (default 5 s): an interrupted job runs again
+once its lock lapses (`MEMEX_JOB_LOCK_MS`).
 
 Per-turn recall injects nothing until `MEMEX_RECALL_TAU` (the rerank score bar) is set: it is not calibrated
 yet (DESIGN §6.2), so the default is "not ready", and the plugins show nothing.

@@ -199,7 +199,25 @@ async function deliver(db: Db, g: Guarded): Promise<Response> {
   throw new HttpError(503, "state kept changing; retry");
 }
 
-export function serve(db: Db, opts: { port: number; hostname?: string }) {
+/** The database health probe for /healthz: at most one `select 1` in flight however many requests ask, each
+ *  answered within `deadlineMs`: true when the database answered, false when it errored (down) or has not
+ *  answered yet. Give it its own connection, so a busy application pool is not taken for a silent database. */
+export function prober(q: Db, deadlineMs = 2_000) {
+  let inflight: Promise<boolean> | null = null, since = 0;
+  return {
+    check: async () => {
+      if (!inflight) {
+        since = Date.now();
+        inflight = q`select 1`.then(() => true, () => false).finally(() => (inflight = null));
+      }
+      const left = deadlineMs - (Date.now() - since);
+      return left > 0 && (await Promise.race([inflight, Bun.sleep(left).then(() => false)]));
+    },
+  };
+}
+
+export function serve(db: Db, opts: { port: number; hostname?: string; health?: ReturnType<typeof prober> }) {
+  const health = opts.health ?? prober(db);
   const server = Bun.serve({
     port: opts.port,
     hostname: opts.hostname ?? "127.0.0.1",
@@ -208,9 +226,7 @@ export function serve(db: Db, opts: { port: number; hostname?: string }) {
       const url = new URL(req.url);
       try {
         if (url.pathname === "/healthz") // the database too: a server that cannot reach it is not healthy
-          // Own deadline: an established connection that stops answering would otherwise hold it forever.
-          return await Promise.race([db`select 1`.then(() => true, () => false), Bun.sleep(2_000).then(() => false)])
-            .then((ok) => (ok ? json(200, { ok: true }) : json(503, { ok: false, error: "database unavailable" })));
+          return (await health.check()) ? json(200, { ok: true }) : json(503, { ok: false, error: "database unavailable" });
         const m = (req.headers.get("authorization") ?? "").match(/^Bearer (\S+)$/);
         const [k] = m ? await db`select 1 from api_key where hash = ${sha(m[1])} and not revoked` : [];
         if (!k) return json(401, { error: "unauthorized" });
