@@ -755,6 +755,11 @@ function codexFragments(p: Record<string, any>, ex: Tally): { user: string[]; co
   return { user, context };
 }
 
+/** A Codex rollout line's indexed text of `kind` ("user" / "assistant"), exactly as the lexical index holds it. */
+export function codexTextOf(line: Record<string, any>, kind: "user" | "assistant"): string {
+  return codexRecordsInner(line, emptyResult(""), new Map(), {}).filter((r) => r.kind === kind).map((r) => r.text).join("");
+}
+
 function codexRecords(line: Record<string, any>, res: FileResult, calls: Map<string, string>): Rec[] {
   return perRecord(res, (ex) => codexRecordsInner(line, res, calls, ex)).map((r, j) => ({ ...r, key: `${line.ordinal}#${j}` }));
 }

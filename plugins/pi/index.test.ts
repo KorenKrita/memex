@@ -66,7 +66,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "memex-pi-"));
   mkdirSync(join(dir, "sessions"));
   policy({ personal: ALL });
-  Object.assign(process.env, { MEMEX_URL: `http://127.0.0.1:${api.port}`, MEMEX_KEY: await addApiKey(db, "t"), MEMEX_IDLE_CLOSE_MS: "0", MEMEX_RECALL_TAU: "0.5", MEMEX_SCAN_DELAY_MS: "-1" });
+  Object.assign(process.env, { MEMEX_URL: `http://127.0.0.1:${api.port}`, MEMEX_KEY: await addApiKey(db, "t"), MEMEX_IDLE_CLOSE_MS: "0", MEMEX_RECALL_TAU: "0.5", MEMEX_SCAN_DELAY_MS: "-1", MEMEX_CLIENT: join(dir, "no-client.json") });
   calls = [];
 });
 function policy(allow: Record<string, object>) {
