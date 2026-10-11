@@ -146,14 +146,14 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
       // means not uploaded yet — e.g. a steering input while the turn's first prompt is already there. Two
       // matching lines: refused.
       let self = r.user_rec;
+      const prompt = (l: any) => (Array.isArray(l?.payload?.content) ? l.payload.content : [])
+        .map((c: any) => (c?.type === "input_text" && typeof c.text === "string" ? c.text : "")).join("").trim();
       if (r.turn) {
         type Line = { rec: string; l: any };
         const rows: any[] = await q`select distinct rec, raw from body where source = ${r.source} and strpos(raw, ${r.turn.id}) > 0`;
         const lines: Line[] = rows.map((x) => ({ rec: x.rec, l: JSON.parse(x.raw) }))
           .filter((x: Line) => x.l.type === "response_item" && x.l.payload?.type === "message" && x.l.payload.role === "user" &&
                                x.l.payload.internal_chat_message_metadata_passthrough?.turn_id === r.turn!.id);
-        const prompt = (l: any) => (Array.isArray(l.payload.content) ? l.payload.content : [])
-          .map((c: any) => (c?.type === "input_text" && typeof c.text === "string" ? c.text : "")).join("").trim();
         const recs: string[] = [...new Set<string>(lines.filter((x) => prompt(x.l) === input).map((x) => x.rec))];
         if (recs.length > 1) return { found: null, pin, stale: true };
         if (recs.length) self = recs[0];
@@ -173,7 +173,12 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const owners = [r.source, ...keys.map((k: string) => k.slice(2))];
           const rows = await q`select key, text from lexical where source = any(${q.array(owners, "text")}) and key = any(${q.array(ks, "text")})
                                and kind = 'user' order by part`;
-          const text = ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
+          // The indexed text joins a Codex message's parts with "\n"; a turn-bound input is the hook's serialization
+          // (parts joined with nothing): compared as that, on the record's current line.
+          const text = r.turn
+            ? prompt(JSON.parse((await q`select b.raw from record x join body b on b.source = x.source and b.rec = x.rec and b.hash = x.hash
+                                         where x.source = ${r.source} and x.rec = ${self}`)[0]?.raw ?? "{}"))
+            : ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
           if (text.trim() !== input) return { found: null, pin, stale: true };
         }
         else if (keys.length && (await q`select 1 from tomb where key = any(${q.array(keys.map((k: string) => `canon:${k.slice(2)}:${self}`), "text")}) limit 1`).length) {
