@@ -102,6 +102,7 @@ test("a sync that gives up after its lease was granted lets the lease go", async
     return r;
   };
   expect(await syncFile(t, policy, p, "pi", { collector: "m1" })).toEqual({ status: "failed", reason: "file-changed-identity" });
+  await Bun.sleep(100); // the release is sent, not waited for
   expect((await db`select count(*)::int n from lease where source = ${src} and not done`)[0].n).toBe(0);
 });
 
@@ -238,4 +239,19 @@ test("the session version moves on withdrawals only: an append does not, a revis
   writeFileSync(p, lines.slice(0, 3).join("\n") + "\n"); // e1 onwards removed
   await syncFile(t, policy, p, "pi", { collector: "m1" });
   expect(await ver()).toBeGreaterThan(v1);
+});
+
+test("sync keeps its deadline when the lease release hangs (the server's lease expires on its own)", async () => {
+  const p = piFile(allowDir, "rel", 2);
+  const f = (async (u: any, i: any) => (String(u).endsWith("/release") ? new Promise<Response>(() => {}) : fetch(u, i))) as typeof fetch;
+  const at = Date.now();
+  const tr = transport(base, key, f);
+  // Fail the poll: the commit path never runs, the release in finally does.
+  const failing = (async (m: any, path: any, body: any, o: any) => {
+    if (String(path).endsWith("/poll")) throw new Error("poll down");
+    return tr(m, path, body, o);
+  }) as any;
+  const r = await syncFile(failing, policy, p, "pi", { collector: "m1", deadlineMs: 600 });
+  expect(r.status).toBe("failed");
+  expect(Date.now() - at).toBeLessThan(1_000);
 });

@@ -99,7 +99,8 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     // Sync first: the previous exchange must be on the server to be referenced (§6.2). The prompt itself is
     // not in the rollout yet (Codex records it after this hook), so it is bound by the turn id.
     await sync(t, policy, s, p.cwd, Math.min(deadline - 500, Date.now() + 1_500)).catch(() => {});
-    if (!allowed(policy, s.scope, "recall", "memex") || !p.turn_id || typeof p.prompt !== "string") return out(event);
+    if (!allowed(policy, s.scope, "recall", "memex") || !p.turn_id || typeof p.prompt !== "string" || Date.now() + 200 >= deadline)
+      return out(event); // the last test: past (or at) the budget, no recall request is made
     const read = readSession(s.path, "codex");
     if (!read.ok) return out(event);
     const body = {

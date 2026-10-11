@@ -52,6 +52,11 @@ function declOf(policy: Policy, path: string, harness: Harness, scope: string, h
   return { source: h.sourceId, harness, nativeId: h.nativeId, scope, parent, meta: meta ?? {} };
 }
 
+/** Give the lease back, not waited for (≤ 5 s): the caller's deadline holds; an unsent release only leaves
+ *  the lease to expire on the server. */
+const release = (t: Transport, lease: number) =>
+  void t("POST", `/v1/sync/lease/${lease}/release`, undefined, { deadline: Date.now() + 5_000 }).catch(() => {});
+
 /** Queue for the lease and wait for it until `deadline`. Returns the lease id and whether it was granted. */
 async function acquire(t: Transport, decl: object, collector: string, deadline: number) {
   const lease: number = (await t("POST", "/v1/sync/lease", { ...decl, collector }, { deadline })).lease;
@@ -62,7 +67,7 @@ async function acquire(t: Transport, decl: object, collector: string, deadline: 
       await sleep(Math.min(50 * (i + 1), 500, Math.max(0, deadline - Date.now())));
     }
   } catch (e) {
-    await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
+    release(t, lease);
     throw e;
   }
 }
@@ -145,7 +150,7 @@ export async function syncFile(t: Transport, policy: Policy, path: string, harne
   } catch (e) {
     return { status: "failed", reason: String((e as Error).message ?? e) };
   } finally {
-    if (!committed) await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
+    if (!committed) release(t, lease);
   }
 }
 
@@ -204,7 +209,7 @@ export async function scanSegment(t: Transport, policy: Policy, path: string, ha
   } catch (e) {
     return { status: "failed", reason: String((e as Error).message ?? e) };
   } finally {
-    if (!committed) await t("POST", `/v1/sync/lease/${lease}/release`).catch(() => {});
+    if (!committed) release(t, lease);
   }
 }
 
@@ -305,7 +310,7 @@ async function scanBatch(t: Transport, policy: Policy, jobs: Job[],
     for (let i = 0; i < out.length; i++) if (out[i].status === "failed" && (out[i] as any).reason === "not-run") out[i] = { status: "failed", reason: String((e as Error).message ?? e) };
   } finally {
     const open = leases.filter((l, i) => l !== undefined && !committed.has(i));
-    if (open.length) await t("POST", "/v1/sync/batch/release", { leases: open }, { deadline: Date.now() + 5_000 }).catch(() => {});
+    if (open.length) void t("POST", "/v1/sync/batch/release", { leases: open }, { deadline: Date.now() + 5_000 }).catch(() => {});
   }
   return out;
 }

@@ -192,6 +192,30 @@ test("a recall answer that arrives past the hook's budget is not emitted", async
   }
 });
 
+test("a hanging lease release holds neither the hook past its budget nor lets it ask for recall late", async () => {
+  const path = rollout(ID);
+  const seen: string[] = [];
+  globalThis.fetch = (async (u: any, i: any) => {
+    const p = new URL(String(u)).pathname;
+    seen.push(p);
+    if (p.endsWith("/release")) return new Promise<Response>(() => {});
+    if (p.endsWith("/poll")) {
+      await Bun.sleep(700); // past the budget: the poll's own deadline aborts it
+      return Response.json({ granted: false });
+    }
+    return orig(u, i);
+  }) as any;
+  try {
+    const at = Date.now();
+    await handle({ hook_event_name: "UserPromptSubmit", session_id: ID, transcript_path: path, turn_id: "t10", prompt: "port?" },
+                 { ...process.env, MEMEX_CODEX_RECALL_MS: "600" });
+    expect(Date.now() - at).toBeLessThan(800);
+    expect(seen).not.toContain("/v1/recall");
+  } finally {
+    globalThis.fetch = (async (u: any, i: any) => (reqs.push(new URL(String(u)).pathname), orig(u, i))) as any;
+  }
+});
+
 test("MCP identity: reverted rollouts (rollout-<ts>-<thread>_<rollout>.jsonl) count; different scopes → no session", async () => {
   const { sessionOfThread } = await import("./session.ts");
   const { loadPolicy } = await import("../../client/policy.ts");
