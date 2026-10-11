@@ -327,3 +327,21 @@ test("scanAll goes past a page that was all skipped to a healthy file", async ()
   expect((await db`select state from scan_item where key = ${fileKey(good)}`)[0].state).toBe("done");
   expect(r.finished).toBe(true);
 });
+
+test("a slow round-count request does not take a scan run past its deadline", async () => {
+  const { scanAll } = await import("../client/sync.ts");
+  const p = piFile("slowcount", 2);
+  const f = (async (u: any, i: any) => {
+    const b = i?.body ? JSON.parse(String(i.body)) : {};
+    if (String(u).endsWith("/v1/scan/next") && b.limit === 0) // the count, honouring its abort signal
+      return new Promise<Response>((ok, no) => {
+        const h = setTimeout(() => ok(fetch(u, i)), 1_500);
+        i?.signal?.addEventListener("abort", () => (clearTimeout(h), no(i.signal.reason)));
+      });
+    return fetch(u, i);
+  }) as typeof fetch;
+  const at = Date.now();
+  await scanAll(transport(base, key, f), policy, [{ path: p, harness: "pi" }], { collector: "m-slow", deadlineMs: 400 });
+  expect(Date.now() - at).toBeLessThan(700);
+  expect((await db`select state from scan_item where key = ${fileKey(p)}`)[0].state).toBe("done"); // progress kept
+});

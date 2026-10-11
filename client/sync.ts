@@ -398,7 +398,10 @@ export async function scanOnce(t: Transport, policy: Policy, files: ScanFile[],
     }
     live = [...keep, ...live.slice(BATCH)];
   }
-  const c = await t("POST", "/v1/scan/next", { round, limit: 0 }, { deadline: Math.max(deadline, Date.now() + 2_000) });
+  const tried = (items as ScanItem[]).map((i) => i.key);
+  // The round's counts, within this call's deadline: past it, none (the progress is on the server already).
+  const c = Date.now() < deadline ? await t("POST", "/v1/scan/next", { round, limit: 0 }, d).catch(() => null) : null;
+  if (!c) return { round, finished: false, total: -1, done: -1, skipped: -1, pending: -1, advanced, tried, counts: false } as const;
   return { round, finished: c.finished as boolean, total: c.total as number, done: c.done as number, skipped: c.skipped as number,
-           pending: c.pending as number, advanced, tried: (items as ScanItem[]).map((i) => i.key) };
+           pending: c.pending as number, advanced, tried, counts: true } as const;
 }
