@@ -309,6 +309,31 @@ test("a recall answered after the turn's budget is never injected, not even by a
   }
 });
 
+test("recall in time but its blocks late: nothing injected after the turn's budget", async () => {
+  const a = host("past9b");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  // The turn's budget: the recall itself returns well within it; the blocks answer (1.25 s later, within
+  // their own 1.5 s timeout) lands after it.
+  process.env.MEMEX_PI_RECALL_MS = "1000";
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (u: any, i: any) => {
+    if (String(u).endsWith("/v1/recall/blocks")) await Bun.sleep(1_250);
+    return orig(u, i);
+  }) as any;
+  try {
+    const h = host("now9b");
+    const t0 = Date.now();
+    const r = await h.run("the port zx-7781?", "ok");
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(1_000);
+    expect((await db`select state from recall_block where source = ${h.source} and user_rec = ${r.user.id}`)[0]?.state).toBe("shown"); // decided in time
+    expect(sentText(r.sent)).not.toContain("memex-recall");
+  } finally {
+    globalThis.fetch = orig;
+    delete process.env.MEMEX_PI_RECALL_MS;
+  }
+});
+
 test("an extension's input, a /command and an ambiguous timestamp are not recalled", async () => {
   const a = host("past3");
   await a.run("where is the port", "ANSWER the port is zx-7781");

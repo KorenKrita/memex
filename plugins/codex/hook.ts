@@ -39,10 +39,15 @@ function sessionOf(p: Payload, policy: Policy) {
 const out = (event: string, context?: string) =>
   JSON.stringify(context ? { hookSpecificOutput: { hookEventName: event, additionalContext: context } } : {});
 
-async function sync(t: Transport, policy: Policy, s: { path: string }, cwd: string | undefined, deadlineMs = SYNC_MS) {
+/** Sync the rollout (only when `sync` is allowed), every segment within one absolute deadline: none starts
+ *  after it. */
+async function sync(t: Transport, policy: Policy, s: { path: string; scope: string }, cwd: string | undefined, until = Date.now() + SYNC_MS) {
+  if (!allowed(policy, s.scope, "sync", "memex")) return;
   const repo = cwd ? repoOf(cwd) : undefined;
   for (let i = 0; i < 20; i++) {
-    const r = await syncFile(t, policy, s.path, "codex", { collector: collector(), meta: repo ? { repo } : {}, deadlineMs });
+    const left = until - Date.now();
+    if (left <= 0) return;
+    const r = await syncFile(t, policy, s.path, "codex", { collector: collector(), meta: repo ? { repo } : {}, deadlineMs: left });
     if (r.status !== "synced" || !r.more) return r;
   }
 }
@@ -74,19 +79,18 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     return out(event);
   }
   const s = t && sessionOf(p, policy);
-  if (!t || !s || !allowed(policy, s.scope, "sync", "memex")) return out(event);
+  // Each purpose is checked where it is used (sync, snapshot, recall): one allowed does not need another.
+  if (!t || !s) return out(event);
   const repo = p.cwd ? repoOf(p.cwd) : undefined;
 
   if (event === "SessionStart") {
-    await sync(t, policy, s, p.cwd).catch(() => {});
-    if (env.MEMEX_SCAN !== "0") {
-      const roots = policy.scopes.filter((x) => x.allow?.sync?.includes("memex")).flatMap((x) => x.paths);
-      const files = collect(roots).files.filter((f) => f.endsWith(".jsonl") && readHead(f, "codex").ok).map((path) => ({ path, harness: "codex" as const }));
-      await scanOnce(t, policy, files, { collector: collector(), deadlineMs: SCAN_MS }).catch(() => {});
-    }
+    // The reconciliation scan does not run here: main() starts it detached after the answer (it must not hold
+    // up the session start).
+    const until = Date.now() + SNAPSHOT_MS + 2_000;
+    await sync(t, policy, s, p.cwd, until - SNAPSHOT_MS).catch(() => {});
     if (!allowed(policy, s.scope, "snapshot", "memex")) return out(event);
     const r: any = await t("POST", "/v1/snapshot", { source: s.source, scope: s.scope, ...(repo ? { repo } : {}) },
-                           { deadline: Date.now() + SNAPSHOT_MS }).catch(() => null);
+                           { deadline: Math.min(until, Date.now() + SNAPSHOT_MS) }).catch(() => null);
     return out(event, typeof r?.text === "string" && r.text ? `<memex>\n${r.text}\n</memex>` : undefined);
   }
 
@@ -94,7 +98,7 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     const deadline = Date.now() + RECALL_MS;
     // Sync first: the previous exchange must be on the server to be referenced (§6.2). The prompt itself is
     // not in the rollout yet (Codex records it after this hook), so it is bound by the turn id.
-    await sync(t, policy, s, p.cwd, Math.max(500, Math.min(1_500, deadline - Date.now()))).catch(() => {});
+    await sync(t, policy, s, p.cwd, Math.min(deadline - 500, Date.now() + 1_500)).catch(() => {});
     if (!allowed(policy, s.scope, "recall", "memex") || !p.turn_id || typeof p.prompt !== "string") return out(event);
     const read = readSession(s.path, "codex");
     if (!read.ok) return out(event);
@@ -112,7 +116,20 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
   return out(event);
 }
 
-if (import.meta.main) {
+/** Reconciliation (§5.2): one scan over this machine's Codex rollouts in every scope that allows sync. */
+export async function scan(env = process.env) {
+  const t = fromEnv(env);
+  const policy = loadPolicy();
+  const roots = policy.scopes.filter((x) => x.allow?.sync?.includes("memex")).flatMap((x) => x.paths);
+  if (!t || !roots.length) return;
+  const files = collect(roots).files.filter((f) => f.endsWith(".jsonl") && readHead(f, "codex").ok).map((path) => ({ path, harness: "codex" as const }));
+  await scanOnce(t, policy, files, { collector: collector(), deadlineMs: SCAN_MS });
+}
+
+if (import.meta.main && process.argv[2] === "--scan") {
+  await scan().catch(() => {});
+  process.exit(0);
+} else if (import.meta.main) {
   const chunks: Buffer[] = [];
   for await (const c of process.stdin) chunks.push(c as Buffer);
   let p: Payload = {};
@@ -121,5 +138,10 @@ if (import.meta.main) {
   } catch {}
   const text = await handle(p).catch(() => out(p.hook_event_name ?? ""));
   process.stdout.write(text + "\n");
+  // The session-start scan in its own process, detached: Codex waits for this one only.
+  if (p.hook_event_name === "SessionStart" && process.env.MEMEX_SCAN !== "0")
+    try {
+      Bun.spawn([process.execPath, import.meta.path, "--scan"], { stdio: ["ignore", "ignore", "ignore"], detached: true } as any).unref();
+    } catch {}
   process.exit(0);
 }

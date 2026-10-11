@@ -147,3 +147,20 @@ test("a closing tag quoted inside a memex answer cannot end the block early", as
   expect(lex.join("\n")).not.toContain("LEAKED_TAIL");
   expect(lex.join("\n")).toContain("KEPT");
 });
+
+test("query allowed, upload not: snapshot and recall still run, and no sync request goes out", async () => {
+  writeFileSync(join(dir, "policy.json"), JSON.stringify({ scopes: [{ name: "personal", paths: [join(dir, "home", "sessions")],
+    allow: { snapshot: ["memex"], recall: ["memex"] } }] }));
+  const path = rollout(ID);
+  process.env.MEMEX_RECALL_TAU = "0.5";
+  try {
+    await handle({ hook_event_name: "SessionStart", session_id: ID, transcript_path: path, cwd: dir });
+    await handle({ hook_event_name: "UserPromptSubmit", session_id: ID, transcript_path: path, turn_id: "t1", prompt: "port?" });
+    await handle({ hook_event_name: "Stop", session_id: ID, transcript_path: path });
+  } finally {
+    delete process.env.MEMEX_RECALL_TAU;
+  }
+  expect(reqs.filter((p) => p.startsWith("/v1/sync"))).toEqual([]);
+  expect(reqs).toContain("/v1/snapshot");
+  expect(reqs).toContain("/v1/recall");
+});

@@ -184,19 +184,22 @@ export default function memex(pi: ExtensionAPI) {
     const leaf = ctx.sessionManager.getLeafId();
     const latest = [...e.messages].reverse().find((m: any) => m.role === "user");
     const cur = latest && entryOf(latest);
+    // One budget from here for this input's recall, its blocks included: past it, this input's block is never
+    // injected — not now, not by a later replay in this process (another process may still replay a decision the
+    // server saved before its own deadline: the server's budget_ms bound is the protocol's, see DESIGN §6.2).
+    let deadline: number | undefined;
     if (cur && human && branch.at(-1)?.id === cur.id && !x.recalls.has(cur.id)) {
-      // One budget from here for the whole recall; an answer after it is dropped, and so is its block later.
-      const deadline = Date.now() + Number(process.env.MEMEX_PI_RECALL_MS ?? RECALL_MS);
-      x.recalls.set(cur.id, recallFor(ctx, x, branch, cur, deadline).then(() => {
-        if (Date.now() >= deadline) x.late.add(cur.id);
+      const until = (deadline = Date.now() + Number(process.env.MEMEX_PI_RECALL_MS ?? RECALL_MS));
+      x.recalls.set(cur.id, recallFor(ctx, x, branch, cur, until).then(() => {
+        if (Date.now() >= until) x.late.add(cur.id);
       }));
-      if ((await within(x.recalls.get(cur.id)!, Math.max(0, deadline - Date.now()))) === "late") x.late.add(cur.id);
+      if ((await within(x.recalls.get(cur.id)!, Math.max(0, until - Date.now()))) === "late") x.late.add(cur.id);
     }
     // Blocks as the server has them now; unreachable → every past block is left out (§6.2 degradation).
     let ok = false;
     try {
       const r: any = await t!("POST", "/v1/recall/blocks", { source: x.source, scope: x.scope, ...(x.cursor ? { cursor: x.cursor } : {}) },
-                              { deadline: Date.now() + BLOCKS_MS });
+                              { deadline: Math.min(Date.now() + BLOCKS_MS, deadline ?? Infinity) });
       if (r.replace) x.blocks = new Map();
       for (const b of r.blocks ?? []) x.blocks.set(b.user_rec, b.text);
       x.cursor = r.cursor;
@@ -205,6 +208,8 @@ export default function memex(pi: ExtensionAPI) {
       x.cursor = undefined;
       x.blocks = new Map();
     }
+    // Past this input's budget (the blocks answer came after it): its block counts as late, never shown.
+    if (deadline !== undefined && Date.now() >= deadline) x.late.add(cur.id);
     // Still the state this request was made for: same session, same leaf.
     if (!ok || !x.blocks.size || stateOf(ctx) !== x || ctx.sessionManager.getLeafId() !== leaf) return;
     let changed = false;

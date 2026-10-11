@@ -1,7 +1,7 @@
 // Codex plugin end to end: the built plugin installed into an isolated CODEX_HOME, the real `codex exec` (and
-// `exec resume`), the real memex HTTP server and Postgres, fake memex models. The host model is the local
-// proxy of eval/probes (MEMEX_E2E_CODEX_BASE, default http://127.0.0.1:8317/v1); skipped when it or codex is
-// not there. Hooks run with --dangerously-bypass-hook-trust (the trust review is the user's, not testable here).
+// `exec resume`), the real memex HTTP server and Postgres, fake memex models. Opt-in:
+//   MEMEX_E2E_CODEX=1 MEMEX_E2E_CODEX_KEY=<key> [MEMEX_E2E_CODEX_BASE=…/v1] [MEMEX_E2E_CODEX_MODEL=…] bun test plugins/codex/e2e.test.ts
+// Hooks run with --dangerously-bypass-hook-trust (the trust review is the user's, not testable here).
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,10 +14,14 @@ import { build } from "./build.ts";
 
 const KINDS = Object.keys(handlers).filter((k) => !k.startsWith("l3"));
 const CODEX = Bun.which("codex");
+// A live integration: runs only when asked for (MEMEX_E2E_CODEX=1), against a Responses endpoint given in the
+// environment (no credential defaults here).
 const BASE = process.env.MEMEX_E2E_CODEX_BASE ?? "http://127.0.0.1:8317/v1";
-const KEY = process.env.MEMEX_E2E_CODEX_KEY ?? "REPLACE_WITH_YOUR_KEY";
+const KEY = process.env.MEMEX_E2E_CODEX_KEY ?? "";
 const MODEL = process.env.MEMEX_E2E_CODEX_MODEL ?? "gpt-6.1-sol";
-const up = CODEX ? await fetch(BASE + "/models", { headers: { authorization: `Bearer ${KEY}` }, signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false) : false;
+const up = process.env.MEMEX_E2E_CODEX === "1" && CODEX && KEY
+  ? await fetch(BASE + "/models", { headers: { authorization: `Bearer ${KEY}` }, signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false)
+  : false;
 
 let db: Db;
 let model: ReturnType<typeof Bun.serve>;
