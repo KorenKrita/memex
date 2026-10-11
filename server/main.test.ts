@@ -13,3 +13,14 @@ test("close() returns within MEMEX_STOP_MS even with a database query outstandin
   expect(await q).toBe("cut");
   delete process.env.MEMEX_STOP_MS;
 });
+
+test("/healthz answers 503 within its deadline when the database stops answering", async () => {
+  const { serve } = await import("./http.ts");
+  const db: any = () => new Promise(() => {}); // an established connection that never answers
+  const api = await serve(db, { port: 0 });
+  const at = Date.now();
+  const r = await fetch(`http://127.0.0.1:${api.port}/healthz`, { signal: AbortSignal.timeout(6_000) });
+  expect(r.status).toBe(503);
+  expect(Date.now() - at).toBeLessThan(4_000);
+  await api.stop();
+});
