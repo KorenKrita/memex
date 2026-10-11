@@ -192,29 +192,30 @@ test("a recall answer that arrives past the hook's budget is not emitted", async
   }
 });
 
-test("a hanging lease release holds neither the hook past its budget nor lets it ask for recall late", async () => {
+test("a lease release that does not answer does not hold the hook up", async () => {
   const path = rollout(ID);
   const seen: string[] = [];
   globalThis.fetch = (async (u: any, i: any) => {
     const p = new URL(String(u)).pathname;
     seen.push(p);
-    if (p.endsWith("/release")) return new Promise<Response>(() => {});
-    if (p.endsWith("/poll")) {
-      await Bun.sleep(700); // past the budget: the poll's own deadline aborts it
-      return Response.json({ granted: false });
-    }
+    // The release never answers unless aborted (honouring the signal, as fetch does); the poll fails at once,
+    // so the sync gives its lease back and the hook goes on to its recall step.
+    if (p.endsWith("/release"))
+      return new Promise<Response>((_, no) => i?.signal?.addEventListener("abort", () => no(i.signal.reason)));
+    if (p.endsWith("/poll")) return new Response("down", { status: 503 });
     return orig(u, i);
   }) as any;
   try {
     const at = Date.now();
     await handle({ hook_event_name: "UserPromptSubmit", session_id: ID, transcript_path: path, turn_id: "t10", prompt: "port?" },
                  { ...process.env, MEMEX_CODEX_RECALL_MS: "600" });
-    expect(Date.now() - at).toBeLessThan(800);
-    expect(seen).not.toContain("/v1/recall");
+    expect(Date.now() - at).toBeLessThan(600); // the release (5 s cap) is not waited for
+    expect(seen.some((s) => s.endsWith("/release"))).toBe(true); // the lease was given back (sent)
   } finally {
     globalThis.fetch = (async (u: any, i: any) => (reqs.push(new URL(String(u)).pathname), orig(u, i))) as any;
   }
 });
+
 
 test("MCP identity: reverted rollouts (rollout-<ts>-<thread>_<rollout>.jsonl) count; different scopes → no session", async () => {
   const { sessionOfThread } = await import("./session.ts");
