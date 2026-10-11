@@ -16,10 +16,28 @@ export async function start(opts: { port?: number; hostname?: string } = {}) {
   const api = await serve(db, { port: opts.port ?? Number(process.env.MEMEX_PORT ?? 8787), hostname: opts.hostname ?? process.env.MEMEX_HOST });
   const stop = new AbortController();
   const worker = loop(db, stop.signal);
+  // Watchdog: a database that stops answering on open connections (a network black hole, a frozen host)
+  // leaves queries waiting forever, which no error path sees. Three checks in a row without an answer
+  // within 3 s: exit 1, and the restart policy brings a fresh process. An error (Postgres down, connection
+  // refused) is an answer: the worker's backoff handles it.
+  const every = Number(process.env.MEMEX_WATCHDOG_MS ?? 10_000);
+  const watchdog = (async () => {
+    // One check at a time: a silent database never piles up more than one waiting query here.
+    for (let missed = 0; !stop.signal.aborted; ) {
+      const answered = await Promise.race([db`select 1`.then(() => true, () => true), Bun.sleep(3_000).then(() => false)]);
+      missed = answered ? 0 : missed + 1;
+      if (missed >= 3 && !stop.signal.aborted) {
+        console.error("memex: the database has not answered for 3 checks; exiting for a restart");
+        process.exit(1);
+      }
+      await Bun.sleep(every);
+    }
+  })();
   return {
     db, port: api.port,
     close: async () => {
       stop.abort();
+      void watchdog; // ends at its next check (stop is aborted)
       // One budget for the whole stop. A job in flight (a model call can take MEMEX_MODEL_TIMEOUT_MS) or a query
       // waiting on a lock may run into it; past it, open requests and connections are cut. Nothing is published
       // without its commit (a cut transaction rolls back), and an interrupted job's lock lapses and it runs again.
