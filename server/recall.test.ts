@@ -1243,3 +1243,26 @@ test("Codex turn binding: another input of the same turn (steering) is its own b
   expect(b.state).toBe("shown");
   expect((await db`select count(*)::int n from recall_block where source = ${csrc}`)[0].n).toBe(2);
 });
+
+test("Codex turn binding: a multi-part prompt (Codex joins the parts with nothing) still resolves to its withdrawn record", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const raw = JSON.stringify({ timestamp: T, ordinal: 1, type: "response_item", payload: { type: "message", role: "user",
+    content: [{ type: "input_text", text: "zx-7781 first" }, { type: "input_text", text: " part two" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-m", content_item_kinds: ["user.text", "user.text"] } } });
+  await putCodex([cmeta, raw]);
+  await putCodex([cmeta]); // withdrawn
+  await drain(db);
+  calls = [];
+  const prompt = "zx-7781 first part two"; // UserMessageItem::message(): text parts joined with ""
+  const d = await ask({ ...R(turnRec("turn-m", prompt), prompt), source: csrc });
+  expect(d.state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
+test("Codex turn binding: steering while the turn's first prompt is uploaded is a new input, recalled", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await putCodex([cmeta, cline(1, "user", "zx-7781 first ask", "turn-st")]);
+  await drain(db);
+  const d = await ask({ ...R(turnRec("turn-st", "zx-7781 steer"), "zx-7781 steer"), source: csrc });
+  expect(d.state).toBe("shown");
+});

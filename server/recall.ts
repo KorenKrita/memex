@@ -22,7 +22,7 @@ import { BARRIER, HttpError, copyTombsOf } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 import { canonOf, load } from "./project.ts";
-import { codexTextOf, contentHash, looseOf } from "../dryrun/dryrun.ts";
+import { contentHash, looseOf } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
 const TAU = () => (process.env.MEMEX_RECALL_TAU ? Number(process.env.MEMEX_RECALL_TAU) : NaN); // [待标定] unset: not ready
@@ -141,15 +141,20 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
       const pin: Record<string, number> = { ...b.qDeps, ...Object.fromEntries(keys.map((k: string) => [k, vs.get(k) ?? 1])) };
       // The record this input is. A Codex prompt is bound before Codex records it (`turn:<turn id>:<input hash>`):
       // once uploaded, it is the user line of that turn with this text, in any version ever received — so every
-      // check below runs on that record (a withdrawn one is refused, never "not yet synced"); two such lines: refused.
+      // check below runs on that record (a withdrawn one is refused, never "not yet synced"). The text is the
+      // hook's own serialization (UserMessageItem::message(): the text parts joined with nothing), so no match
+      // means not uploaded yet — e.g. a steering input while the turn's first prompt is already there. Two
+      // matching lines: refused.
       let self = r.user_rec;
       if (r.turn) {
-        const lines = (await q`select distinct rec, raw from body where source = ${r.source} and strpos(raw, ${r.turn.id}) > 0`)
-          .filter((x: any) => {
-            const l = JSON.parse(x.raw);
-            return l.payload?.internal_chat_message_metadata_passthrough?.turn_id === r.turn!.id && codexTextOf(l, "user").trim() === input;
-          });
-        const recs: string[] = [...new Set<string>(lines.map((x: any) => x.rec as string))];
+        type Line = { rec: string; l: any };
+        const rows: any[] = await q`select distinct rec, raw from body where source = ${r.source} and strpos(raw, ${r.turn.id}) > 0`;
+        const lines: Line[] = rows.map((x) => ({ rec: x.rec, l: JSON.parse(x.raw) }))
+          .filter((x: Line) => x.l.type === "response_item" && x.l.payload?.type === "message" && x.l.payload.role === "user" &&
+                               x.l.payload.internal_chat_message_metadata_passthrough?.turn_id === r.turn!.id);
+        const prompt = (l: any) => (Array.isArray(l.payload.content) ? l.payload.content : [])
+          .map((c: any) => (c?.type === "input_text" && typeof c.text === "string" ? c.text : "")).join("").trim();
+        const recs: string[] = [...new Set<string>(lines.filter((x) => prompt(x.l) === input).map((x) => x.rec))];
         if (recs.length > 1) return { found: null, pin, stale: true };
         if (recs.length) self = recs[0];
       }
