@@ -7,6 +7,7 @@
 //   Stop, PreCompact, SessionEnd   sync
 // Identity is the transcript itself: its session_meta id must be the payload's session_id, and the file must
 // lie in a policy scope; otherwise nothing leaves this machine.
+import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { fromEnv, type Transport } from "../../client/api.ts";
@@ -21,6 +22,7 @@ const SNAPSHOT_MS = 3_000;
 const RECALL_MS = Number(process.env.MEMEX_CODEX_RECALL_MS ?? 3_000);
 const SCAN_MS = 10_000;
 const collector = () => `${process.env.MEMEX_MACHINE ?? hostname()}:codex`;
+const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 
 type Payload = { hook_event_name?: string; session_id?: string; transcript_path?: string | null; cwd?: string; turn_id?: string; prompt?: string; source?: string };
 
@@ -97,7 +99,8 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     const read = readSession(s.path, "codex");
     if (!read.ok) return out(event);
     const body = {
-      source: s.source, scope: s.scope, user_rec: `turn:${p.turn_id}`, input: p.prompt, ...previous(read.records),
+      // The turn and this prompt's hash: the server finds the prompt's record by them once it is uploaded.
+      source: s.source, scope: s.scope, user_rec: `turn:${p.turn_id}:${sha(p.prompt.trim()).slice(0, 16)}`, input: p.prompt, ...previous(read.records),
       dests: allowedDests(policy, s.scope, "recall"), budget_ms: Math.max(1, deadline - Date.now() - 200),
     };
     const r: any = await t("POST", "/v1/recall", body, { deadline }).catch((e) => ({ state: "failed", reason: String(e?.message ?? e) }));

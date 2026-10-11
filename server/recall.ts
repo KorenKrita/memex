@@ -22,7 +22,7 @@ import { BARRIER, HttpError, copyTombsOf } from "./sync.ts";
 import { snapshot, unchanged, within } from "./derive.ts";
 import { basis, search } from "./search.ts";
 import { canonOf, load } from "./project.ts";
-import { contentHash, looseOf } from "../dryrun/dryrun.ts";
+import { codexTextOf, contentHash, looseOf } from "../dryrun/dryrun.ts";
 
 export const BUDGET_MS = () => Number(process.env.MEMEX_RECALL_MS ?? 2_500); // [待标定 2.5s]
 const TAU = () => (process.env.MEMEX_RECALL_TAU ? Number(process.env.MEMEX_RECALL_TAU) : NaN); // [待标定] unset: not ready
@@ -55,7 +55,7 @@ export const queryOf = (input: string, prevUser: string, prevAssistant: string) 
 
 type Ref = { rec: string; hash: string };
 type Req = { source: string; scope: string; user_rec: string; input: string; prev_user: string; prev_assistant: string; prev_user_ref: Ref | null; prev_assistant_ref: Ref | null;
-             dests: string[]; leaf?: string; inContext?: string[] };
+             dests: string[]; leaf?: string; inContext?: string[]; turn?: { id: string } };
 const refOf = (v: any, n: string): Ref | null => {
   if (v === undefined || v === null) return null;
   if (typeof v?.rec !== "string" || !v.rec || v.rec.length > 256 || typeof v?.hash !== "string" || !/^[0-9a-f]{64}$/.test(v.hash)) throw new HttpError(400, `${n} must be { rec, hash }`);
@@ -67,13 +67,19 @@ function validate(b: any): Req {
     if (typeof v !== "string" || (!v && !empty) || v.length > max) throw new HttpError(400, `${n} must be a string`);
     return v;
   };
+  const user_rec = s(b?.user_rec, "user_rec", 256);
+  const input = s(b?.input, "input", 8192, true);
+  // A Codex turn binding names its input: the hash must be this input's, so one binding is one prompt.
+  const tm = /^turn:([0-9A-Za-z-]{1,64}):([0-9a-f]{16})$/.exec(user_rec);
+  if (user_rec.startsWith("turn:") && (!tm || tm[2] !== sha(input.trim()).slice(0, 16))) throw new HttpError(400, "user_rec turn:<id>:<sha256(input)[0:16]>");
   return {
-    source: s(b?.source, "source", 64), scope: s(b?.scope, "scope", 64), user_rec: s(b?.user_rec, "user_rec", 256),
-    input: s(b?.input, "input", 8192, true), prev_user: s(b?.prev_user, "prev_user", 8192, true), prev_assistant: s(b?.prev_assistant, "prev_assistant", 65536, true),
+    source: s(b?.source, "source", 64), scope: s(b?.scope, "scope", 64), user_rec,
+    input, prev_user: s(b?.prev_user, "prev_user", 8192, true), prev_assistant: s(b?.prev_assistant, "prev_assistant", 65536, true),
     prev_user_ref: refOf(b?.prev_user_ref, "prev_user_ref"), prev_assistant_ref: refOf(b?.prev_assistant_ref, "prev_assistant_ref"),
     dests: Array.isArray(b?.dests) ? b.dests : [],
     leaf: typeof b?.leaf === "string" ? b.leaf : undefined,
     inContext: Array.isArray(b?.inContext) ? b.inContext : undefined,
+    ...(tm ? { turn: { id: tm[1] } } : {}),
   };
 }
 
@@ -133,17 +139,31 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
       const keys = anc.map((x: any) => "s:" + x.id);
       const vs = new Map<string, number>((await q`select key, v from vis_version where key = any(${q.array(keys, "text")})`).map((x: any) => [x.key, Number(x.v)]));
       const pin: Record<string, number> = { ...b.qDeps, ...Object.fromEntries(keys.map((k: string) => [k, vs.get(k) ?? 1])) };
+      // The record this input is. A Codex prompt is bound before Codex records it (`turn:<turn id>:<input hash>`):
+      // once uploaded, it is the user line of that turn with this text, in any version ever received — so every
+      // check below runs on that record (a withdrawn one is refused, never "not yet synced"); two such lines: refused.
+      let self = r.user_rec;
+      if (r.turn) {
+        const lines = (await q`select distinct rec, raw from body where source = ${r.source} and strpos(raw, ${r.turn.id}) > 0`)
+          .filter((x: any) => {
+            const l = JSON.parse(x.raw);
+            return l.payload?.internal_chat_message_metadata_passthrough?.turn_id === r.turn!.id && codexTextOf(l, "user").trim() === input;
+          });
+        const recs: string[] = [...new Set<string>(lines.map((x: any) => x.rec as string))];
+        if (recs.length > 1) return { found: null, pin, stale: true };
+        if (recs.length) self = recs[0];
+      }
       if (!row) {
         // The current input, when ever synced (in L0 in any state, or a version kept in its body history after a
         // shorter file dropped it): sent only as the readable user record it is now — in a current projection's
         // views, its indexed text the input. A withdrawn one (a revised parent's old copy, a conflict, quarantined,
         // dropped) is not "not yet synced": refused, previous exchange or not.
-        if ((await q`select 1 from record where source = ${r.source} and rec = ${r.user_rec}
-                     union all select 1 from body where source = ${r.source} and rec = ${r.user_rec} limit 1`).length) {
+        if ((await q`select 1 from record where source = ${r.source} and rec = ${self}
+                     union all select 1 from body where source = ${r.source} and rec = ${self} limit 1`).length) {
           const [p] = await q`select deps from projected where source = ${r.source} and status = 'ok'`;
           if (!p || !(await unchanged(q, p.deps))) return { found: null, pin, stale: true };
           const ks = [...new Set((await q`select recs from view where source = ${r.source}`).flatMap((v: any) =>
-            (v.recs as { key: string; id: string; kind: string }[]).filter((x) => x.id === r.user_rec && x.kind === "user").map((x) => x.key)))];
+            (v.recs as { key: string; id: string; kind: string }[]).filter((x) => x.id === self && x.kind === "user").map((x) => x.key)))];
           if (!ks.length) return { found: null, pin, stale: true };
           const owners = [r.source, ...keys.map((k: string) => k.slice(2))];
           const rows = await q`select key, text from lexical where source = any(${q.array(owners, "text")}) and key = any(${q.array(ks, "text")})
@@ -151,7 +171,7 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
           const text = ks.map((k) => rows.filter((x: any) => x.key === k).map((x: any) => x.text).join("")).join("");
           if (text.trim() !== input) return { found: null, pin, stale: true };
         }
-        else if (keys.length && (await q`select 1 from tomb where key = any(${q.array(keys.map((k: string) => `canon:${k.slice(2)}:${r.user_rec}`), "text")}) limit 1`).length) {
+        else if (keys.length && (await q`select 1 from tomb where key = any(${q.array(keys.map((k: string) => `canon:${k.slice(2)}:${self}`), "text")}) limit 1`).length) {
           // Not in L0, but a forgotten ancestor of this lineage held this id: a copy forget removed (Pi copies keep
           // the parent's ids), not a new input — refused, never sent as "not yet synced".
           return { found: null, pin, stale: true };
@@ -235,7 +255,7 @@ export async function recall(db: Db, body: any, until0?: number): Promise<Guarde
             if (recs.some((x) => !on.has(x.id))) return { found: null, pin, stale: true }; // not that path after all
           } else {
             const all = views[0] ?? [];
-            const at = all.findIndex((x) => x.id === r.user_rec);
+            const at = all.findIndex((x) => x.id === self);
             recs = at < 0 ? all : all.slice(0, at);
           }
           const u = recs.findLastIndex((x) => x.kind === "user");

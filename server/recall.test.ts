@@ -1192,3 +1192,54 @@ test("a Codex session's previous exchange with valid references: sent", async ()
   expect(outbound()).toContain("CODEX_PREV_QUESTION");
   expect(outbound()).toContain("CODEX_PREV_REPLY");
 });
+
+// ---------- Codex: a prompt bound by its turn (the hook runs before Codex records it) ----------
+const CID = "33333333-3333-3333-3333-333333333333";
+const csrc = sourceIdOf("codex", CID);
+const cline = (ordinal: number, role: string, text: string, turn?: string) =>
+  JSON.stringify({ timestamp: T, ordinal, type: "response_item", payload: { type: "message", role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text }],
+    ...(turn ? { internal_chat_message_metadata_passthrough: { turn_id: turn, content_item_kinds: ["user.text"] } } : {}) } });
+const cmeta = JSON.stringify({ timestamp: T, ordinal: 0, type: "session_meta", payload: { id: CID, history_mode: "paginated", source: "cli", cwd: "/x" } });
+async function putCodex(lines: string[]) {
+  const decl = { source: csrc, harness: "codex" as const, nativeId: CID, scope: "personal", parent: null };
+  const l = await requestLease(db, decl, "m1");
+  expect((await tryGrant(db, l)).granted).toBe(true);
+  expect((await commit(db, { leaseId: l, commitId: `r${n++}`, length: lines.length, changes: lines.map((raw, pos) => ({ pos, id: String(pos), hash: sha(raw), raw })) })).ok).toBe(true);
+}
+const turnRec = (turn: string, input: string) => `turn:${turn}:${sha(input).slice(0, 16)}`;
+const cref = (raw: string) => ({ rec: String(JSON.parse(raw).ordinal), hash: sha(raw) });
+
+test("Codex turn binding: the turn's input once uploaded and then withdrawn is refused, not 'not yet synced'", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const u = cline(1, "user", "zx-7781 where", "turn-x");
+  await putCodex([cmeta, u, cline(2, "assistant", "there")]);
+  await putCodex([cmeta]); // rolled back: the turn's lines are gone (body keeps them)
+  await drain(db);
+  calls = [];
+  const d = await ask({ ...R(turnRec("turn-x", "zx-7781 where"), "zx-7781 where"), source: csrc });
+  expect(d.state).toBe("query-stale");
+  expect(calls.length).toBe(0);
+});
+
+test("Codex turn binding: the turn's input already uploaded is that record — the previous exchange is the one before it", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  const pu = cline(1, "user", "CODEX_Q0", "turn-0"), pa = cline(2, "assistant", "CODEX_R0");
+  await putCodex([cmeta, pu, pa, cline(3, "user", "zx-7781 again", "turn-1")]);
+  await drain(db);
+  calls = [];
+  const d = await ask({ ...R(turnRec("turn-1", "zx-7781 again"), "zx-7781 again"), source: csrc,
+    prev_user: "CODEX_Q0", prev_user_ref: cref(pu), prev_assistant: "CODEX_R0", prev_assistant_ref: cref(pa) });
+  expect(d.state).toBe("shown");
+  expect(outbound()).toContain("CODEX_R0");
+});
+
+test("Codex turn binding: another input of the same turn (steering) is its own binding", async () => {
+  await put("a", [["q", "ANSWER zx-7781"]]);
+  await putCodex([cmeta]);
+  await drain(db);
+  const a = await ask({ ...R(turnRec("turn-s", "zx-7781 first"), "zx-7781 first"), source: csrc });
+  const b = await ask({ ...R(turnRec("turn-s", "zx-7781 second"), "zx-7781 second"), source: csrc });
+  expect(a.state).toBe("shown");
+  expect(b.state).toBe("shown");
+  expect((await db`select count(*)::int n from recall_block where source = ${csrc}`)[0].n).toBe(2);
+});

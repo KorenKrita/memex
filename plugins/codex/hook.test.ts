@@ -88,7 +88,7 @@ test("UserPromptSubmit binds the prompt by turn id and references the last excha
     delete process.env.MEMEX_RECALL_TAU;
   }
   expect(reqs[0]).toBe("/v1/sync/lease"); // synced before the recall
-  expect(bodies[0].user_rec).toBe("turn:t1");
+  expect(bodies[0].user_rec).toMatch(/^turn:t1:[0-9a-f]{16}$/);
   expect(bodies[0].input).toBe("and that port?");
   expect(bodies[0].prev_user).toBe("where is the port");
   expect(bodies[0].prev_user_ref.rec).toBe("1");
