@@ -494,20 +494,53 @@ test("interleaved inputs: a delayed extension follow-up is not recalled, the hum
   const a = host("past4");
   await a.run("where is the port", "ANSWER the port is zx-7781");
   await flush(a);
-  const h = host("now4");
-  await h.run("hello", "hi");
-  await h.emit("input", { text: "AUTOMATED delayed follow-up about the zx-7781 port", source: "extension" }); // its handlers still running
-  const human = await h.run("which port is zx-7781?", "ok"); // delivered first
-  await h.emit("input", { text: "the zx-7781 port again?", source: "interactive" }); // handled by another extension: no entry
-  const status = async () => {
-    const notes: string[] = [];
-    await h.commands.get("memex").handler("", { ...h.ctx, ui: { notify: (m: string) => notes.push(m), setStatus: () => {} } });
-    return notes.join("\n").match(/last recall: .*/)![0];
-  };
-  expect(await status()).not.toMatch(/last recall: none/); // the human input was asked for
-  const before = await status();
-  const ext = await h.run("AUTOMATED delayed follow-up about the zx-7781 port", "ok", { noInput: true });
-  expect(sentText(ext.sent)).not.toContain("memex-recall");
-  expect(await status()).toBe(before); // and the extension's was not
-  void human;
+  const asked: string[] = [];
+  const orig = globalThis.fetch; // before the host: its transport takes fetch when it is made
+  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
+  try {
+    const h = host("now4");
+    await h.run("hello", "hi");
+    await h.emit("input", { text: "AUTOMATED delayed follow-up about the zx-7781 port", source: "extension" }); // its handlers still running
+    const human = await h.run("which port is zx-7781?", "ok"); // delivered first
+    await h.emit("input", { text: "the zx-7781 port again?", source: "interactive" }); // handled by another extension: no entry
+    const ext = await h.run("AUTOMATED delayed follow-up about the zx-7781 port", "ok", { noInput: true });
+    expect(asked).toContain(human.user.id);
+    expect(asked).not.toContain(ext.user.id);
+    expect(sentText(ext.sent)).not.toContain("memex-recall");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("same text from an extension and the user: neither entry is recalled, whichever comes first", async () => {
+  const asked: string[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
+  try {
+    const h = host("same5");
+    await h.run("hello", "hi");
+    await h.emit("input", { text: "the zx-7781 port?", source: "extension" }); // delayed
+    const first = await h.run("the zx-7781 port?", "ok"); // the user's, delivered first: two matches
+    const second = await h.run("the zx-7781 port?", "ok", { noInput: true }); // the extension's
+    expect(asked).not.toContain(first.user.id);
+    expect(asked).not.toContain(second.user.id);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("an extension input dropped past the 50 pending keeps a later same-text entry from being recalled", async () => {
+  const asked: string[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (u: any, i: any) => (String(u).endsWith("/v1/recall") && asked.push(JSON.parse(String(i.body)).user_rec), orig(u, i))) as any;
+  try {
+    const h = host("lost6");
+    await h.run("hello", "hi");
+    await h.emit("input", { text: "the zx-7781 port?", source: "extension" }); // delayed, then pushed out
+    for (let i = 0; i < 50; i++) await h.emit("input", { text: `handled ${i}`, source: "interactive" }); // no entries
+    const r = await h.run("the zx-7781 port?", "ok"); // the user's own, but the extension's could be this one
+    expect(asked).not.toContain(r.user.id);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
