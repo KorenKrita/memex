@@ -55,6 +55,21 @@ bun server/admin.ts grant list
 Grants are the server's own authorization. The client policy can only narrow them. A revoke withdraws what
 was derived or served under the grant.
 
+### Backup and restore
+
+```sh
+deploy/backup.sh                                   # pg_dump -Fc into deploy/backups/, keeps the newest 14 (KEEP)
+deploy/backup.sh restore deploy/backups/<file> memex_restored   # into a NEW database; refuses "memex"
+```
+
+Run the dump daily (cron or a systemd timer on the server host); copy `deploy/backups/` off the machine. The
+dump holds everything: records, grants, API key hashes and forget tombstones. To switch to a restored
+database, point `MEMEX_PG_URL` at it (or rename it after stopping the API).
+
+A backup taken before a forget still holds what was forgotten, and restoring it brings that back: after a
+restore, repeat every forget made since the backup was taken. Uploads of a source forgotten before the backup
+are still refused after the restore (its tombstone is in the dump).
+
 ## 2. Client settings (both hosts)
 
 **Server**: `MEMEX_URL` and `MEMEX_KEY` when both are set in the environment; otherwise the file
