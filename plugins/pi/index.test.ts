@@ -131,8 +131,8 @@ function host(native: string, from?: { entries: Entry[]; leaf: () => string | nu
     source: sourceIdOf("pi", native),
     /** One run: input → before_agent_start → user entry → context → reply → turn_end. Returns the system
      *  prompt sections and the messages sent to the model. */
-    async run(input: string, reply: string, o: { source?: string; beforeContext?: () => Promise<void> } = {}) {
-      await emit("input", { text: input, source: o.source ?? "interactive" });
+    async run(input: string, reply: string, o: { source?: string; beforeContext?: () => Promise<void>; noInput?: boolean } = {}) {
+      if (!o.noInput) await emit("input", { text: input, source: o.source ?? "interactive" }); // noInput: emitted earlier
       const sections: Record<string, string> = {};
       await emit("before_agent_start", { prompt: input, systemPrompt: "", systemPromptOptions: { sections } });
       const u = add({ role: "user", content: text(input) }, false); // in memory first: the file has it at turn end
@@ -475,4 +475,39 @@ test("a session file not written yet, under a symlinked directory, is in its sco
   expect(scopeOf(p, join(dir, "link", "not-yet.jsonl"))).toBe("personal");
   expect(scopeOf(p, join(dir, "link", "sub", "not-yet.jsonl"))).toBe("personal");
   expect(scopeOf(p, join(dir, "elsewhere", "x.jsonl"))).toBe("unauthorized");
+});
+
+test("MEMEX_SCAN_DELAY_MS < 0 turns reconciliation off after turns too", async () => {
+  process.env.MEMEX_SCAN_EVERY_MS = "0";
+  try {
+    const h = host("noscan");
+    await h.run("hello", "hi");
+    await h.run("again", "ok");
+    await Bun.sleep(300);
+    expect((await db`select count(*)::int n from scan_round`)[0].n).toBe(0);
+  } finally {
+    delete process.env.MEMEX_SCAN_EVERY_MS;
+  }
+});
+
+test("interleaved inputs: a delayed extension follow-up is not recalled, the human steering input is", async () => {
+  const a = host("past4");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now4");
+  await h.run("hello", "hi");
+  await h.emit("input", { text: "AUTOMATED delayed follow-up about the zx-7781 port", source: "extension" }); // its handlers still running
+  const human = await h.run("which port is zx-7781?", "ok"); // delivered first
+  await h.emit("input", { text: "the zx-7781 port again?", source: "interactive" }); // handled by another extension: no entry
+  const status = async () => {
+    const notes: string[] = [];
+    await h.commands.get("memex").handler("", { ...h.ctx, ui: { notify: (m: string) => notes.push(m), setStatus: () => {} } });
+    return notes.join("\n").match(/last recall: .*/)![0];
+  };
+  expect(await status()).not.toMatch(/last recall: none/); // the human input was asked for
+  const before = await status();
+  const ext = await h.run("AUTOMATED delayed follow-up about the zx-7781 port", "ok", { noInput: true });
+  expect(sentText(ext.sent)).not.toContain("memex-recall");
+  expect(await status()).toBe(before); // and the extension's was not
+  void human;
 });

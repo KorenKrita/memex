@@ -23,7 +23,6 @@ const SNAPSHOT_MS = 3_000;
 const RECALL_MS = 3_000; // the server's own budget is 2.5 s; a later answer is dropped
 const BLOCKS_MS = 1_500;
 const SCAN_MS = 60_000; // one reconciliation run (background)
-const SCAN_EVERY_MS = Number(process.env.MEMEX_SCAN_EVERY_MS ?? 600_000); // again after a turn, at most this often
 const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 
 type Session = {
@@ -33,7 +32,7 @@ type Session = {
   meta: { repo?: string };
   chain: Promise<unknown>; // syncs, one at a time
   lastSync?: { at: string; outcome: SyncOutcome | { status: "error"; reason: string } };
-  inputs: { at: number; human: boolean }[]; // input events not yet tied to a user entry: when, and recallable
+  inputs: { at: number; text: string; human: boolean }[]; // input events not yet tied to a user entry (last 50)
   seen: Set<string>; // user entries already tied to an input, or there before it
   based: boolean; // the baseline (entries there before the first input) taken
   recalls: Map<string, Promise<void>>; // user entry id → its one recall request
@@ -115,9 +114,10 @@ export default function memex(pi: ExtensionAPI) {
 
   /** Reconciliation (§5.2) over this machine's authorized Pi logs, in the background: calls until the round is
    *  finished (the server keeps the progress), at session start and again after turns while the session lives
-   *  (at most every SCAN_EVERY_MS; the server opens a new round only once its own interval has passed). */
-  function scan(x: Session, delay = Number(process.env.MEMEX_SCAN_DELAY_MS ?? 2_000)) {
-    if (!t || delay < 0 || x.scanning) return; // < 0: off
+   *  (at most every MEMEX_SCAN_EVERY_MS, default 10 min; the server opens a new round only once its own interval has passed). */
+  function scan(x: Session, now = false) {
+    const delay = Number(process.env.MEMEX_SCAN_DELAY_MS ?? 2_000); // after session start; < 0: off altogether
+    if (!t || delay < 0 || x.scanning) return;
     const roots = policy.scopes.filter((p) => p.allow?.sync?.includes("memex")).flatMap((p) => p.paths);
     if (!roots.length) return;
     x.scanning = true;
@@ -134,7 +134,7 @@ export default function memex(pi: ExtensionAPI) {
         run = Promise.reject(e);
       }
       run.catch((e) => (x.scan = `${new Date().toISOString()} failed: ${err(e)}`)).finally(() => (x.scanning = false));
-    }, delay).unref?.();
+    }, now ? 0 : delay).unref?.();
   }
 
   pi.on("session_start", async (_e, ctx) => {
@@ -145,7 +145,7 @@ export default function memex(pi: ExtensionAPI) {
   pi.on("turn_end", async (_e, ctx) => {
     void sync(ctx);
     const x = stateOf(ctx);
-    if (Date.now() - (x.scanAt ?? 0) >= SCAN_EVERY_MS) scan(x, 0);
+    if (Date.now() - (x.scanAt ?? 0) >= Number(process.env.MEMEX_SCAN_EVERY_MS ?? 600_000)) scan(x, true);
   });
   pi.on("session_compact", async (_e, ctx) => void sync(ctx));
   pi.on("session_tree", async (_e, ctx) => void sync(ctx));
@@ -168,15 +168,16 @@ export default function memex(pi: ExtensionAPI) {
   // An input becomes at most one new user entry, made after it (Pi stamps the message after the input handlers;
   // another extension may handle the input and make none). Entries that exist when the session is first seen
   // here (history of a resumed session, other branches) are never an input's entry: the baseline is taken
-  // once, on the first input. Each input is kept with its time and whether it may be recalled: typed by the
-  // user (not an extension's) and not a /command (Pi expands /templates and /skill: after this event).
+  // once, on the first input. Each input is kept with its time, its text and whether it may be recalled: typed
+  // by the user (not an extension's) and not a /command (Pi expands /templates and /skill: after this event).
   pi.on("input", async (e, ctx) => {
     const x = stateOf(ctx);
     if (!x.based) {
       x.based = true;
       for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
     }
-    x.inputs.push({ at: Date.now(), human: e.source !== "extension" && !String(e.text ?? "").trimStart().startsWith("/") });
+    const text = String(e.text ?? "");
+    x.inputs = [...x.inputs, { at: Date.now(), text, human: e.source !== "extension" && !text.trimStart().startsWith("/") }].slice(-50);
   });
 
   // §6.2: recall for the latest user message, once per user entry; frozen blocks replayed on their messages.
@@ -192,17 +193,21 @@ export default function memex(pi: ExtensionAPI) {
       const hit = branch.filter((b: any) => b.type === "message" && ts(b.message) === at);
       return hit.length === 1 ? (hit[0] as any) : undefined;
     };
-    // Each new user entry on the branch takes every pending input made before it. It is the user's only when
-    // there is one and all of them may be recalled (a handled human input then an extension's message: the
-    // entry is the extension's — not recalled). Fail closed: two queued inputs before one entry recall none.
+    // Each new user entry on the branch is tied to the pending input whose text it carries (Pi writes the
+    // input's text as is, image hints after "\n\n"; an input handled with no entry is never matched, and
+    // inputs are delivered in any order). It is the user's only when exactly one pending input made before it
+    // matches and that one may be recalled. Fail closed: no match (another extension transformed it) or two
+    // matches (the same text queued twice, whoever sent it) recall none.
     let human = false;
     for (const b of branch as any[])
       if (b.type === "message" && b.message?.role === "user" && !x.seen.has(b.id)) {
         x.seen.add(b.id);
         const at = Number(b.message.timestamp);
-        const mine = x.inputs.filter((i) => i.at <= at);
-        x.inputs = x.inputs.filter((i) => i.at > at);
-        human = mine.length > 0 && mine.every((i) => i.human);
+        const c = b.message.content;
+        const first = typeof c === "string" ? c : Array.isArray(c) && c[0]?.type === "text" ? String(c[0].text) : undefined;
+        const mine = first === undefined ? [] : x.inputs.filter((i) => i.at <= at && (first === i.text || first.startsWith(i.text + "\n\n")));
+        if (mine.length) x.inputs = x.inputs.filter((i) => i !== mine[0]);
+        human = mine.length === 1 && mine[0].human;
       }
     const leaf = ctx.sessionManager.getLeafId();
     const latest = [...e.messages].reverse().find((m: any) => m.role === "user");
