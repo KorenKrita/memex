@@ -58,13 +58,15 @@ was derived or served under the grant.
 ### Backup and restore
 
 ```sh
-deploy/backup.sh                                   # pg_dump -Fc into deploy/backups/, keeps the newest 14 (KEEP)
+deploy/backup.sh                                   # pg_dump -Fc into deploy/backups/ (mode 600); prints the path
 deploy/backup.sh restore deploy/backups/<file> memex_restored   # into a NEW database; refuses "memex"
 ```
 
-Run the dump daily (cron or a systemd timer on the server host); copy `deploy/backups/` off the machine. The
-dump holds everything: records, grants, API key hashes and forget tombstones. To switch to a restored
-database, point `MEMEX_PG_URL` at it (or rename it after stopping the API).
+Run the dump daily (cron or a systemd timer on the server host) and copy `deploy/backups/` off the machine.
+Old dumps are never deleted by the script: move the ones you no longer need to the trash. A dump holds
+everything — every uploaded record, grants, API key hashes and forget tombstones — so keep it as private as
+the database. To switch to a restored database, point `MEMEX_PG_URL` at it (or rename it after stopping the
+API).
 
 A backup taken before a forget still holds what was forgotten, and restoring it brings that back: after a
 restore, repeat every forget made since the backup was taken. Uploads of a source forgotten before the backup
