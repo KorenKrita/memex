@@ -41,7 +41,7 @@ own; from then on API requests get 503 at once without touching the database, an
 gone `MEMEX_DB_STUCK_MS` (default 10 s) without any answer the process exits 1, so run it under a supervisor
 that restarts it (compose does). This is needed because, with Bun 1.4.2, queries on a silent connection do
 not fail while new ones keep arriving (measured: 41 over 40 s, none settled). SIGTERM ends the process
-within `MEMEX_STOP_MS` (default 5 s, plus at most 1 s): an interrupted job runs again once its lock lapses
+within `MEMEX_STOP_MS` (default 5 s: a graceful close, then a forced exit at the end of the budget): an interrupted job runs again once its lock lapses
 (`MEMEX_JOB_LOCK_MS`). Rerun `server/main.test.ts` after upgrading Bun.
 
 Per-turn recall injects nothing until `MEMEX_RECALL_TAU` (the rerank score bar) is set: it is not calibrated

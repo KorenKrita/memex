@@ -13,7 +13,7 @@ modes for fork-after-forget), `hang.ts` (fake model endpoint on :18799 that hang
 
 ## Regression
 
-At the commit after ec6f67e that refuses requests on a silent database: `bunx tsc -p .` exit 0; `bun run test` 428 pass, 1 skip, 0 fail; `bun test dryrun`
+At the commit adding this line (after 60f2ef3): `bunx tsc -p .` exit 0; `bun run test` 429 pass, 1 skip, 0 fail; `bun test dryrun`
 79 pass; Pi e2e 2 pass; Codex e2e (`MEMEX_E2E_CODEX=1`, real codex-cli) 1 pass.
 
 ## Results
@@ -27,6 +27,8 @@ At the commit after ec6f67e that refuses requests on a silent database: `bunx ts
 | Database silent on open connections (this commit) | `server/main.test.ts`: API on a TCP proxy that, after a first answer, drops all traffic on open sockets while a request arrives every 500 ms. Real: `docker pause` on the database of a separate compose project, a request every 0.5 s | Under Bun 1.4.2 such queries never settle while new ones arrive (measured directly: 41 queries over 40 s, none settled; an earlier test that stopped sending saw them fail at 30 s, which does not hold under traffic). Now: `/healthz` 503 within 2 s; after that API requests get 503 at once with no query; the process exits 1 after 10 s. Real: 10 immediate 503s, exit and compose restart 11 s after the pause; after unpause `/healthz` ok, and a new session synced and was found by grep in that session |
 | Postgres refusing connections while requests keep coming | `server/main.test.ts`, 20 s of refusals with `MEMEX_DB_STUCK_MS=7000` | the process stays (refusals take 5.26 s to fail, an answer); `/healthz` 200 again once connections pass |
 | SIGTERM with a health query in flight on a silent database | `server/main.test.ts`, `MEMEX_STOP_MS=300` | the process exits within 1.5 s (before: 28 s, because `close({ timeout: 0 })` waits for queries in flight under Bun 1.4.2) |
+| `close()` with the budget used up | `server/main.test.ts`: a worker job holding a `pg_sleep(3)` on the application pool and a `pg_sleep(3)` on the probe pool, `MEMEX_STOP_MS=200`, `close()` called directly (no signal-level exit involved) | returns in about 210 ms, both queries cut (with the probe pool closed by `timeout: 0`, as before: 2 923 ms) |
+| Gate without application queries | `server/main.test.ts`: probe stub that never answers, application stub that counts calls | after the probe deadline, 3 `/v1/grep` requests get 503, 0 application queries |
 | `/healthz` single-flight and own connection | `server/main.test.ts` | 3 requests against a database that never answers: 3 × 503 within 2.5 s each, 1 query issued; all 8 application connections blocked by a lock: `/healthz` still 200 |
 | Worker backoff vs stop | `server/worker.test.ts` | abort during a 2 s backoff ends the loop in < 200 ms (was 1951 ms) |
 | Backup / restore (b8a3a86, 521542f) | `deploy/backup.sh`, then INSTALL's restore command from the repo root | restore into a new database succeeds, row counts equal; restore over the live database exits 2, database unchanged; missing file exits 2; dumps mode 600, two runs never share a file; no dump is deleted by the script |
@@ -80,12 +82,12 @@ as resolved, and 4 as partly resolved, and found two problems in the watchdog:
 
 | # | Finding | Status |
 | --- | --- | --- |
-| r2-1 | timed-out probes stayed outstanding and accumulated (watchdog and each `/healthz`) | held: a5485a2 shares one in-flight probe across requests; the watchdog is gone |
-| r2-2 | the watchdog, on the shared pool, took a busy pool for a silent database and killed the process | held: a5485a2 removed the watchdog; the probe has its own 1-connection pool (test: 8 connections blocked, `/healthz` 200) |
+| r2-1 | timed-out probes stayed outstanding and accumulated (watchdog and each `/healthz`) | held: one probe in flight however many ask (a5485a2); the fail-stop after r3 judges that same probe by how long it has gone unanswered, never submitting another while it hangs |
+| r2-2 | the watchdog, on the shared pool, took a busy pool for a silent database and killed the process | held: the probe has its own 1-connection pool (a5485a2; test: 8 application connections blocked, `/healthz` 200), which the fail-stop after r3 also uses |
 
 Third review (beb59ab..ec6f67e): `/tmp/memex-review/stage5-r3-231425.md`.
 
 | # | Finding | Status |
 | --- | --- | --- |
 | r3-1 | requests arriving on a silent database keep its connections from timing out; queries accumulate | held (reproduced: 41 queries over 40 s, none settled): API requests are refused before any query once the probe is overdue; the process exits after the probe has gone 10 s unanswered |
-| r3-2 | `close({ timeout: 0 })` waits for queries in flight, so shutdown could exceed its budget | held (reproduced: 1 930 ms, query completed; `0.001`: 2 ms, cut): both pools closed with a positive timeout from the shared deadline, plus a signal-level exit 1 s after the budget |
+| r3-2 | `close({ timeout: 0 })` waits for queries in flight, so shutdown could exceed its budget | held (reproduced: 1 930 ms, query completed; `0.001`: 2 ms, cut): both pools closed with a positive timeout from the shared deadline, and a signal-level forced exit at the end of the budget |

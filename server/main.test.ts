@@ -1,17 +1,33 @@
 // Shutdown is bounded as a whole: a query still running when the stop budget ends is cut, not waited for.
 import { expect, test } from "bun:test";
 import { start } from "./main.ts";
+import { handlers } from "./worker.ts";
 
-test("close() returns within MEMEX_STOP_MS even with a database query outstanding", async () => {
+test("close() within MEMEX_STOP_MS: a worker job using the whole budget, a health query in flight, both cut", async () => {
   process.env.MEMEX_STOP_MS = "200";
+  const { enqueue } = await import("./db.ts");
+  const kind = "project";
+  const real = handlers[kind];
+  // A job that holds an application connection past any budget, as a slow statement or lock wait would.
+  let jobQuery: Promise<string> | undefined;
+  handlers[kind] = async (db: any) => void (await (jobQuery = db`select pg_sleep(3)`.then(() => "done", () => "cut")));
   const s = await start({ port: 0 });
-  const q = s.db`select pg_sleep(3)`.catch(() => "cut");
-  await Bun.sleep(100);
-  const at = Date.now();
-  await s.close();
-  expect(Date.now() - at).toBeLessThan(600); // budget 200 ms, plus the close of the API and pools
-  expect(await q).toBe("cut");
-  delete process.env.MEMEX_STOP_MS;
+  try {
+    await s.db.begin((tx: any) => enqueue(tx, kind, "stop-budget-" + Date.now()));
+    for (let i = 0; i < 100 && !jobQuery; i++) await Bun.sleep(20);
+    expect(jobQuery).toBeDefined(); // the worker is in the job
+    // A health query in flight on the probe's own connection.
+    const healthQ = s.probeDb`select pg_sleep(3)`.then(() => "done", () => "cut");
+    await Bun.sleep(100);
+    const at = Date.now();
+    await s.close();
+    expect(Date.now() - at).toBeLessThan(500); // budget 200 ms
+    expect(await jobQuery).toBe("cut");
+    expect(await healthQ).toBe("cut");
+  } finally {
+    handlers[kind] = real;
+    delete process.env.MEMEX_STOP_MS;
+  }
 });
 
 test("/healthz answers 503 in time when the database stops answering, with one query in flight however often asked", async () => {
@@ -26,6 +42,23 @@ test("/healthz answers 503 in time when the database stops answering, with one q
     expect(Date.now() - at).toBeLessThan(2_500);
   }
   expect(issued).toBe(1);
+  await api.stop();
+});
+
+test("once the health probe is overdue, API requests get 503 without any query on the application pool", async () => {
+  const { serve, prober } = await import("./http.ts");
+  let appQueries = 0;
+  const app: any = () => (appQueries++, Promise.resolve([]));
+  const probe: any = () => new Promise(() => {}); // the probe's own connection: silent
+  const health = prober(probe, 200);
+  const api = await serve(app, { port: 0, health });
+  expect((await fetch(`http://127.0.0.1:${api.port}/healthz`)).status).toBe(503);
+  await Bun.sleep(50);
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`http://127.0.0.1:${api.port}/v1/grep`, { method: "POST", headers: { authorization: "Bearer x" }, body: "{}" });
+    expect(r.status).toBe(503);
+  }
+  expect(appQueries).toBe(0);
   await api.stop();
 });
 

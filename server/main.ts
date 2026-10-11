@@ -33,7 +33,7 @@ export async function start(opts: { port?: number; hostname?: string } = {}) {
     }
   }, 1_000);
   return {
-    db, port: api.port,
+    db, probeDb, port: api.port,
     close: async () => {
       stop.abort();
       clearInterval(watch);
@@ -55,8 +55,8 @@ if (import.meta.main) {
   console.log(`memex listening on ${process.env.MEMEX_HOST ?? "127.0.0.1"}:${s.port}`);
   for (const sig of ["SIGINT", "SIGTERM"] as const)
     process.on(sig, () => {
-      // Whatever close() runs into, the process is gone shortly after its budget.
-      setTimeout(() => process.exit(0), Number(process.env.MEMEX_STOP_MS ?? 5_000) + 1_000).unref();
+      // Graceful close within MEMEX_STOP_MS; at its end the process exits whatever close() is still waiting on.
+      setTimeout(() => process.exit(0), Number(process.env.MEMEX_STOP_MS ?? 5_000)).unref();
       void s.close().then(() => process.exit(0));
     });
 }
