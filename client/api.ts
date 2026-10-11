@@ -10,6 +10,8 @@ export const REQUEST_MS = Number(process.env.MEMEX_REQUEST_MS ?? 15_000);
 /** JSON over fetch with the API key. Throws `<status> <error>` on an HTTP error, `timeout` past the deadline. */
 export function transport(base: string, key: string, f: typeof fetch = fetch): Transport {
   return async (method, path, body, o) => {
+    // A deadline already passed: no request at all (not one with a 1 ms timeout that still goes out).
+    if (o?.deadline !== undefined && o.deadline <= Date.now()) throw new Error("timeout");
     const ms = Math.max(1, Math.min(REQUEST_MS, o?.deadline !== undefined ? o.deadline - Date.now() : REQUEST_MS));
     let r: Response;
     try {

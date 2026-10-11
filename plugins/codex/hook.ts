@@ -100,9 +100,10 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     // not in the rollout yet (Codex records it after this hook), so it is bound by the turn id.
     await sync(t, policy, s, p.cwd, Math.min(deadline - 500, Date.now() + 1_500)).catch(() => {});
     if (!allowed(policy, s.scope, "recall", "memex") || !p.turn_id || typeof p.prompt !== "string" || Date.now() + 200 >= deadline)
-      return out(event); // the last test: past (or at) the budget, no recall request is made
+      return out(event); // past (or at) the budget, no recall request is made
     const read = readSession(s.path, "codex");
-    if (!read.ok) return out(event);
+    // Reading the rollout takes time too (a large file, a slow disk): checked again before the request.
+    if (!read.ok || Date.now() + 200 >= deadline) return out(event);
     const body = {
       // The turn and this prompt's hash: the server finds the prompt's record by them once it is uploaded.
       source: s.source, scope: s.scope, user_rec: `turn:${p.turn_id}:${sha(p.prompt.trim()).slice(0, 16)}`, input: p.prompt, ...previous(read.records),

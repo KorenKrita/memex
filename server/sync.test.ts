@@ -255,3 +255,9 @@ test("sync keeps its deadline when the lease release hangs (the server's lease e
   expect(r.status).toBe("failed");
   expect(Date.now() - at).toBeLessThan(1_000);
 });
+
+test("a request whose deadline has passed is not sent at all", async () => {
+  const c = counting();
+  await expect(c.t()("POST", "/v1/recall", {}, { deadline: Date.now() - 1 })).rejects.toThrow("timeout");
+  expect(c.calls).toEqual([]);
+});
