@@ -32,7 +32,7 @@ type Session = {
   meta: { repo?: string };
   chain: Promise<unknown>; // syncs, one at a time
   lastSync?: { at: string; outcome: SyncOutcome | { status: "error"; reason: string } };
-  inputs: boolean[]; // input events not yet tied to a user entry, in order: true = typed by the user
+  inputs: { at: number; human: boolean }[]; // input events not yet tied to a user entry: when, and recallable
   seen: Set<string>; // user entries already tied to an input, or there before it
   based: boolean; // the baseline (entries there before the first input) taken
   recalls: Map<string, Promise<void>>; // user entry id → its one recall request
@@ -52,6 +52,12 @@ function repoOf(cwd: string): string | undefined {
 }
 
 const err = (e: unknown) => String((e as Error)?.message ?? e);
+/** The user entry `id` ends the branch's conversation: nothing after it but non-message entries (custom
+ *  context an extension added at agent start, labels…) — no reply, no later user message. */
+const tail = (branch: any[], id: string) => {
+  const at = branch.findIndex((b) => b.id === id);
+  return at >= 0 && branch.slice(at + 1).every((b) => b.type !== "message");
+};
 const within = <T>(p: Promise<T>, ms: number) =>
   Promise.race([p, new Promise<"late">((r) => setTimeout(() => r("late"), ms).unref?.())]);
 
@@ -148,16 +154,18 @@ export default function memex(pi: ExtensionAPI) {
     if (text && stateOf(ctx) === x) e.systemPromptOptions.sections.memex = text;
   });
 
-  // An input becomes one new user entry. Entries that exist when the session is first seen here (history of a
-  // resumed session, other branches) are never an input's entry: the baseline is taken once, on the first input,
-  // never again — a later input must not mark an entry a queued input has not been matched with yet.
+  // An input becomes at most one new user entry, made after it (Pi stamps the message after the input handlers;
+  // another extension may handle the input and make none). Entries that exist when the session is first seen
+  // here (history of a resumed session, other branches) are never an input's entry: the baseline is taken
+  // once, on the first input. Each input is kept with its time and whether it may be recalled: typed by the
+  // user (not an extension's) and not a /command (Pi expands /templates and /skill: after this event).
   pi.on("input", async (e, ctx) => {
     const x = stateOf(ctx);
     if (!x.based) {
       x.based = true;
       for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
     }
-    x.inputs.push(e.source !== "extension");
+    x.inputs.push({ at: Date.now(), human: e.source !== "extension" && !String(e.text ?? "").trimStart().startsWith("/") });
   });
 
   // §6.2: recall for the latest user message, once per user entry; frozen blocks replayed on their messages.
@@ -173,13 +181,17 @@ export default function memex(pi: ExtensionAPI) {
       const hit = branch.filter((b: any) => b.type === "message" && ts(b.message) === at);
       return hit.length === 1 ? (hit[0] as any) : undefined;
     };
-    // Each queued input takes the next new user entry on the branch, in order (an extension's message —
-    // sendUserMessage, steer — is never recalled).
+    // Each new user entry on the branch takes every pending input made before it. It is the user's only when
+    // there is one and all of them may be recalled (a handled human input then an extension's message: the
+    // entry is the extension's — not recalled). Fail closed: two queued inputs before one entry recall none.
     let human = false;
     for (const b of branch as any[])
       if (b.type === "message" && b.message?.role === "user" && !x.seen.has(b.id)) {
         x.seen.add(b.id);
-        human = x.inputs.shift() ?? false;
+        const at = Number(b.message.timestamp);
+        const mine = x.inputs.filter((i) => i.at <= at);
+        x.inputs = x.inputs.filter((i) => i.at > at);
+        human = mine.length > 0 && mine.every((i) => i.human);
       }
     const leaf = ctx.sessionManager.getLeafId();
     const latest = [...e.messages].reverse().find((m: any) => m.role === "user");
@@ -188,7 +200,7 @@ export default function memex(pi: ExtensionAPI) {
     // injected — not now, not by a later replay in this process (another process may still replay a decision the
     // server saved before its own deadline: the server's budget_ms bound is the protocol's, see DESIGN §6.2).
     let deadline: number | undefined;
-    if (cur && human && branch.at(-1)?.id === cur.id && !x.recalls.has(cur.id)) {
+    if (cur && human && tail(branch, cur.id) && !x.recalls.has(cur.id)) {
       const until = (deadline = Date.now() + Number(process.env.MEMEX_PI_RECALL_MS ?? RECALL_MS));
       x.recalls.set(cur.id, recallFor(ctx, x, branch, cur, until).then(() => {
         if (Date.now() >= until) x.late.add(cur.id);

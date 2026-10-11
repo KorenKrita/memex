@@ -368,6 +368,51 @@ test("interleaved: an extension input arriving after a human entry not yet consu
   void human;
 });
 
+test("an input another extension handled (no entry) does not make a later extension message count as human", async () => {
+  const a = host("past3c");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now3c");
+  await h.run("hello", "hi");
+  const status = async () => {
+    const notes: string[] = [];
+    await h.commands.get("memex").handler("", { ...h.ctx, ui: { notify: (m: string) => notes.push(m), setStatus: () => {} } });
+    return notes.join("\n").match(/last recall: .*/)![0];
+  };
+  const before = await status();
+  await h.emit("input", { text: "the port zx-7781?", source: "interactive" }); // consumed by another extension: no entry
+  const r = await h.run("AUTOMATED extension message about zx-7781 port", "ok", { source: "extension" });
+  expect(sentText(r.sent)).not.toContain("memex-recall");
+  expect(await status()).toBe(before); // no recall request for the extension's entry at all
+  expect((await db`select count(*)::int n from recall_block where source = ${h.source} and user_rec = ${r.user.id}`)[0].n).toBe(0);
+});
+
+test("a /template whose expansion is ordinary text is not recalled", async () => {
+  const a = host("past3d");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now3d");
+  await h.emit("input", { text: "/template", source: "interactive" });
+  await h.emit("before_agent_start", { prompt: "", systemPrompt: "", systemPromptOptions: { sections: {} } });
+  h.add({ role: "user", content: [{ type: "text", text: "expanded template question about the port zx-7781" }] }, false);
+  await h.emit("context", { messages: h.branch().map((e: any) => e.message) });
+  expect((await db`select count(*)::int n from recall_block where source = ${h.source}`)[0].n).toBe(0);
+});
+
+test("a custom message after the user entry (before_agent_start context) does not stop its recall", async () => {
+  const a = host("past3e");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now3e");
+  await h.emit("input", { text: "the port zx-7781?", source: "interactive" });
+  await h.emit("before_agent_start", { prompt: "", systemPrompt: "", systemPromptOptions: { sections: {} } });
+  const u = h.add({ role: "user", content: [{ type: "text", text: "the port zx-7781?" }] }, false);
+  h.entries.push({ type: "custom_message", id: "c1", parentId: u.id, timestamp: new Date().toISOString(), customType: "x", content: "ctx" } as any);
+  h.setLeaf("c1");
+  const out = await h.emit("context", { messages: [...h.branch().map((e: any) => e.message).filter(Boolean), { role: "custom", content: "ctx", timestamp: Date.now() }] });
+  expect(sentText(out?.messages ?? [])).toContain("memex-recall");
+});
+
 test("recall not ready (τ unset): nothing injected, nothing stored", async () => {
   delete process.env.MEMEX_RECALL_TAU;
   const a = host("past4");
