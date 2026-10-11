@@ -359,7 +359,11 @@ test("tools: search, zoom a hit, grep; identity from the session, not the model"
   const h = host("now6");
   await h.run("hi", "hello");
   await flush(h);
-  const call = async (n: string, p: object) => JSON.parse((await h.tools.get(n).execute("c", p, undefined, undefined, h.ctx)).content[0].text);
+  const call = async (n: string, p: object) => {
+    const text: string = (await h.tools.get(n).execute("c", p, undefined, undefined, h.ctx)).content[0].text;
+    expect(text).toMatch(/^<memex-tool>\n[\s\S]*\n<\/memex-tool>$/);
+    return JSON.parse(text.slice("<memex-tool>\n".length, -"\n</memex-tool>".length));
+  };
   const s = await call("mem_search", { query: "zx-7781" });
   expect(s.results.length).toBeGreaterThan(0);
   const z = await call("mem_zoom", { id: s.results[0].id, view_key: s.results[0].view_key });

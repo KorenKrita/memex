@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyzeFile, codexForkBoundary, codexIsChild, collect, dryRun } from "./dryrun";
+import { analyzeFile, codexForkBoundary, codexIsChild, collect, dryRun, projectLines } from "./dryrun";
 const SPAN_MAX = 12288; // DESIGN §4.3 upper target; mirrored here, not imported
 const D = (kind: string, text: string) => B(`${kind}: ${text}`) + 1; // one record's digest bytes
 
@@ -1067,5 +1067,25 @@ describe("span hook", () => {
     expect(r.forks.resolved).toBe(1);
     expect(lex.sort()).toEqual(["child b", "copied", "parent a", "parent q"]);
     expect(lex.reduce((a, t) => a + B(t), 0)).toBe(r.total.lexicalBytes);
+  });
+});
+
+describe("Codex code mode", () => {
+  test("a memex tool's result inside an exec output stays out of the index; the rest of the output stays", () => {
+    const lex: { kind: string; text: string }[] = [];
+    const lines = withOrd([
+      meta(),
+      cmsg("user", ["find it"], ["user.text"]),
+      ri({ type: "custom_tool_call", call_id: "c1", name: "exec", input: "text(await tools.mcp__memex__mem_search({query:'port'})); text(await shell('ls'))" }),
+      ri({ type: "custom_tool_call_output", call_id: "c1", output: [
+        { type: "input_text", text: "Script completed\nOutput:\n" },
+        { type: "input_text", text: JSON.stringify({ content: [{ type: "text", text: "<memex-tool>\n{\"results\":[{\"excerpt\":\"RECALLED_PORT\"}]}\n</memex-tool>" }] }) },
+        { type: "input_text", text: "LOCAL_FILE_LIST" },
+      ] }),
+    ]);
+    projectLines("x", lines, { idOf: (r) => r.map((x) => x.key).join(","), onLexical: (r) => lex.push(r) });
+    const all = lex.map((r) => r.text).join("\n");
+    expect(all).not.toContain("RECALLED_PORT");
+    expect(all).toContain("LOCAL_FILE_LIST");
   });
 });

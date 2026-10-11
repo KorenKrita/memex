@@ -35,11 +35,21 @@ export const TOOLS = [
 export type ToolSession = { source: string; scope: string; leaf: string | null };
 
 // Search results for the model: the handle, its view key, where it sits and what it says; the rest is internal.
+// Attachments stay: a correction or what came next may sit on another branch than the hit (search.ts).
 const brief = (r: any) => ({ id: r.key, view_key: r.path?.view_key, path: r.path?.label, view_basis: r.path?.view_basis, rerank_score: r.rerank_score,
-                             excerpt: r.excerpt?.text, summaries: [...new Set((r.reps ?? []).map((x: any) => x.text))], incomplete: r.incomplete?.length ? r.incomplete : undefined });
+                             excerpt: r.excerpt?.text, summaries: [...new Set((r.reps ?? []).map((x: any) => x.text))],
+                             attachments: r.attachments?.length ? r.attachments.map((a: any) => ({ what: a.what, path: a.path, text: a.text })) : undefined,
+                             incomplete: r.incomplete?.length ? r.incomplete : undefined });
+// Every answer is wrapped: when it comes back to the host inside another tool's output (Codex code mode runs
+// tools from an `exec` script), the indexer still knows it as memex's own and keeps it out (dryrun MEMEX_BLOCK).
+// A closing tag inside the content (recalled text quoting one) is broken up, so the block cannot end early.
+const mark = (s: string) => `<memex-tool>\n${s.replace(/<\/memex/gi, "<\\/memex")}\n</memex-tool>`;
 
 /** Run one tool call for session `s` (undefined: the host could not tell which session this is). Returns text. */
 export async function callTool(t: Transport | undefined, policy: Policy, s: ToolSession | undefined, name: string, p: any): Promise<string> {
+  return mark(await run(t, policy, s, name, p));
+}
+async function run(t: Transport | undefined, policy: Policy, s: ToolSession | undefined, name: string, p: any): Promise<string> {
   if (!t) return "memex is not configured (MEMEX_URL / MEMEX_KEY or ~/.config/memex/client.json).";
   if (!s || !allowed(policy, s.scope, "tool", "memex")) return "This session is not authorized for remote memex queries.";
   const base = { source: s.source, scope: s.scope, purpose: "tool" };
