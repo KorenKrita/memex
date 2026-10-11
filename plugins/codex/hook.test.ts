@@ -2,13 +2,13 @@
 // counting requests: a payload whose transcript does not prove its session, or a file outside every scope, or a
 // tool call without a resolvable thread sends nothing.
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, migrate, type Db } from "../../server/db.ts";
 import { addApiKey, serve } from "../../server/http.ts";
 import { handle } from "./hook.ts";
-import { rolloutOf } from "./session.ts";
+import { rolloutsOf } from "./session.ts";
 
 let db: Db;
 let api: { port: number; stop: () => Promise<void> };
@@ -95,16 +95,18 @@ test("UserPromptSubmit binds the prompt by turn id and references the last excha
   expect(bodies[0].prev_assistant_ref.rec).toBe("2");
 });
 
-test("MCP identity: the thread's rollout by id, verified by its session_meta; none or two → no session", async () => {
+test("MCP identity: the thread's rollouts by id, each verified by its session_meta", async () => {
   const path = rollout(ID);
-  expect(rolloutOf(ID)).toBe(path);
-  expect(rolloutOf("01a12800-0000-7000-8000-00000000dead")).toBeUndefined();
-  expect(rolloutOf("../../etc")).toBeUndefined();
-  // A second file claiming the same id (another day): ambiguous.
+  expect(rolloutsOf(ID)).toEqual([path]);
+  expect(rolloutsOf("01a12800-0000-7000-8000-00000000dead")).toEqual([]);
+  expect(rolloutsOf("../../etc")).toEqual([]);
+  // A file whose name claims the thread but whose session_meta is another's: not this thread's.
   const other = join(dir, "home", "sessions", "2026", "10", "12");
   mkdirSync(other, { recursive: true });
-  rollout(ID, other);
-  expect(rolloutOf(ID)).toBeUndefined();
+  const fake = rollout("01a12800-0000-7000-8000-00000000ffff", other);
+  const { renameSync } = await import("node:fs");
+  renameSync(fake, join(other, `rollout-2026-10-12T00-00-00-${ID}.jsonl`));
+  expect(rolloutsOf(ID)).toEqual([path]);
 });
 
 test("MCP tools: no thread id → not authorized, nothing sent", async () => {
@@ -163,4 +165,53 @@ test("query allowed, upload not: snapshot and recall still run, and no sync requ
   expect(reqs.filter((p) => p.startsWith("/v1/sync"))).toEqual([]);
   expect(reqs).toContain("/v1/snapshot");
   expect(reqs).toContain("/v1/recall");
+});
+
+test("a recall answer that arrives past the hook's budget is not emitted", async () => {
+  const path = rollout(ID);
+  process.env.MEMEX_RECALL_TAU = "0.5";
+  globalThis.fetch = (async (u: any, i: any) => {
+    const r = await orig(u, i);
+    if (!String(u).endsWith("/v1/recall")) return r;
+    const body = await r.text();
+    const until = JSON.parse(i.body).budget_ms + 400;
+    return new Response(new ReadableStream({ async start(c) { // the body finishes only past the deadline
+      const t0 = Date.now();
+      while (Date.now() - t0 < until) {} // a stalled event loop: no timer can fire
+      c.enqueue(new TextEncoder().encode(JSON.stringify({ ...JSON.parse(body), state: "shown", text: "<memex-recall>LATE</memex-recall>" })));
+      c.close();
+    } }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as any;
+  try {
+    const out = await handle({ hook_event_name: "UserPromptSubmit", session_id: ID, transcript_path: path, turn_id: "t9", prompt: "port?" },
+                             { ...process.env, MEMEX_CODEX_RECALL_MS: "400" });
+    expect(out).not.toContain("LATE");
+  } finally {
+    globalThis.fetch = (async (u: any, i: any) => (reqs.push(new URL(String(u)).pathname), orig(u, i))) as any;
+    delete process.env.MEMEX_RECALL_TAU;
+  }
+});
+
+test("MCP identity: reverted rollouts (rollout-<ts>-<thread>_<rollout>.jsonl) count; different scopes → no session", async () => {
+  const { sessionOfThread } = await import("./session.ts");
+  const { loadPolicy } = await import("../../client/policy.ts");
+  const day = join(dir, "home", "sessions", "2026", "10", "11");
+  const a = rollout(ID);
+  // Reverted copy in the same scope: one session, that scope.
+  const rv = join(day, `rollout-2026-10-11T00-10-00-${ID}_01a12800-0000-7000-8000-0000000000aa.jsonl`);
+  writeFileSync(rv, readFileSync(a, "utf8"));
+  expect(sessionOfThread(ID, loadPolicy())?.scope).toBe("personal");
+  // Only the reverted file: still found.
+  const { renameSync } = await import("node:fs");
+  renameSync(a, a + ".moved");
+  expect(sessionOfThread(ID, loadPolicy())?.scope).toBe("personal");
+  renameSync(a + ".moved", a);
+  // The same thread in another scope too (a symlinked or second sessions dir): ambiguous.
+  writeFileSync(join(dir, "policy.json"), JSON.stringify({ scopes: [
+    { name: "personal", paths: [day], allow: { tool: ["memex"] } },
+    { name: "work", paths: [join(dir, "home", "sessions", "2026", "10", "12")], allow: { tool: ["memex"] } }] }));
+  const d12 = join(dir, "home", "sessions", "2026", "10", "12");
+  mkdirSync(d12, { recursive: true });
+  writeFileSync(join(d12, `rollout-2026-10-12T00-00-00-${ID}_01a12800-0000-7000-8000-0000000000bb.jsonl`), readFileSync(a, "utf8"));
+  expect(sessionOfThread(ID, loadPolicy())).toBeUndefined();
 });

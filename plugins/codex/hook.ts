@@ -95,7 +95,7 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
   }
 
   if (event === "UserPromptSubmit") {
-    const deadline = Date.now() + RECALL_MS;
+    const deadline = Date.now() + Number(env.MEMEX_CODEX_RECALL_MS ?? RECALL_MS);
     // Sync first: the previous exchange must be on the server to be referenced (§6.2). The prompt itself is
     // not in the rollout yet (Codex records it after this hook), so it is bound by the turn id.
     await sync(t, policy, s, p.cwd, Math.min(deadline - 500, Date.now() + 1_500)).catch(() => {});
@@ -109,6 +109,8 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
     };
     const r: any = await t("POST", "/v1/recall", body, { deadline }).catch((e) => ({ state: "failed", reason: String(e?.message ?? e) }));
     if (env.MEMEX_DEBUG_LOG) appendFileSync(env.MEMEX_DEBUG_LOG, JSON.stringify({ event, turn: p.turn_id, state: r?.state, reason: r?.reason, prev: (body as any).prev_user_ref ?? null }) + "\n");
+    // Past the budget (a slow body, a stalled loop): not shown, whatever came back.
+    if (Date.now() >= deadline) return out(event);
     return out(event, r?.state === "shown" && typeof r.text === "string" && r.text ? r.text : undefined);
   }
 

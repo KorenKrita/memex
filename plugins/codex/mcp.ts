@@ -2,10 +2,9 @@
 // in each call's `_meta.threadId` (verified against its rollout's session_meta id, then the policy scope of that
 // file); a call without it, or whose rollout cannot be found or is outside every scope, sends nothing.
 import { fromEnv } from "../../client/api.ts";
-import { loadPolicy, scopeOf, type Policy } from "../../client/policy.ts";
-import { readHead } from "../../client/records.ts";
+import { loadPolicy, type Policy } from "../../client/policy.ts";
 import { callTool, TOOLS } from "../../client/tools.ts";
-import { rolloutOf } from "./session.ts";
+import { sessionOfThread } from "./session.ts";
 
 const send = (m: object) => process.stdout.write(JSON.stringify(m) + "\n");
 
@@ -18,9 +17,8 @@ async function call(params: any): Promise<string> {
     return `memex: policy: ${String((e as Error)?.message ?? e)}`;
   }
   const id = params?._meta?.threadId;
-  const path = typeof id === "string" ? rolloutOf(id) : undefined;
-  const h = path ? readHead(path, "codex") : undefined;
-  const s = path && h?.ok ? { source: h.sourceId, scope: scopeOf(policy, path), leaf: null } : undefined;
+  const x = typeof id === "string" ? sessionOfThread(id, policy) : undefined;
+  const s = x ? { ...x, leaf: null } : undefined;
   return callTool(t, policy, s, params?.name, params?.arguments ?? {});
 }
 
