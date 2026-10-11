@@ -26,7 +26,10 @@ services:
     image: memex-server:local
     env_file: memex.env
     environment:
-      MEMEX_PG_URL: postgres://memex:${MEMEX_PG_PASSWORD}@db:5432/memex
+      # The password goes in PGPASSWORD, not the URL: any character works, nothing needs escaping.
+      # MEMEX_PG_DB switches the API to another database of this server, e.g. a restored one.
+      MEMEX_PG_URL: postgres://memex@db:5432/${MEMEX_PG_DB:-memex}
+      PGPASSWORD: ${MEMEX_PG_PASSWORD}
       MEMEX_HOST: 0.0.0.0
       MEMEX_PORT: "8787"
     depends_on:

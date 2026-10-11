@@ -65,8 +65,9 @@ deploy/backup.sh restore deploy/backups/<file> memex_restored   # into a NEW dat
 Run the dump daily (cron or a systemd timer on the server host) and copy `deploy/backups/` off the machine.
 Old dumps are never deleted by the script: move the ones you no longer need to the trash. A dump holds
 everything — every uploaded record, grants, API key hashes and forget tombstones — so keep it as private as
-the database. To switch to a restored database, point `MEMEX_PG_URL` at it (or rename it after stopping the
-API).
+the database. To switch the API to a restored database: `MEMEX_PG_DB=memex_restored docker compose -f
+deploy/compose.yaml up -d api` (keep `MEMEX_PG_DB` set for later runs, backup.sh included: it dumps the
+database it names, and refuses to restore over it).
 
 A backup taken before a forget still holds what was forgotten, and restoring it brings that back: after a
 restore, repeat every forget made since the backup was taken. Uploads of a source forgotten before the backup
