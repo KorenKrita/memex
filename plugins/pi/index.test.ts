@@ -126,7 +126,7 @@ function host(native: string, from?: { entries: Entry[]; leaf: () => string | nu
   hosts.push({ emit });
   void emit("session_start", { reason: "startup" });
   return {
-    file, ctx, tools, commands, notes, emit, entries, leaf: () => leaf,
+    file, ctx, tools, commands, notes, emit, entries, add, branch, leaf: () => leaf,
     setLeaf: (id: string | null) => (leaf = id),
     source: sourceIdOf("pi", native),
     /** One run: input → before_agent_start → user entry → context → reply → turn_end. Returns the system
@@ -323,6 +323,24 @@ test("an extension's input, a /command and an ambiguous timestamp are not recall
   const msgs = [{ role: "user", content: [{ type: "text", text: "a zx-7781" }], timestamp: 5 }, { role: "user", content: [{ type: "text", text: "b zx-7781" }], timestamp: 5 }];
   const out = await h.emit("context", { messages: msgs });
   expect(out).toBeUndefined();
+});
+
+test("interleaved: an extension input arriving after a human entry not yet consumed does not take its place", async () => {
+  const a = host("past3b");
+  await a.run("where is the port", "ANSWER the port is zx-7781");
+  await flush(a);
+  const h = host("now3b");
+  await h.run("hello", "hi");
+  // Human input, its entry; then (before any context call) an extension's input and its entry.
+  await h.emit("input", { text: "the port zx-7781?", source: "interactive" });
+  await h.emit("before_agent_start", { prompt: "", systemPrompt: "", systemPromptOptions: { sections: {} } });
+  const human = h.add({ role: "user", content: [{ type: "text", text: "the port zx-7781?" }] }, false);
+  await h.emit("input", { text: "ext about zx-7781 port", source: "extension" });
+  const ext = h.add({ role: "user", content: [{ type: "text", text: "ext about zx-7781 port" }] }, false);
+  await h.emit("context", { messages: h.branch().map((e: any) => e.message) });
+  expect((await db`select user_rec from recall_block where source = ${h.source}`).map((x: any) => x.user_rec)).not.toContain(ext.id);
+  // The human entry was not the latest; it is not recalled late either, but it was not mistaken for the extension's.
+  void human;
 });
 
 test("recall not ready (τ unset): nothing injected, nothing stored", async () => {

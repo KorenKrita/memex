@@ -34,6 +34,7 @@ type Session = {
   lastSync?: { at: string; outcome: SyncOutcome | { status: "error"; reason: string } };
   inputs: boolean[]; // input events not yet tied to a user entry, in order: true = typed by the user
   seen: Set<string>; // user entries already tied to an input, or there before it
+  based: boolean; // the baseline (entries there before the first input) taken
   recalls: Map<string, Promise<void>>; // user entry id → its one recall request
   late: Set<string>; // user entries whose recall missed its budget: never shown
   blocks: Map<string, string>; // user entry id → frozen recall block
@@ -76,7 +77,7 @@ export default function memex(pi: ExtensionAPI) {
     s = {
       file, source: sourceIdOf("pi", ctx.sessionManager.getSessionId()), scope: file ? scopeOf(policy, file) : NONE,
       meta: { ...(repoOf(ctx.cwd) ? { repo: repoOf(ctx.cwd) } : {}) },
-      chain: Promise.resolve(), inputs: [], seen: new Set(), recalls: new Map(), late: new Set(), blocks: new Map(),
+      chain: Promise.resolve(), inputs: [], seen: new Set(), based: false, recalls: new Map(), late: new Set(), blocks: new Map(),
     };
     return s;
   }
@@ -147,11 +148,15 @@ export default function memex(pi: ExtensionAPI) {
     if (text && stateOf(ctx) === x) e.systemPromptOptions.sections.memex = text;
   });
 
-  // An input becomes one new user entry. Entries that exist when it arrives (history of a resumed session, other
-  // branches) are never its entry.
+  // An input becomes one new user entry. Entries that exist when the session is first seen here (history of a
+  // resumed session, other branches) are never an input's entry: the baseline is taken once, on the first input,
+  // never again — a later input must not mark an entry a queued input has not been matched with yet.
   pi.on("input", async (e, ctx) => {
     const x = stateOf(ctx);
-    for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
+    if (!x.based) {
+      x.based = true;
+      for (const b of ctx.sessionManager.getEntries() as any[]) if (b.type === "message" && b.message?.role === "user") x.seen.add(b.id);
+    }
     x.inputs.push(e.source !== "extension");
   });
 
