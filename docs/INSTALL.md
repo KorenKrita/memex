@@ -34,6 +34,12 @@ bun server/main.ts
 `main.ts` migrates the schema, then serves the API and runs one worker loop. It listens on loopback by
 default; put TLS in front (a reverse proxy) before exposing it.
 
+Failure behaviour: with Postgres down the process stays up, `/healthz` answers 503 and the worker retries
+(backoff up to 30 s). If the database stops answering on open connections (a frozen host, a network black
+hole), a watchdog exits the process after 3 checks without an answer (`MEMEX_WATCHDOG_MS`, default 10 s
+apart, 3 s each), so run it under a supervisor that restarts it (compose does). SIGTERM ends it within
+`MEMEX_STOP_MS` (default 5 s): an interrupted job runs again once its lock lapses (`MEMEX_JOB_LOCK_MS`).
+
 Per-turn recall injects nothing until `MEMEX_RECALL_TAU` (the rerank score bar) is set: it is not calibrated
 yet (DESIGN §6.2), so the default is "not ready", and the plugins show nothing.
 

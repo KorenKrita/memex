@@ -47,7 +47,8 @@ const grep = (i: number, j: number) =>
 const found = (r: any, i: number) => r.hits?.length === 1 && r.hits[0].in === sourceIdOf("pi", id(i));
 // grep reads projected views: wait until the last session synced is projected.
 const w0 = Date.now();
-while (!found(await grep(N - 1, R - 1), N - 1) && Date.now() - w0 < 300_000) await Bun.sleep(1000);
+let lastProjected = false;
+while (!(lastProjected = found(await grep(N - 1, R - 1), N - 1)) && Date.now() - w0 < 300_000) await Bun.sleep(1000);
 const projectMs = Date.now() - w0;
 const lat: number[] = [];
 let missed = 0;
@@ -59,6 +60,6 @@ for (let k = 0; k < 30; k++) {
   if (!found(r, i)) missed++;
 }
 lat.sort((a, b) => a - b);
-const out = { run, sessions: N, records: N * R * 2, sync, sync_ms: syncMs, wait_projected_ms: projectMs, grep_missed: missed, grep_p50: lat[15], grep_p95: lat[28] };
+const out = { run, sessions: N, records: N * R * 2, sync, sync_ms: syncMs, last_projected: lastProjected, wait_projected_ms: projectMs, grep_missed: missed, grep_p50: lat[15], grep_p95: lat[28] };
 console.log(JSON.stringify(out));
-if (sync.other || sync.sent !== N * R * 2 + N || sync.refused || missed) process.exit(1);
+if (sync.other || sync.sent !== N * R * 2 + N || sync.refused || missed || !lastProjected) process.exit(1);
