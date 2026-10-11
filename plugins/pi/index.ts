@@ -10,7 +10,7 @@ import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { fromEnv, type Transport } from "../../client/api.ts";
+import { clientPath, fromEnv, type Transport } from "../../client/api.ts";
 import { allowed, allowedDests, loadPolicy, NONE, policyPath, scopeOf, type Policy, type Purpose } from "../../client/policy.ts";
 import { readHead, readSession, sourceIdOf } from "../../client/records.ts";
 import { scanOnce, syncFile, type SyncOutcome } from "../../client/sync.ts";
@@ -276,7 +276,7 @@ export default function memex(pi: ExtensionAPI) {
       const x = stateOf(ctx);
       const purposes: Purpose[] = ["sync", "snapshot", "recall", "tool"];
       const lines = [
-        `server: ${t ? process.env.MEMEX_URL : configError ?? "not configured (MEMEX_URL / MEMEX_KEY)"}`,
+        `server: ${t ? (process.env.MEMEX_URL && process.env.MEMEX_KEY ? process.env.MEMEX_URL : `from ${clientPath()}`) : configError ?? `not configured (MEMEX_URL / MEMEX_KEY or ${clientPath()})`}`,
         `policy: ${policyPath()} — scope ${x.scope}${x.file ? "" : " (no session file)"}`,
         `allowed: ${purposes.filter((p) => allowed(policy, x.scope, p, "memex")).join(", ") || "nothing (no memex data leaves this session)"}`,
         `last sync: ${x.lastSync ? `${x.lastSync.at} ${JSON.stringify(x.lastSync.outcome)}` : "none"}`,

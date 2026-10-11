@@ -3,17 +3,21 @@
 Personal cross-session, cross-harness (Pi + Codex) memory backend. Under construction: delivery phases 1–3
 (DESIGN §11), validated on synthetic data only.
 
+- `docs/INSTALL.md` — installing the server and the two plugins, settings, known limits
 - `docs/DESIGN.md` — design
 - `docs/RESEARCH-landscape.md` — survey of open-source memory projects and what was adopted
 - `dryrun/` — offline projection rules (spans, views, forks, canonical records), validated on local sessions
 - `prototype/` — sync protocol model
 - `server/` — the service: L0 sync (`sync.ts`), projection (`project.ts`), summaries and embeddings
   (`derive.ts`), search / zoom / grep (`search.ts`), forget (`forget.ts`), HTTP (`http.ts`), entry (`main.ts`)
-- `client/` — record encoding and the sync client shared by the plugins
+- `client/` — record encoding, the sync client and the mem_* tools shared by the plugins; `cli.ts` (import)
+- `plugins/pi/` — Pi extension; `plugins/codex/` — Codex plugin (hooks, MCP server, `build.ts`)
 - `eval/` — question bank tooling
 
 Tests: a Postgres 17 with pgvector and pg_trgm at `MEMEX_PG_URL` (default
-`postgres://postgres:memex@127.0.0.1:55433/memex`), then `bun test server dryrun`.
+`postgres://postgres:memex@127.0.0.1:55433/memex`), then `bun run test` (server, client, plugins; the Pi
+end-to-end test needs `pi` on PATH) and `bun test dryrun`. The live Codex test is opt-in: see
+`plugins/codex/e2e.test.ts`.
 
 ## Not implemented yet (stage 2 search contract, DESIGN §6.4)
 
