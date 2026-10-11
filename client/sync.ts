@@ -322,10 +322,18 @@ export async function scanAll(t: Transport, policy: Policy, files: ScanFile[],
                               opts: { collector: string; kind?: "auto" | "import"; limit?: number; deadlineMs?: number }) {
   const deadline = Date.now() + (opts.deadlineMs ?? 60_000);
   let r: Awaited<ReturnType<typeof scanOnce>>;
-  do {
+  // A call that moves nothing only tells about the page it took (the least-tried pending items): failing ones
+  // count a try and sink, so the next page holds others. It stops once a whole pass over what is pending moved
+  // nothing — every pending item was tried and failed (tried again next run).
+  let still = 0, closed = -1;
+  for (;;) {
     r = await scanOnce(t, policy, files, { ...opts, deadlineMs: Math.max(1, deadline - Date.now()) });
-  } while (r.round !== null && !r.finished && r.advanced > 0 && Date.now() < deadline);
-  return r;
+    if (r.round === null || r.finished || Date.now() >= deadline) return r;
+    const now = r.done + r.skipped;
+    still = r.advanced > 0 || now !== closed ? 0 : still + 1;
+    closed = now;
+    if (still >= Math.ceil(r.pending / (opts.limit ?? 50))) return r;
+  }
 }
 
 export type ScanFile = { path: string; harness: Harness };

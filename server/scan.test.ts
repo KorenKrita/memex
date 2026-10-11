@@ -279,3 +279,19 @@ test("scanAll goes on past one call's item limit until the round is finished", a
   expect(r.finished).toBe(true);
   expect((await db`select count(*)::int n from scan_item i join scan_round r on r.id = i.round where r.collector = 'm-all' and i.state = 'done'`)[0].n).toBe(5);
 });
+
+test("scanAll goes past a page whose files all fail to an untried healthy file", async () => {
+  const { scanAll } = await import("../client/sync.ts");
+  const bad = [piFile("fail0", 2), piFile("fail1", 2)], good = piFile("good", 2);
+  for (const p of bad) writeFileSync(p, readFileSync(p)); // newest: first in the round's order
+  const badSrc = new Set(["s-fail0", "s-fail1"].map((n) => sourceIdOf("pi", n)));
+  const tr: Transport = async (m, path, body, o) => {
+    const r = await t()(m, path, body, o);
+    if (path !== "/v1/sync/batch/lease") return r;
+    return { results: r.results.map((x: any, i: number) => (badSrc.has((body as any).requests[i].source) ? { error: "503 busy" } : x)) };
+  };
+  const files = [...bad, good].map((path) => ({ path, harness: "pi" as const }));
+  const r: any = await scanAll(tr, policy, files, { collector: "m-mix", limit: 2, deadlineMs: 20_000 });
+  expect((await db`select state from scan_item where key = ${fileKey(good)}`)[0].state).toBe("done");
+  expect(r.finished).toBe(false); // the failing ones stay pending, tried again next run
+});
