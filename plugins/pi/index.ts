@@ -13,7 +13,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { clientPath, fromEnv, type Transport } from "../../client/api.ts";
 import { allowed, allowedDests, loadPolicy, NONE, policyPath, scopeOf, type Policy, type Purpose } from "../../client/policy.ts";
 import { readHead, readSession, sourceIdOf } from "../../client/records.ts";
-import { scanOnce, syncFile, type SyncOutcome } from "../../client/sync.ts";
+import { scanAll, syncFile, type SyncOutcome } from "../../client/sync.ts";
 import { callTool, TOOLS } from "../../client/tools.ts";
 import { collect, piTextOf } from "../../dryrun/dryrun.ts";
 
@@ -22,7 +22,8 @@ const SHUTDOWN_MS = 5_000; // what exit waits for the last sync
 const SNAPSHOT_MS = 3_000;
 const RECALL_MS = 3_000; // the server's own budget is 2.5 s; a later answer is dropped
 const BLOCKS_MS = 1_500;
-const SCAN_MS = 10_000;
+const SCAN_MS = 60_000; // one reconciliation run (background)
+const SCAN_EVERY_MS = Number(process.env.MEMEX_SCAN_EVERY_MS ?? 600_000); // again after a turn, at most this often
 const PI_SUBAGENT = /(^|\/)subagent-artifacts\/[^/]*_transcript\.jsonl$/;
 
 type Session = {
@@ -41,6 +42,8 @@ type Session = {
   cursor?: string;
   lastRecall?: string;
   scan?: string;
+  scanning?: boolean; // a reconciliation run in flight
+  scanAt?: number; // when the last one started
 };
 
 /** The repository a directory belongs to: the name of the closest ancestor holding `.git`. */
@@ -110,23 +113,27 @@ export default function memex(pi: ExtensionAPI) {
     return x.chain;
   }
 
-  /** Reconciliation (§5.2): one scan call over this machine's authorized Pi logs, in the background. */
-  function scan(x: Session) {
-    const delay = Number(process.env.MEMEX_SCAN_DELAY_MS ?? 2_000); // after session start; < 0: off
-    if (!t || delay < 0) return;
+  /** Reconciliation (§5.2) over this machine's authorized Pi logs, in the background: calls until the round is
+   *  finished (the server keeps the progress), at session start and again after turns while the session lives
+   *  (at most every SCAN_EVERY_MS; the server opens a new round only once its own interval has passed). */
+  function scan(x: Session, delay = Number(process.env.MEMEX_SCAN_DELAY_MS ?? 2_000)) {
+    if (!t || delay < 0 || x.scanning) return; // < 0: off
     const roots = policy.scopes.filter((p) => p.allow?.sync?.includes("memex")).flatMap((p) => p.paths);
     if (!roots.length) return;
+    x.scanning = true;
+    x.scanAt = Date.now();
     setTimeout(() => {
+      let run: Promise<unknown>;
       try {
         const files = collect(roots).files
           .filter((p) => p.endsWith(".jsonl") && !PI_SUBAGENT.test(p) && readHead(p, "pi").ok)
           .map((path) => ({ path, harness: "pi" as const }));
-        scanOnce(t!, policy, files, { collector, deadlineMs: SCAN_MS })
-          .then((r: any) => (x.scan = `${new Date().toISOString()} ${JSON.stringify(r).slice(0, 300)}`))
-          .catch((e) => (x.scan = `${new Date().toISOString()} failed: ${err(e)}`));
+        run = scanAll(t!, policy, files, { collector, deadlineMs: SCAN_MS })
+          .then((r: any) => (x.scan = `${new Date().toISOString()} ${JSON.stringify(r).slice(0, 300)}`));
       } catch (e) {
-        x.scan = `failed: ${err(e)}`;
+        run = Promise.reject(e);
       }
+      run.catch((e) => (x.scan = `${new Date().toISOString()} failed: ${err(e)}`)).finally(() => (x.scanning = false));
     }, delay).unref?.();
   }
 
@@ -135,7 +142,11 @@ export default function memex(pi: ExtensionAPI) {
     const x = stateOf(ctx);
     scan(x);
   });
-  pi.on("turn_end", async (_e, ctx) => void sync(ctx));
+  pi.on("turn_end", async (_e, ctx) => {
+    void sync(ctx);
+    const x = stateOf(ctx);
+    if (Date.now() - (x.scanAt ?? 0) >= SCAN_EVERY_MS) scan(x, 0);
+  });
   pi.on("session_compact", async (_e, ctx) => void sync(ctx));
   pi.on("session_tree", async (_e, ctx) => void sync(ctx));
   pi.on("session_shutdown", async (_e, ctx) => {

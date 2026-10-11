@@ -271,3 +271,11 @@ test("an unauthorized file in the list makes no request for it", async () => {
   await scanOnce(tr, policy, [{ path: p, harness: "pi" }], { collector: "m1" });
   expect(calls).toEqual([]);
 });
+
+test("scanAll goes on past one call's item limit until the round is finished", async () => {
+  const { scanAll } = await import("../client/sync.ts");
+  const files = Array.from({ length: 5 }, (_, i) => ({ path: piFile(`many${i}`, 2), harness: "pi" as const }));
+  const r: any = await scanAll(t(), policy, files, { collector: "m-all", limit: 2, deadlineMs: 30_000 });
+  expect(r.finished).toBe(true);
+  expect((await db`select count(*)::int n from scan_item i join scan_round r on r.id = i.round where r.collector = 'm-all' and i.state = 'done'`)[0].n).toBe(5);
+});

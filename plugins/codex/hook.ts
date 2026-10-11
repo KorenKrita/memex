@@ -13,14 +13,14 @@ import { hostname } from "node:os";
 import { fromEnv, type Transport } from "../../client/api.ts";
 import { allowed, allowedDests, loadPolicy, scopeOf, type Policy } from "../../client/policy.ts";
 import { readHead, readSession, type Rec } from "../../client/records.ts";
-import { scanOnce, syncFile } from "../../client/sync.ts";
+import { scanAll, syncFile } from "../../client/sync.ts";
 import { codexTextOf, collect } from "../../dryrun/dryrun.ts";
 import { repoOf } from "./session.ts";
 
 const SYNC_MS = Number(process.env.MEMEX_CODEX_SYNC_MS ?? 8_000);
 const SNAPSHOT_MS = 3_000;
 const RECALL_MS = Number(process.env.MEMEX_CODEX_RECALL_MS ?? 3_000);
-const SCAN_MS = 10_000;
+const SCAN_MS = 60_000; // one reconciliation run (its own detached process)
 const collector = () => `${process.env.MEMEX_MACHINE ?? hostname()}:codex`;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -118,14 +118,15 @@ export async function handle(p: Payload, env = process.env): Promise<string> {
   return out(event);
 }
 
-/** Reconciliation (§5.2): one scan over this machine's Codex rollouts in every scope that allows sync. */
+/** Reconciliation (§5.2) over this machine's Codex rollouts in every scope that allows sync: calls until the
+ *  round is finished (the server keeps the progress; a new round opens only once its interval has passed). */
 export async function scan(env = process.env) {
   const t = fromEnv(env);
   const policy = loadPolicy();
   const roots = policy.scopes.filter((x) => x.allow?.sync?.includes("memex")).flatMap((x) => x.paths);
   if (!t || !roots.length) return;
   const files = collect(roots).files.filter((f) => f.endsWith(".jsonl") && readHead(f, "codex").ok).map((path) => ({ path, harness: "codex" as const }));
-  await scanOnce(t, policy, files, { collector: collector(), deadlineMs: SCAN_MS });
+  return scanAll(t, policy, files, { collector: collector(), deadlineMs: SCAN_MS });
 }
 
 if (import.meta.main && process.argv[2] === "--scan") {
@@ -140,8 +141,9 @@ if (import.meta.main && process.argv[2] === "--scan") {
   } catch {}
   const text = await handle(p).catch(() => out(p.hook_event_name ?? ""));
   process.stdout.write(text + "\n");
-  // The session-start scan in its own process, detached: Codex waits for this one only.
-  if (p.hook_event_name === "SessionStart" && process.env.MEMEX_SCAN !== "0")
+  // Reconciliation in its own process, detached: Codex waits for this one only. At session start and after
+  // each turn (Stop) — the server decides whether a round is due, so a long session keeps reconciling.
+  if ((p.hook_event_name === "SessionStart" || p.hook_event_name === "Stop") && process.env.MEMEX_SCAN !== "0")
     try {
       Bun.spawn([process.execPath, import.meta.path, "--scan"], { stdio: ["ignore", "ignore", "ignore"], detached: true } as any).unref();
     } catch {}

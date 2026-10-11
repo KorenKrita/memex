@@ -310,6 +310,19 @@ async function scanBatch(t: Transport, policy: Policy, jobs: Job[],
   return out;
 }
 
+/** Scan calls until the round is finished, nothing moved (every pending item failing: tried again next time),
+ *  no round is due, or the deadline. The plugins call this at session start and on later lifecycle events:
+ *  the server keeps the progress and only opens a new auto round once its interval has passed. */
+export async function scanAll(t: Transport, policy: Policy, files: ScanFile[],
+                              opts: { collector: string; kind?: "auto" | "import"; limit?: number; deadlineMs?: number }) {
+  const deadline = Date.now() + (opts.deadlineMs ?? 60_000);
+  let r: Awaited<ReturnType<typeof scanOnce>>;
+  do {
+    r = await scanOnce(t, policy, files, { ...opts, deadlineMs: Math.max(1, deadline - Date.now()) });
+  } while (r.round !== null && !r.finished && r.advanced > 0 && Date.now() < deadline);
+  return r;
+}
+
 export type ScanFile = { path: string; harness: Harness };
 /** One scan call (§5.2): open this collector's round of `kind` over the authorized `files` (or continue the
  *  open one), then run segments on at most `limit` pending items until `deadlineMs`. Call again to go on;

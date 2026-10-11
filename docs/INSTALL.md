@@ -89,8 +89,10 @@ scope and what it allows, and the last sync, recall and scan.
 
 What it does:
 - Syncs the session file on `turn_end`, `session_tree`, `session_compact` and `session_shutdown`.
-- Scans this machine's authorized Pi logs in the background 2 s after start, to reconcile missed syncs
-  (`MEMEX_SCAN_DELAY_MS`; negative turns it off).
+- Scans this machine's authorized Pi logs in the background to reconcile missed syncs: 2 s after start
+  (`MEMEX_SCAN_DELAY_MS`; negative turns it off), then again after a turn at most every 10 minutes
+  (`MEMEX_SCAN_EVERY_MS`). Each run continues the server-side round until it is finished; the server opens a
+  new round only once its interval (`MEMEX_SCAN_INTERVAL_MS`, 1 h) has passed.
 - Puts the start-of-session snapshot in the system prompt.
 - Recalls once per user input. The recall goes on that message in what the model sees (never into the
   session file) and is replayed as frozen on later turns.
@@ -121,12 +123,12 @@ The hook command uses the Bun binary that ran the build, by absolute path. Rebui
 after moving or upgrading Bun.
 
 What it does:
-- `SessionStart`: syncs, then adds the snapshot as context. A reconciliation scan starts in its own detached
-  process, so it does not hold up the start.
+- `SessionStart`: syncs, then adds the snapshot as context. A reconciliation run starts in its own detached
+  process, so it does not hold up the start; `Stop` starts one too (the server decides whether a round is due).
 - `UserPromptSubmit`: syncs the previous exchange, then adds the recall for this prompt. Codex writes it into
   the rollout and replays it itself.
-- `Stop`, `PreCompact`, `SessionEnd`: sync. `SessionEnd` does not run reliably in Codex; the next
-  `SessionStart` scan catches up.
+- `Stop`, `PreCompact`, `SessionEnd`: sync. `SessionEnd` does not run reliably in Codex; reconciliation
+  catches up.
 - MCP server: `mem_search`, `mem_zoom` and `mem_grep` as the thread Codex names in each call
   (`_meta.threadId`), checked against that thread's rollout under `CODEX_HOME/sessions`.
 
