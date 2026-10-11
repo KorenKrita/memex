@@ -13,7 +13,7 @@ modes for fork-after-forget), `hang.ts` (fake model endpoint on :18799 that hang
 
 ## Regression
 
-At 158c68c plus this commit: `bunx tsc -p .` exit 0; `bun run test` 424 pass, 1 skip, 0 fail; `bun test dryrun`
+At a5485a2: `bunx tsc -p .` exit 0; `bun run test` 426 pass, 1 skip, 0 fail; `bun test dryrun`
 79 pass; Pi e2e 2 pass; Codex e2e (`MEMEX_E2E_CODEX=1`, real codex-cli) 1 pass.
 
 ## Results
