@@ -20,7 +20,9 @@ export async function start(opts: { port?: number; hostname?: string } = {}) {
     db, port: api.port,
     close: async () => {
       stop.abort();
-      await worker;
+      // A job in flight (a model call can take MEMEX_MODEL_TIMEOUT_MS) gets a few seconds to finish; past that the
+      // process goes anyway: nothing is published without its commit, and the job's lock lapses and it runs again.
+      await Promise.race([worker, Bun.sleep(Number(process.env.MEMEX_STOP_MS ?? 5_000))]);
       await api.stop();
       await db.close();
     },

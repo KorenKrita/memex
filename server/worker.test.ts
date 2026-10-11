@@ -17,3 +17,15 @@ test("a database error in the loop is retried, not the end of the loop", async (
   await run; // resolves: did not throw
   expect(calls).toBeGreaterThan(2);
 });
+
+test("stopping the loop during a long backoff ends it at once", async () => {
+  const db: any = (first: unknown) =>
+    Array.isArray(first) && "raw" in first ? Promise.reject(new Error("connection refused")) : first;
+  const stop = new AbortController();
+  const run = loop(db, stop.signal, 2_000); // the first backoff is 2 s, then 4 s…
+  await Bun.sleep(50);
+  const at = Date.now();
+  stop.abort();
+  await run;
+  expect(Date.now() - at).toBeLessThan(200);
+});

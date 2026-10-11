@@ -30,6 +30,15 @@ export async function drain(db: Db, kinds?: string[], max = 10_000) {
   return n;
 }
 
+/** Sleep that a stop ends at once (a shutdown never waits out a backoff). */
+const sleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((done) => {
+    if (signal.aborted) return done();
+    const h = setTimeout(() => (signal.removeEventListener("abort", stop), done()), ms);
+    const stop = () => (clearTimeout(h), done());
+    signal.addEventListener("abort", stop, { once: true });
+  });
+
 /** The worker loop. A database error (Postgres restarting, the connection gone) is not the process's end: the
  *  loop waits and tries again (the job's lock lapses and it is claimed again), up to 30 s apart. */
 export async function loop(db: Db, signal: AbortSignal, idleMs = 1000) {
@@ -43,6 +52,6 @@ export async function loop(db: Db, signal: AbortSignal, idleMs = 1000) {
       errWait = Math.min(Math.max(errWait * 2, idleMs), 30_000);
       console.error(`worker: ${(e as Error).message?.slice(0, 300)}; retrying in ${errWait} ms`);
     }
-    if (!ran) await Bun.sleep(errWait || idleMs);
+    if (!ran) await sleep(errWait || idleMs, signal);
   }
 }
