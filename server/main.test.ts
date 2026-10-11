@@ -45,6 +45,14 @@ test("/healthz answers 503 in time when the database stops answering, with one q
   await api.stop();
 });
 
+test("MEMEX_DB_STUCK_MS outside 6-25 s (where the probe's own idle timeout would end it first): no start", async () => {
+  for (const v of ["60000", "3000", "x"]) {
+    process.env.MEMEX_DB_STUCK_MS = v;
+    await expect(start({ port: 0 })).rejects.toThrow("MEMEX_DB_STUCK_MS");
+  }
+  delete process.env.MEMEX_DB_STUCK_MS;
+});
+
 test("once the health probe is overdue, API requests get 503 without any query on the application pool", async () => {
   const { serve, prober } = await import("./http.ts");
   let appQueries = 0;

@@ -13,8 +13,10 @@ modes for fork-after-forget), `hang.ts` (fake model endpoint on :18799 that hang
 
 ## Regression
 
-At the commit adding this line (after 60f2ef3): `bunx tsc -p .` exit 0; `bun run test` 429 pass, 1 skip, 0 fail; `bun test dryrun`
+At de816ab: `bunx tsc -p .` exit 0; `bun run test` 429 pass, 1 skip, 0 fail; `bun test dryrun`
 79 pass; Pi e2e 2 pass; Codex e2e (`MEMEX_E2E_CODEX=1`, real codex-cli) 1 pass.
+After the r4 fix (the commit adding this line): `bun run test` 430 pass, 1 skip, 0 fail (only server code and
+its test changed; dryrun and plugin e2e not rerun).
 
 ## Results
 
@@ -91,3 +93,11 @@ Third review (beb59ab..ec6f67e): `/tmp/memex-review/stage5-r3-231425.md`.
 | --- | --- | --- |
 | r3-1 | requests arriving on a silent database keep its connections from timing out; queries accumulate | held (reproduced: 41 queries over 40 s, none settled): API requests are refused before any query once the probe is overdue; the process exits after the probe has gone 10 s unanswered |
 | r3-2 | `close({ timeout: 0 })` waits for queries in flight, so shutdown could exceed its budget | held (reproduced: 1 930 ms, query completed; `0.001`: 2 ms, cut): both pools closed with a positive timeout from the shared deadline, and a signal-level forced exit at the end of the budget |
+
+Fourth review (ec6f67e..de816ab): `/tmp/memex-review/stage5-r4-234213.md`. It reproduced the default behaviour
+(exit at 11.0 s with requests gated; refusals do not exit; busy pool stays healthy; SIGTERM/SIGINT 308/310 ms;
+`close()` 215 ms) and found one problem:
+
+| # | Finding | Status |
+| --- | --- | --- |
+| r4-1 | `MEMEX_DB_STUCK_MS` above the probe pool's 30 s idle timeout lets the silent probe fail first, reopening the gate and never exiting (60 s: 164 queries pending) | held: the server refuses to start outside 6-25 s (test) |

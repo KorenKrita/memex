@@ -11,6 +11,11 @@ import { prober, serve } from "./http.ts";
 import { loop } from "./worker.ts";
 
 export async function start(opts: { port?: number; hostname?: string } = {}) {
+  // It must lie above the 5 s connect timeout (a refusal answers only then) and below the probe pool's 30 s
+  // idleTimeout minus the 1 s check interval: past that, the silent probe query fails as if answered, the gate
+  // reopens and the exit never comes (a 60 s setting let 164 queries pile up). Outside 6-25 s: no start.
+  const stuckLimit = Number(process.env.MEMEX_DB_STUCK_MS ?? 10_000);
+  if (!(stuckLimit >= 6_000 && stuckLimit <= 25_000)) throw new Error("MEMEX_DB_STUCK_MS must be between 6000 and 25000");
   const db = connect();
   await migrate(db);
   // The health probe has a connection of its own: a busy application pool is not a silent database.
@@ -24,7 +29,6 @@ export async function start(opts: { port?: number; hostname?: string } = {}) {
   // keep postponing. So past the probe's deadline API requests are refused before any query (http.ts), and
   // when the one probe query has gone MEMEX_DB_STUCK_MS (10 s; above the 5 s connect timeout, after which a
   // refused connection does answer) without any answer, the process exits 1 for its supervisor to restart.
-  const stuckLimit = Number(process.env.MEMEX_DB_STUCK_MS ?? 10_000);
   const watch = setInterval(() => {
     void health.check(); // keeps one probe going while the database is in doubt
     if (health.stuckMs() >= stuckLimit) {
