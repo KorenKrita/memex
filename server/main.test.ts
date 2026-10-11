@@ -182,4 +182,3 @@ test("SIGTERM with a health query in flight on a silent database: the process ex
     proxy.stop();
   }
 }, 30_000);
-
