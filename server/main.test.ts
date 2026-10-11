@@ -29,16 +29,19 @@ test("/healthz answers 503 in time when the database stops answering, with one q
   await api.stop();
 });
 
-// A TCP proxy to the test database that can go silent: sockets stay open, nothing passes either way (a
-// network black hole, a frozen host).
+// A TCP proxy to the test database that can go silent (sockets stay open, nothing passes either way: a
+// network black hole, a frozen host) or refuse (every socket closed, new ones closed at once: Postgres down).
 const PG = new URL(process.env.MEMEX_PG_URL ?? "postgres://postgres:memex@127.0.0.1:55433/memex");
 function pgProxy() {
-  let mode: "pass" | "silent" = "pass";
+  let mode: "pass" | "silent" | "refuse" = "pass";
+  const open = new Set<any>();
   const server = Bun.listen<{ peer?: any; queue: Uint8Array[] }>({
     hostname: "127.0.0.1", port: 0,
     socket: {
       async open(c) {
         c.data = { queue: [] };
+        if (mode === "refuse") return void c.end();
+        open.add(c);
         c.data.peer = await Bun.connect({
           hostname: PG.hostname, port: Number(PG.port),
           socket: {
@@ -52,14 +55,17 @@ function pgProxy() {
         if (mode !== "pass") return;
         c.data.peer ? c.data.peer.write(d) : c.data.queue.push(new Uint8Array(d));
       },
-      close: (c) => void c.data.peer?.end(),
+      close: (c) => (open.delete(c), void c.data.peer?.end()),
     },
   });
   const url = new URL(PG);
   url.host = `127.0.0.1:${server.port}`;
   return {
     url: url.toString(),
-    set: (m: typeof mode) => void (mode = m),
+    set(m: typeof mode) {
+      mode = m;
+      if (m === "refuse") for (const s of open) s.end();
+    },
     stop: () => server.stop(true),
   };
 }
@@ -97,67 +103,83 @@ test("a busy application pool is not a silent database: /healthz answers from it
   }
 }, 45_000);
 
-test("database silent on open connections, default settings: queries fail after the idle timeout, the same process recovers", async () => {
-  const { syncFile } = await import("../client/sync.ts");
-  const { transport } = await import("../client/api.ts");
-  const { sourceIdOf } = await import("../client/records.ts");
-  const { addApiKey } = await import("./http.ts");
-  const { allowGrant } = await import("./derive.ts");
-  const { connect } = await import("./db.ts");
-  const { mkdtempSync, writeFileSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const admin = connect();
-  const key = await addApiKey(admin, "silent-" + Date.now());
-  await allowGrant(admin, "personal", "sync", "memex");
-  await allowGrant(admin, "personal", "tool", "memex");
-  const proxy = pgProxy();
-  const p = Bun.spawn(["bun", import.meta.dir + "/main.ts"], {
-    env: { ...process.env, MEMEX_PG_URL: proxy.url, MEMEX_PORT: "0", MEMEX_IDLE_CLOSE_MS: "0" },
-    stdout: "pipe", stderr: "pipe",
-  });
-  try {
-    const err: string[] = [];
-    void (async () => { for await (const c of p.stderr) err.push(new TextDecoder().decode(c)); })();
+const spawnMain = (env: Record<string, string>) => {
+  const p = Bun.spawn(["bun", import.meta.dir + "/main.ts"], { env: { ...process.env, MEMEX_PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
+  const err: string[] = [];
+  void (async () => { for await (const c of p.stderr) err.push(new TextDecoder().decode(c)); })();
+  const port = (async () => {
     const reader = p.stdout.getReader();
-    const port = Number(new TextDecoder().decode((await reader.read()).value).match(/:(\d+)/)![1]);
-    const base = `http://127.0.0.1:${port}`;
+    const n = Number(new TextDecoder().decode((await reader.read()).value).match(/:(\d+)/)![1]);
+    reader.releaseLock();
+    return n;
+  })();
+  return { p, err, port };
+};
+
+test("database silent while requests keep coming: API requests answer 503 without queries, the process exits within its limit", async () => {
+  // Under Bun 1.4.2, queries submitted to a silent connection keep it from idling out: nothing ever settles
+  // as long as traffic continues (measured: 41 queries over 40 s, none settled).
+  const proxy = pgProxy();
+  const { p, err, port } = spawnMain({ MEMEX_PG_URL: proxy.url, MEMEX_DB_STUCK_MS: "10000" });
+  try {
+    const base = `http://127.0.0.1:${await port}`;
     expect((await fetch(base + "/healthz")).status).toBe(200);
     proxy.set("silent");
-    // Several health checks, some at once: each answers 503 in time, one probe query in flight.
     const at = Date.now();
-    const hs = await Promise.all([1, 2, 3].map(() => fetch(base + "/healthz").then((r) => r.status)));
-    expect(hs).toEqual([503, 503, 503]);
-    expect(Date.now() - at).toBeLessThan(2_500);
-    await Bun.sleep(33_000); // past Bun's 30 s idle timeout: the silent connections are given up
-    proxy.set("pass");
-    // The same process: health back, and a new session synced and projected (its own record found by grep).
-    let ok = false;
-    for (let i = 0; i < 60 && !ok; i++) ok = (await fetch(base + "/healthz").then((r) => r.status)) === 200 || (await Bun.sleep(500), false);
-    expect(ok).toBe(true);
-    expect(p.exitCode).toBe(null);
-    const dir = mkdtempSync(tmpdir() + "/memex-silent-");
-    const id = "silent-" + Date.now();
-    const file = `${dir}/${id}.jsonl`;
-    writeFileSync(file, [JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-10-11T00:00:00Z", cwd: "/tmp" }),
-      JSON.stringify({ type: "message", id: "u1", parentId: null, timestamp: "2026-10-11T00:00:01Z", message: { role: "user", content: [{ type: "text", text: `after-silence-${id}` }] } })].join("\n") + "\n");
-    const t = transport(base, key);
-    const policy = { scopes: [{ name: "personal", paths: [dir], allow: { sync: ["memex"], tool: ["memex"] } }] };
-    // A sync that began connecting while the database was still silent fails once (5 s connect timeout); a
-    // plugin syncs again on its next trigger. Recovery: one succeeds within 20 s.
-    let res: any;
-    for (const s = Date.now(); Date.now() - s < 20_000; await Bun.sleep(1_000))
-      if ((res = await syncFile(t, policy as any, file, "pi", { collector: "silent:pi" })).status === "synced") break;
-    if (res.status !== "synced") console.log("sync:", JSON.stringify(res), "stderr:", err.join("").slice(-1500));
-    expect(res.status).toBe("synced");
-    let found = false;
-    for (let i = 0; i < 60 && !found; i++) {
-      const r: any = await t("POST", "/v1/grep", { source: sourceIdOf("pi", id), scope: "personal", purpose: "tool", pattern: `after-silence-${id}`, dests: ["memex"] });
-      found = r.hits?.some((h: any) => h.in === sourceIdOf("pi", id)) || (await Bun.sleep(500), false);
+    const statuses: number[] = [];
+    let gated = 0;
+    while (p.exitCode === null && Date.now() - at < 20_000) {
+      void fetch(base + "/v1/grep", { method: "POST", headers: { authorization: "Bearer x" }, body: "{}", signal: AbortSignal.timeout(1_000) })
+        .then((r) => (statuses.push(r.status), r.status === 503 && gated++), () => {});
+      await Bun.sleep(500);
     }
-    expect(found).toBe(true);
+    expect(await p.exited).toBe(1);
+    const took = Date.now() - at;
+    expect(took).toBeGreaterThan(9_000); // not before the limit
+    expect(took).toBeLessThan(15_000);
+    expect(gated).toBeGreaterThan(5); // once health missed its deadline, requests were turned away at once
+    expect(err.join("")).toContain("has not answered");
   } finally {
     p.kill();
     proxy.stop();
-    await admin.close();
   }
-}, 120_000);
+}, 40_000);
+
+test("Postgres refusing connections past the limit while requests keep coming: the process stays", async () => {
+  const proxy = pgProxy();
+  const { p, port } = spawnMain({ MEMEX_PG_URL: proxy.url, MEMEX_DB_STUCK_MS: "7000" }); // above the 5 s connect timeout
+  try {
+    const base = `http://127.0.0.1:${await port}`;
+    expect((await fetch(base + "/healthz")).status).toBe(200);
+    proxy.set("refuse");
+    for (const at = Date.now(); Date.now() - at < 20_000; await Bun.sleep(500))
+      void fetch(base + "/v1/grep", { method: "POST", headers: { authorization: "Bearer x" }, body: "{}", signal: AbortSignal.timeout(1_000) }).catch(() => {});
+    expect(p.exitCode).toBe(null); // a refusal is an answer, not silence
+    proxy.set("pass");
+    let ok = false;
+    for (let i = 0; i < 30 && !ok; i++) ok = (await fetch(base + "/healthz").then((r) => r.status)) === 200 || (await Bun.sleep(500), false);
+    expect(ok).toBe(true);
+  } finally {
+    p.kill();
+    proxy.stop();
+  }
+}, 60_000);
+
+test("SIGTERM with a health query in flight on a silent database: the process exits within MEMEX_STOP_MS", async () => {
+  const proxy = pgProxy();
+  const { p, port } = spawnMain({ MEMEX_PG_URL: proxy.url, MEMEX_STOP_MS: "300" });
+  try {
+    const base = `http://127.0.0.1:${await port}`;
+    expect((await fetch(base + "/healthz")).status).toBe(200);
+    proxy.set("silent");
+    expect((await fetch(base + "/healthz")).status).toBe(503); // its query is in flight, never answered
+    const at = Date.now();
+    p.kill("SIGTERM");
+    await p.exited;
+    expect(Date.now() - at).toBeLessThan(1_500);
+  } finally {
+    p.kill();
+    proxy.stop();
+  }
+}, 30_000);
+

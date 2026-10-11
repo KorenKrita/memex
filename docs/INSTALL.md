@@ -34,14 +34,15 @@ bun server/main.ts
 `main.ts` migrates the schema, then serves the API and runs one worker loop. It listens on loopback by
 default; put TLS in front (a reverse proxy) before exposing it.
 
-Failure behaviour: with Postgres down the process stays up, `/healthz` answers 503 and the worker retries
-(backoff up to 30 s). If the database stops answering on open connections (a frozen host, a network black
-hole), `/healthz` answers 503 within 2 s from a connection of its own, and the queries on silent
-connections failed after about 30 s in tests with the pinned Bun 1.4.2 (its `idleTimeout`, 30 s in db.ts),
-after which the same process reconnected. This is observed driver behaviour, not a documented limit on how
-long any SQL statement may run: rerun the "default settings" test in `server/main.test.ts` after upgrading
-Bun. SIGTERM ends the process within `MEMEX_STOP_MS` (default 5 s): an interrupted job runs again
-once its lock lapses (`MEMEX_JOB_LOCK_MS`).
+Failure behaviour: with Postgres down (connections refused or closed) the process stays up, `/healthz`
+answers 503 and the worker retries (backoff up to 30 s). If the database stops answering on open
+connections (a frozen host, a network black hole), `/healthz` answers 503 within 2 s from a connection of its
+own; from then on API requests get 503 at once without touching the database, and once the health query has
+gone `MEMEX_DB_STUCK_MS` (default 10 s) without any answer the process exits 1, so run it under a supervisor
+that restarts it (compose does). This is needed because, with Bun 1.4.2, queries on a silent connection do
+not fail while new ones keep arriving (measured: 41 over 40 s, none settled). SIGTERM ends the process
+within `MEMEX_STOP_MS` (default 5 s, plus at most 1 s): an interrupted job runs again once its lock lapses
+(`MEMEX_JOB_LOCK_MS`). Rerun `server/main.test.ts` after upgrading Bun.
 
 Per-turn recall injects nothing until `MEMEX_RECALL_TAU` (the rerank score bar) is set: it is not calibrated
 yet (DESIGN §6.2), so the default is "not ready", and the plugins show nothing.
