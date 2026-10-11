@@ -20,11 +20,13 @@ export async function start(opts: { port?: number; hostname?: string } = {}) {
     db, port: api.port,
     close: async () => {
       stop.abort();
-      // A job in flight (a model call can take MEMEX_MODEL_TIMEOUT_MS) gets a few seconds to finish; past that the
-      // process goes anyway: nothing is published without its commit, and the job's lock lapses and it runs again.
-      await Promise.race([worker, Bun.sleep(Number(process.env.MEMEX_STOP_MS ?? 5_000))]);
-      await api.stop();
-      await db.close();
+      // One budget for the whole stop. A job in flight (a model call can take MEMEX_MODEL_TIMEOUT_MS) or a query
+      // waiting on a lock may run into it; past it, open requests and connections are cut. Nothing is published
+      // without its commit (a cut transaction rolls back), and an interrupted job's lock lapses and it runs again.
+      const until = Date.now() + Number(process.env.MEMEX_STOP_MS ?? 5_000);
+      await Promise.race([worker, Bun.sleep(until - Date.now())]);
+      await api.stop(); // closes open connections too
+      await db.close({ timeout: Math.max(0, until - Date.now()) / 1000 });
     },
   };
 }
