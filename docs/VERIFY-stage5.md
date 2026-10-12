@@ -61,7 +61,27 @@ its test changed; dryrun and plugin e2e not rerun).
   With models configured, how fast a backlog is worked off and how much it delays projection are not measured.
 - Pi `/tree` and compaction followed by recall in a real Pi; Codex with a shared app-server (several
   threads, one MCP process); a Codex fork's first turn.
-- server itself (1.9 GB memory), the shared reverse proxy, and turning off OV's automatic recall.
+- The shared reverse proxy (not changed; server serves plain HTTP by IP and port, below).
+- server under real load: only the synthetic run below. server's swap was nearly full (1 898 of 1 964 MB) after it,
+  mostly OpenViking's (about 990 MB swapped); memex's containers used 27 and 51 MB.
+
+## server deployment (2026-10-12)
+
+Images built locally for linux/amd64 and loaded with `docker save | ssh docker load`; compose started with
+`--no-build` from `/root/memex/deploy/` (`.env`, `memex.env`, `pgpass`: mode 600; the model groups come from
+OpenViking's own `ov.conf`). Published on `0.0.0.0:18787`: plain HTTP.
+
+| Check | Result |
+| --- | --- |
+| Health, from this machine to the public address | `{"ok":true}`; both containers healthy, 0 restarts, not OOM-killed; OpenViking health still ok |
+| Model endpoints from the api container | LLM, embedding and rerank each 200 |
+| Synthetic Pi session: sync, then grep | 3 records synced; 2 hits once projected |
+| Synthetic session with derive granted | summarize, embed, l3, card, forest jobs done; a Chinese query found the right span through vector search and rerank (0.993) |
+| Grants needed for explicit search | without `tool embedding` and `tool rerank`, search reports both channels `not-granted` (INSTALL now lists them) |
+| Backup | `deploy/backup.sh` wrote a mode-600 dump (57 KB); it held the synthetic data, so it went to server's trash |
+| Cleanup | both synthetic sources forgotten: 0 records, 0 summaries; their tombstones stay (16 rows) |
+
+Not done: no real session data, no backup schedule, `MEMEX_RECALL_TAU` unset (per-turn recall injects nothing).
 
 ## Independent reviews
 
