@@ -21,6 +21,10 @@ docker compose -f deploy/compose.yaml exec api bun server/admin.ts key add lapto
 Memory limits default to 384 MB (Postgres) and 256 MB (API); set `MEMEX_PG_MEM` / `MEMEX_API_MEM`. An empty
 model group in `memex.env` keeps that destination off.
 
+The API binds `127.0.0.1` unless `MEMEX_BIND_HOST` says otherwise (e.g. `0.0.0.0` to reach it by IP and
+port). That is plain HTTP: the bearer key and every synced record cross the network unencrypted, so prefer a
+TLS reverse proxy, and restrict the port to known addresses in the host's firewall meanwhile.
+
 Without Docker: Postgres 17 with the `vector` and `pg_trgm` extensions, then:
 
 ```sh

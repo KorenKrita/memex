@@ -1,7 +1,8 @@
 # memex: its own project, its own Postgres. From the repository root:
 #   cp deploy/memex.env.example deploy/memex.env   # fill in the model endpoints
 #   docker compose -f deploy/compose.yaml up -d --build
-# The API listens on loopback only (MEMEX_BIND_PORT, default 18787); put TLS in front before exposing it.
+# The API listens on loopback by default (MEMEX_BIND_HOST, MEMEX_BIND_PORT: 127.0.0.1:18787). Binding another
+# address exposes plain HTTP: bearer keys and session text travel unencrypted; put TLS in front when you can.
 name: memex
 services:
   db:
@@ -36,7 +37,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${MEMEX_BIND_PORT:-18787}:8787"
+      - "${MEMEX_BIND_HOST:-127.0.0.1}:${MEMEX_BIND_PORT:-18787}:8787"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
