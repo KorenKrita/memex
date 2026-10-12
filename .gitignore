@@ -4,3 +4,4 @@ node_modules/
 dist/
 deploy/memex.env
 deploy/backups/
+docs/DESIGN.md

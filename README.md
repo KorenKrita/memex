@@ -4,7 +4,7 @@ Personal cross-session, cross-harness (Pi + Codex) memory backend. Under constru
 (DESIGN §11), validated on synthetic data only.
 
 - `docs/INSTALL.md` — installing the server and the two plugins, settings, known limits
-- `docs/DESIGN.md` — design
+- `docs/DESIGN.md` — design (private, not in the public repository)
 - `docs/RESEARCH-landscape.md` — survey of open-source memory projects and what was adopted
 - `dryrun/` — offline projection rules (spans, views, forks, canonical records), validated on local sessions
 - `prototype/` — sync protocol model
