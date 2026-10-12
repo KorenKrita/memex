@@ -63,6 +63,8 @@ bun server/admin.ts grant allow personal recall memex
 bun server/admin.ts grant allow personal recall embedding
 bun server/admin.ts grant allow personal recall rerank
 bun server/admin.ts grant allow personal tool memex
+bun server/admin.ts grant allow personal tool embedding     # explicit search: vector and rerank channels
+bun server/admin.ts grant allow personal tool rerank
 bun server/admin.ts grant list
 ```
 
